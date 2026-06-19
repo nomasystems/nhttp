@@ -1,0 +1,52 @@
+# Rebar3 build artifacts
+_build/
+_checkouts/
+
+# Dependencies lock (uncomment if you want to commit it)
+# rebar.lock
+
+# Erlang artifacts
+*.beam
+*.plt
+erl_crash.dump
+.eunit/
+.rebar3/
+
+# Common Test logs
+logs/
+log/
+ct_logs/
+
+# Cover data
+*.coverdata
+cover/
+
+# Editor/IDE
+*.swp
+*.swo
+*~
+.idea/
+*.iml
+.vscode/
+.elixir_ls/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Nix/direnv
+.direnv/
+.envrc
+result
+result-*
+
+# Temporary files
+*.tmp
+*.temp
+
+# Downloaded binaries
+priv/h3spec
+
+# Test certificates (regenerate with test/conf/gen_test_certs.sh)
+test/conf/*.pem
+test/conf/*.key

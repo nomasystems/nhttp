@@ -1,0 +1,24 @@
+# h1spec HTTP/1.1 compliance runner (uNetworking/h1spec) on Deno.
+#
+# The runner is a single TypeScript file fetched at build time from a pinned
+# upstream commit (image build needs network access). Upstream has no releases
+# or tags, so a commit SHA plus content checksum pin it. One local patch is
+# applied after download: the read timeout is raised from 500ms to 3000ms; the
+# grep guard fails the build if a SHA bump moves that line. `deno run` does not
+# type-check, so the script runs as-is. Invoke with the target host and port as
+# trailing args:
+#   docker run --rm --network=host nhttp/h1spec:<ver> 127.0.0.1 <port>
+FROM denoland/deno:alpine-2.1.4
+
+ARG H1SPEC_COMMIT=f0a5650a20c575fbea0f7179a3a9cfa50f20ba6e
+ARG H1SPEC_SHA256=d3825f5ec013ee42b117bea175fcbb9c0a9b284d069f0ab8b9e26bdd463f4b54
+
+WORKDIR /h1spec
+RUN apk add --no-cache curl \
+    && curl -fsSL "https://raw.githubusercontent.com/uNetworking/h1spec/${H1SPEC_COMMIT}/http_test.ts" \
+       -o http_test.ts \
+    && echo "${H1SPEC_SHA256}  http_test.ts" | sha256sum -c - \
+    && grep -q '}, 500);' http_test.ts \
+    && sed -i 's/}, 500);/}, 3000);/' http_test.ts
+
+ENTRYPOINT ["deno", "run", "--allow-net", "/h1spec/http_test.ts"]

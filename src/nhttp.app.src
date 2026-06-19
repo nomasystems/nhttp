@@ -1,0 +1,23 @@
+{application, nhttp, [
+    {description, "HTTP/1.1, HTTP/2, and HTTP/3 server for Erlang/OTP 27+"},
+    {vsn, "1.0.0"},
+    {registered, []},
+    {applications, [
+        kernel,
+        stdlib,
+        ssl,
+        nhttp_lib,
+        nquic,
+        opentelemetry_api,
+        opentelemetry_api_experimental
+    ]},
+    {env, []},
+    {modules, []},
+    {licenses, ["Apache-2.0"]},
+    {maintainers, ["Nomasystems"]},
+    {minimum_otp_vsn, "27"},
+    {links, [
+        {"GitHub", "https://github.com/nomasystems/nhttp"},
+        {"Changelog", "https://github.com/nomasystems/nhttp/blob/main/CHANGELOG.md"}
+    ]}
+]}.

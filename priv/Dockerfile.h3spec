@@ -1,0 +1,6 @@
+FROM debian:stable-slim
+RUN apt-get update && apt-get install -y curl ca-certificates && rm -rf /var/lib/apt/lists/*
+ENV H3SPEC_VERSION=0.1.12
+RUN curl -L "https://github.com/kazu-yamamoto/h3spec/releases/download/v${H3SPEC_VERSION}/h3spec-linux-x86_64" \
+    -o /usr/local/bin/h3spec && chmod +x /usr/local/bin/h3spec
+ENTRYPOINT ["h3spec"]
