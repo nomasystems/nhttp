@@ -78,6 +78,11 @@
     ws_ping_pong/1,
     ws_close_handshake/1,
     ws_binary_message/1,
+    ws_fragmented_message/1,
+    ws_fragmented_message_coalesced/1,
+    ws_fragmented_interleaved_ping/1,
+    ws_invalid_utf8_closes_1007/1,
+    ws_invalid_utf8_fragment_closes_early/1,
     ws_sys_get_status/1,
     ws_server_drained_during_session/1
 ]).
@@ -158,6 +163,11 @@ groups() ->
             ws_ping_pong,
             ws_close_handshake,
             ws_binary_message,
+            ws_fragmented_message,
+            ws_fragmented_message_coalesced,
+            ws_fragmented_interleaved_ping,
+            ws_invalid_utf8_closes_1007,
+            ws_invalid_utf8_fragment_closes_early,
             ws_sys_get_status,
             ws_server_drained_during_session
         ]}
@@ -631,6 +641,71 @@ ws_binary_message(_Config) ->
     gen_tcp:close(Socket),
     nhttp:stop(Pid).
 
+ws_fragmented_message(_Config) ->
+    {ok, Pid, Socket} = ws_session(),
+
+    ok = gen_tcp:send(Socket, masked_frame(0, 1, <<"Hel">>)),
+    ok = gen_tcp:send(Socket, masked_frame(1, 0, <<"lo">>)),
+
+    {ok, EchoFrame} = gen_tcp:recv(Socket, 0, 5000),
+    ?assertMatch(<<16#81, 5, "Hello">>, EchoFrame),
+
+    gen_tcp:close(Socket),
+    nhttp:stop(Pid).
+
+ws_fragmented_message_coalesced(_Config) ->
+    {ok, Pid, Socket} = ws_session(),
+
+    First = masked_frame(0, 1, <<"Hel">>),
+    Last = masked_frame(1, 0, <<"lo">>),
+    ok = gen_tcp:send(Socket, <<First/binary, Last/binary>>),
+
+    {ok, EchoFrame} = gen_tcp:recv(Socket, 0, 5000),
+    ?assertMatch(<<16#81, 5, "Hello">>, EchoFrame),
+
+    gen_tcp:close(Socket),
+    nhttp:stop(Pid).
+
+ws_fragmented_interleaved_ping(_Config) ->
+    {ok, Pid, Socket} = ws_session(),
+
+    ok = gen_tcp:send(Socket, masked_frame(0, 1, <<"Hel">>)),
+    ok = gen_tcp:send(Socket, masked_frame(1, 9, <<"pi">>)),
+
+    {ok, PongFrame} = gen_tcp:recv(Socket, 0, 5000),
+    ?assertMatch(<<16#8A, 2, "pi">>, PongFrame),
+
+    ok = gen_tcp:send(Socket, masked_frame(1, 0, <<"lo">>)),
+
+    {ok, EchoFrame} = gen_tcp:recv(Socket, 0, 5000),
+    ?assertMatch(<<16#81, 5, "Hello">>, EchoFrame),
+
+    gen_tcp:close(Socket),
+    nhttp:stop(Pid).
+
+ws_invalid_utf8_fragment_closes_early(_Config) ->
+    {ok, Pid, Socket} = ws_session(),
+
+    ok = gen_tcp:send(Socket, masked_frame(0, 1, <<"Hel">>)),
+    ok = gen_tcp:send(Socket, masked_frame(0, 0, <<16#C0, 16#AF>>)),
+
+    {ok, CloseFrame} = gen_tcp:recv(Socket, 0, 5000),
+    ?assertMatch(<<16#88, _Len, ?WS_CLOSE_INVALID_PAYLOAD:16, _/binary>>, CloseFrame),
+
+    gen_tcp:close(Socket),
+    nhttp:stop(Pid).
+
+ws_invalid_utf8_closes_1007(_Config) ->
+    {ok, Pid, Socket} = ws_session(),
+
+    ok = gen_tcp:send(Socket, masked_frame(1, 1, <<16#C0, 16#AF>>)),
+
+    {ok, CloseFrame} = gen_tcp:recv(Socket, 0, 5000),
+    ?assertMatch(<<16#88, _Len, ?WS_CLOSE_INVALID_PAYLOAD:16, _/binary>>, CloseFrame),
+
+    gen_tcp:close(Socket),
+    nhttp:stop(Pid).
+
 ws_sys_get_status(_Config) ->
     {ok, Pid} = nhttp:start_link(#{
         port => 0,
@@ -697,6 +772,25 @@ mask_loop(<<B, Rest/binary>>, <<K1, K2, K3, K4>> = Key, Idx, Acc) ->
             3 -> K4
         end,
     mask_loop(Rest, Key, Idx + 1, <<Acc/binary, (B bxor KeyByte)>>).
+
+masked_frame(Fin, Opcode, Payload) ->
+    MaskKey = crypto:strong_rand_bytes(4),
+    Masked = mask(Payload, MaskKey),
+    Len = byte_size(Payload),
+    <<Fin:1, 0:3, Opcode:4, 1:1, Len:7, MaskKey/binary, Masked/binary>>.
+
+ws_session() ->
+    {ok, Pid} = nhttp:start_link(#{
+        port => 0,
+        handler => ?MODULE,
+        versions => [http1_1],
+        telemetry => false
+    }),
+    {ok, Port} = nhttp:get_port(Pid),
+    {ok, Socket} = gen_tcp:connect("127.0.0.1", Port, [binary, {active, false}]),
+    ok = gen_tcp:send(Socket, ws_upgrade_request()),
+    {ok, <<"HTTP/1.1 101 ", _/binary>>} = gen_tcp:recv(Socket, 0, 5000),
+    {ok, Pid, Socket}.
 
 ws_upgrade_request() ->
     [

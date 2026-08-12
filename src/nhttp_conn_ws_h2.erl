@@ -152,6 +152,21 @@ notify_goaway(State, ErrorCode) ->
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - LIFECYCLE
 %%%-----------------------------------------------------------------------------
+-doc """
+Build the frame decoder from the runtime opts the open callback settled
+on. Armed here rather than at stream construction because
+`max_message_size` bounds what the decoder accumulates, and until
+`handle_ws_open/2` returns there is no limit to give it.
+""".
+-spec arm_decoder(#state{}, nhttp_lib:stream_id()) -> #state{}.
+arm_decoder(State, StreamId) ->
+    case view(State, StreamId) of
+        undefined ->
+            State;
+        #{runtime_opts := Opts} ->
+            buffer(State, StreamId, <<>>, nhttp_ws:decoder_new(server, Opts))
+    end.
+
 -spec call_send(
     #state{}, gen_server:from(), reference(), nhttp_lib:stream_id(), nhttp_ws:ws_message()
 ) -> #state{}.
@@ -255,12 +270,29 @@ open(
             State1;
         View ->
             Actions = nhttp_conn_ws:open(nhttp_conn:log_ctx(State1), View, Handler),
-            interpret(State1, StreamId, Actions)
+            arm_decoder(interpret(State1, StreamId, Actions), StreamId)
     end.
 
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - FRAME PROCESSING
 %%%-----------------------------------------------------------------------------
+-spec buffer(#state{}, nhttp_lib:stream_id(), binary(), nhttp_ws:ws_decoder()) -> #state{}.
+buffer(
+    #state{protocol_state = #h2_state{h2_streams = Streams} = H2} = State, StreamId, Buffer, Dec
+) ->
+    case maps:get(StreamId, Streams, undefined) of
+        #h2_stream{} = LiveStream ->
+            State#state{
+                protocol_state = H2#h2_state{
+                    h2_streams = Streams#{
+                        StreamId => LiveStream#h2_stream{ws_buffer = Buffer, ws_decoder = Dec}
+                    }
+                }
+            };
+        undefined ->
+            State
+    end.
+
 -spec process_frames(
     #state{}, nhttp_lib:stream_id(), #h2_stream{}, binary(), nhttp_ws:ws_decoder(), nhttp_h2:fin()
 ) -> #state{}.
@@ -268,43 +300,25 @@ process_frames(State, StreamId, WsStream, Buffer, Dec, Fin) ->
     case nhttp_ws:decode_with_state(Buffer, Dec) of
         {ok, Message, Rest, NewDec} ->
             State1 = dispatch_frame(State, StreamId, Message),
-            #state{protocol_state = #h2_state{h2_streams = Streams1} = H2After} = State1,
+            #state{protocol_state = #h2_state{h2_streams = Streams1}} = State1,
             case maps:get(StreamId, Streams1, undefined) of
-                #h2_stream{} = _ when Rest =/= <<>> ->
+                #h2_stream{} when Rest =/= <<>> ->
                     process_frames(State1, StreamId, WsStream, Rest, NewDec, Fin);
-                #h2_stream{} = LiveStream ->
-                    State1#state{
-                        protocol_state = H2After#h2_state{
-                            h2_streams = Streams1#{
-                                StreamId => LiveStream#h2_stream{
-                                    ws_buffer = <<>>, ws_decoder = NewDec
-                                }
-                            }
-                        }
-                    };
+                #h2_stream{} ->
+                    buffer(State1, StreamId, <<>>, NewDec);
                 undefined ->
                     State1
             end;
+        {continue, Rest, NewDec} when Rest =/= <<>> ->
+            process_frames(State, StreamId, WsStream, Rest, NewDec, Fin);
+        {continue, <<>>, NewDec} ->
+            buffer(State, StreamId, <<>>, NewDec);
         {more, _Needed, NewDec} ->
-            #state{protocol_state = #h2_state{h2_streams = Streams0} = H2} = State,
-            case maps:get(StreamId, Streams0, undefined) of
-                #h2_stream{} = LiveStream ->
-                    State#state{
-                        protocol_state = H2#h2_state{
-                            h2_streams = Streams0#{
-                                StreamId => LiveStream#h2_stream{
-                                    ws_buffer = Buffer, ws_decoder = NewDec
-                                }
-                            }
-                        }
-                    };
-                undefined ->
-                    State
-            end;
+            buffer(State, StreamId, Buffer, NewDec);
         {error, Reason} ->
-            ReasonBin = nhttp_conn_ws:str_or_atom(Reason),
-            State1 = send_close(State, StreamId, ?WS_CLOSE_PROTOCOL_ERROR, ReasonBin),
-            finish(State1, StreamId, {fail, ?WS_CLOSE_PROTOCOL_ERROR, ReasonBin})
+            {Code, ReasonBin} = nhttp_conn_ws:decode_error_close(Reason),
+            State1 = send_close(State, StreamId, Code, ReasonBin),
+            finish(State1, StreamId, {fail, Code, ReasonBin})
     end.
 
 %%%-----------------------------------------------------------------------------

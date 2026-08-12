@@ -61,6 +61,7 @@
     buffer = <<>> :: binary(),
     body_stream :: nhttp_h1:body_stream() | undefined,
     ws_buffer = <<>> :: binary(),
+    ws_decoder :: nhttp_ws:ws_decoder() | undefined,
     h1_ws :: undefined | #ws_state{},
     keep_alive = true :: boolean(),
     body_timeout = ?DEFAULT_BODY_TIMEOUT :: timeout(),

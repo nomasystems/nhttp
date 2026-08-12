@@ -148,6 +148,21 @@ notify_connection_close(State, ErrorCode) ->
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - LIFECYCLE
 %%%-----------------------------------------------------------------------------
+-doc """
+Build the frame decoder from the runtime opts the open callback settled
+on. Armed here rather than at stream construction because
+`max_message_size` bounds what the decoder accumulates, and until
+`handle_ws_open/2` returns there is no limit to give it.
+""".
+-spec arm_decoder(#state{}, nhttp_lib:stream_id()) -> #state{}.
+arm_decoder(State, StreamId) ->
+    case view(State, StreamId) of
+        undefined ->
+            State;
+        #{runtime_opts := Opts} ->
+            buffer(State, StreamId, <<>>, nhttp_ws:decoder_new(server, Opts))
+    end.
+
 -spec call_send(
     #state{}, gen_server:from(), reference(), nhttp_lib:stream_id(), nhttp_ws:ws_message()
 ) -> #state{}.
@@ -246,12 +261,25 @@ open(
             State2;
         View ->
             Actions = nhttp_conn_ws:open(nhttp_conn_h3:log_ctx(State2), View, Handler),
-            interpret(State2, StreamId, Actions)
+            arm_decoder(interpret(State2, StreamId, Actions), StreamId)
     end.
 
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - FRAME PROCESSING
 %%%-----------------------------------------------------------------------------
+-spec buffer(#state{}, nhttp_lib:stream_id(), binary(), nhttp_ws:ws_decoder()) -> #state{}.
+buffer(State, StreamId, Buffer, Dec) ->
+    case maps:get(StreamId, State#state.h3_streams, undefined) of
+        #h3_stream{} = LiveStream ->
+            State#state{
+                h3_streams = (State#state.h3_streams)#{
+                    StreamId => LiveStream#h3_stream{ws_buffer = Buffer, ws_decoder = Dec}
+                }
+            };
+        undefined ->
+            State
+    end.
+
 -spec process_frames(
     #state{}, nhttp_lib:stream_id(), #h3_stream{}, binary(), nhttp_ws:ws_decoder(), nhttp_h3:fin()
 ) -> #state{}.
@@ -260,36 +288,23 @@ process_frames(State, StreamId, WsStream, Buffer, Dec, Fin) ->
         {ok, Message, Rest, NewDec} ->
             State1 = dispatch_frame(State, StreamId, Message),
             case maps:get(StreamId, State1#state.h3_streams, undefined) of
-                #h3_stream{} = _ when Rest =/= <<>> ->
+                #h3_stream{} when Rest =/= <<>> ->
                     process_frames(State1, StreamId, WsStream, Rest, NewDec, Fin);
-                #h3_stream{} = LiveStream ->
-                    State1#state{
-                        h3_streams = (State1#state.h3_streams)#{
-                            StreamId => LiveStream#h3_stream{
-                                ws_buffer = <<>>, ws_decoder = NewDec
-                            }
-                        }
-                    };
+                #h3_stream{} ->
+                    buffer(State1, StreamId, <<>>, NewDec);
                 undefined ->
                     State1
             end;
+        {continue, Rest, NewDec} when Rest =/= <<>> ->
+            process_frames(State, StreamId, WsStream, Rest, NewDec, Fin);
+        {continue, <<>>, NewDec} ->
+            buffer(State, StreamId, <<>>, NewDec);
         {more, _Needed, NewDec} ->
-            case maps:get(StreamId, State#state.h3_streams, undefined) of
-                #h3_stream{} = LiveStream ->
-                    State#state{
-                        h3_streams = (State#state.h3_streams)#{
-                            StreamId => LiveStream#h3_stream{
-                                ws_buffer = Buffer, ws_decoder = NewDec
-                            }
-                        }
-                    };
-                undefined ->
-                    State
-            end;
+            buffer(State, StreamId, Buffer, NewDec);
         {error, Reason} ->
-            ReasonBin = nhttp_conn_ws:str_or_atom(Reason),
-            State1 = send_close(State, StreamId, ?WS_CLOSE_PROTOCOL_ERROR, ReasonBin),
-            finish(State1, StreamId, {fail, ?WS_CLOSE_PROTOCOL_ERROR, ReasonBin})
+            {Code, ReasonBin} = nhttp_conn_ws:decode_error_close(Reason),
+            State1 = send_close(State, StreamId, Code, ReasonBin),
+            finish(State1, StreamId, {fail, Code, ReasonBin})
     end.
 
 %%%-----------------------------------------------------------------------------

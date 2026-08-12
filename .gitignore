@@ -50,3 +50,6 @@ priv/h3spec
 # Test certificates (regenerate with test/conf/gen_test_certs.sh)
 test/conf/*.pem
 test/conf/*.key
+
+# Autobahn WebSocket compliance reports
+autobahn-reports/
