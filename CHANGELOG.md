@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-08-12
+
+### Fixed
+
+- WebSocket fragmented messages on HTTP/1.1. The connection keeps decoder state across reads, so a message split over several frames is reassembled and delivered once (RFC 6455 section 5.4)
+- WebSocket CLOSE codes for decode errors. A text payload or CLOSE reason that is not valid UTF-8 gives 1007, a message over `max_message_size` gives 1009, and other framing errors keep 1002. Before, every decode error gave 1002
+
+### Changed
+
+- Requires `nhttp_lib` 1.0.3 for the stateful frame decoder and incremental UTF-8 validation
+
+### Added
+
+- WebSocket RFC 6455 compliance tests with Autobahn. Run them with `make ws-compliance`
+
 ## [1.0.0] - 2026-06-01
 
 Initial public release.
