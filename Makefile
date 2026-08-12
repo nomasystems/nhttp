@@ -1,6 +1,6 @@
 .PHONY: all compile clean check test cover doc binopt certs compliance \
-        h1-compliance h2-compliance h3-compliance \
-        h1spec-image h2spec-image h3spec-image help
+        h1-compliance h2-compliance h3-compliance ws-compliance \
+        h1spec-image h2spec-image h3spec-image autobahn-image help
 
 # Tools
 REBAR3 := rebar3
@@ -16,6 +16,12 @@ H2SPEC_IMAGE := summerwind/h2spec:2.6.0
 H3SPEC_VERSION := 0.1.12
 H3SPEC_IMAGE := nhttp/h3spec:$(H3SPEC_VERSION)
 H3SPEC_DOCKERFILE := priv/Dockerfile.h3spec
+AUTOBAHN_VERSION := 25.10.1
+AUTOBAHN_IMAGE := nhttp/autobahn:$(AUTOBAHN_VERSION)
+AUTOBAHN_DOCKERFILE := priv/Dockerfile.autobahn
+AUTOBAHN_SPEC := priv/autobahn/fuzzingclient.json
+AUTOBAHN_GATE := priv/autobahn/gate.sh
+AUTOBAHN_REPORTS := autobahn-reports
 # h3spec only ships an x86_64 Linux binary; force amd64 so arm64 hosts
 # (e.g. Apple Silicon, arm64 Linux with qemu-user) can still run it.
 DOCKER_PLATFORM := linux/amd64
@@ -54,6 +60,7 @@ compile:
 clean:
 	$(REBAR3) clean
 	@rm -f .compliance_port .compliance_pid
+	@rm -rf $(AUTOBAHN_REPORTS)
 
 check: certs
 	$(REBAR3) check
@@ -208,7 +215,51 @@ h3spec-image:
 			-t $(H3SPEC_IMAGE) -f $(H3SPEC_DOCKERFILE) priv; \
 	}
 
-compliance: h1-compliance h2-compliance h3-compliance
+ws-compliance: autobahn-image
+	@echo "=== WebSocket Compliance Tests with Autobahn (Docker) ==="
+	@$(REBAR3) as test compile
+	@rm -rf $(AUTOBAHN_REPORTS)
+	@mkdir -p $(AUTOBAHN_REPORTS)
+	@rm -f $(COMPLIANCE_PORT_FILE) $(COMPLIANCE_PID_FILE)
+	@echo "Starting WebSocket server (plaintext)..."
+	@( tail -f /dev/null | $(REBAR3) as test shell --eval 'nhttp_ws_compliance:start().' ) > $(COMPLIANCE_PORT_FILE) 2>&1 & echo $$! > $(COMPLIANCE_PID_FILE)
+	@for _ in $$(seq 1 100); do \
+		grep -qE 'PORT:[0-9]+' $(COMPLIANCE_PORT_FILE) 2>/dev/null && break; \
+		sleep 0.1; \
+	done
+	@PORT=$$(grep -oE 'PORT:[0-9]+' $(COMPLIANCE_PORT_FILE) | head -1 | cut -d: -f2); \
+	if [ -z "$$PORT" ]; then \
+		echo "Error: Could not parse port from server output:"; \
+		cat $(COMPLIANCE_PORT_FILE); \
+		kill $$(cat $(COMPLIANCE_PID_FILE)) 2>/dev/null; \
+		rm -f $(COMPLIANCE_PORT_FILE) $(COMPLIANCE_PID_FILE); \
+		exit 1; \
+	fi; \
+	echo "Server running on port $$PORT"; \
+	echo ""; \
+	sed "s|ws://[^\"]*|ws://$(COMPLIANCE_TARGET):$$PORT/ws|" \
+		$(AUTOBAHN_SPEC) > $(AUTOBAHN_REPORTS)/fuzzingclient.json; \
+	docker run --rm $(DOCKER_NET_ARGS) --user $$(id -u):$$(id -g) \
+		-v $(CURDIR)/$(AUTOBAHN_REPORTS):/reports $(AUTOBAHN_IMAGE) \
+		wstest --mode fuzzingclient --spec /reports/fuzzingclient.json || true
+	@-kill $$(cat $(COMPLIANCE_PID_FILE)) 2>/dev/null
+	@-pkill -f 'nhttp_ws_compliance:start' 2>/dev/null
+	@rm -f $(COMPLIANCE_PORT_FILE) $(COMPLIANCE_PID_FILE)
+	@./$(AUTOBAHN_GATE) $(AUTOBAHN_REPORTS)
+	@echo ""
+	@echo "=== WebSocket Compliance Tests Complete ==="
+
+autobahn-image:
+	@command -v docker >/dev/null 2>&1 || { \
+		echo "Error: docker not found in PATH. Install Docker to run compliance tests."; \
+		exit 1; \
+	}
+	@docker image inspect $(AUTOBAHN_IMAGE) >/dev/null 2>&1 || { \
+		echo "Building $(AUTOBAHN_IMAGE) from $(AUTOBAHN_DOCKERFILE)..."; \
+		docker build -t $(AUTOBAHN_IMAGE) -f $(AUTOBAHN_DOCKERFILE) priv; \
+	}
+
+compliance: h1-compliance h2-compliance h3-compliance ws-compliance
 
 #==============================================================================
 # Help
@@ -234,10 +285,14 @@ help:
 	@echo "    make binopt       - Analyze binary optimization opportunities"
 	@echo ""
 	@echo "  Compliance (Docker-based, no host h2spec/h3spec install needed):"
-	@echo "    make compliance      - Run all RFC compliance tests (h1spec + h2spec + h3spec)"
+	@echo "    make compliance      - Run all RFC compliance tests (h1spec + h2spec + h3spec + Autobahn)"
 	@echo "    make h1-compliance   - Run HTTP/1.1 tests (Docker: $(H1SPEC_IMAGE))"
 	@echo "    make h2-compliance   - Run HTTP/2 RFC 9113 tests (Docker: $(H2SPEC_IMAGE))"
 	@echo "    make h3-compliance   - Run HTTP/3 tests (Docker: $(H3SPEC_IMAGE))"
+	@echo "    make ws-compliance   - Run WebSocket RFC 6455 tests (Docker: $(AUTOBAHN_IMAGE))"
+	@echo ""
+	@echo "  ws-compliance gates on the report it writes to $(AUTOBAHN_REPORTS)/;"
+	@echo "  read the detail in $(AUTOBAHN_REPORTS)/index.html."
 	@echo ""
 	@echo "  Requirement: Docker daemon running. On macOS/Windows, Docker Desktop."
 	@echo ""

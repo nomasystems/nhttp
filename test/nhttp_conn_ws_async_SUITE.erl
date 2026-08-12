@@ -34,6 +34,7 @@ H1/H2/H3) lands in phase 6.
     external_close/1,
     protocol_error_close/1,
     oversized_message_close/1,
+    oversized_fragment_close/1,
     idle_timeout_close/1,
     handler_crash_close/1,
     handler_stop_close/1,
@@ -71,6 +72,7 @@ groups() ->
             external_close,
             protocol_error_close,
             oversized_message_close,
+            oversized_fragment_close,
             idle_timeout_close,
             handler_crash_close,
             handler_stop_close,
@@ -172,6 +174,16 @@ protocol_error_close(_Config) ->
 oversized_message_close(_Config) ->
     {Sock, Server, _Session} = setup_ws(max_msg_256, #{}),
     ok = send_text(Sock, binary:copy(<<"x">>, 1024)),
+    ?assertEqual({close, 1009, <<"Message Too Big">>}, recv_frame(Sock)),
+    ?assertMatch({closed, {fail, 1009, <<"Message Too Big">>}}, recv_observer_event(closed)),
+    teardown_ws(Sock, Server).
+
+oversized_fragment_close(_Config) ->
+    {Sock, Server, _Session} = setup_ws(max_msg_256, #{}),
+    Payload = binary:copy(<<"x">>, 1024),
+    MaskKey = <<1, 2, 3, 4>>,
+    Masked = crypto:exor(Payload, binary:copy(MaskKey, byte_size(Payload) div 4)),
+    ok = gen_tcp:send(Sock, <<0:1, 0:3, 1:4, 1:1, 127:7, 1024:64, MaskKey/binary, Masked/binary>>),
     ?assertEqual({close, 1009, <<"Message Too Big">>}, recv_frame(Sock)),
     ?assertMatch({closed, {fail, 1009, <<"Message Too Big">>}}, recv_observer_event(closed)),
     teardown_ws(Sock, Server).

@@ -8,12 +8,18 @@
 -include("nhttp_ws_codes.hrl").
 
 %%%-----------------------------------------------------------------------------
+%% MACROS
+%%%-----------------------------------------------------------------------------
+-define(MESSAGE_TOO_BIG, <<"Message Too Big">>).
+
+%%%-----------------------------------------------------------------------------
 %% API EXPORTS
 %%%-----------------------------------------------------------------------------
 -export([
     apply_handler_result/2,
     apply_runtime_opts/2,
     close_lifecycle/4,
+    decode_error_close/1,
     default_runtime_opts/0,
     dispatch_frame/4,
     dispatch_info/4,
@@ -132,6 +138,23 @@ close_lifecycle(Ctx, Reason, View, Handler) ->
             end
     end.
 
+-doc """
+Map a frame decoder error to the CLOSE code and reason RFC 6455 gives it.
+A text payload or CLOSE reason that is not valid UTF-8 is 1007 (§8.1), a
+message over the session limit is 1009 (§7.4.1), and every other framing
+error is a protocol error. The set of reasons the decoder can return is
+open, so an unknown one is a protocol error too.
+
+`message_too_large` carries the same reason text as the message-level
+check in `dispatch_frame/4`, because the peer sees one limit whichever
+side of reassembly trips it.
+""".
+-spec decode_error_close(term()) -> {nhttp_ws:close_code(), binary()}.
+decode_error_close(message_too_large) -> {?WS_CLOSE_MESSAGE_TOO_BIG, ?MESSAGE_TOO_BIG};
+decode_error_close(invalid_utf8 = R) -> {?WS_CLOSE_INVALID_PAYLOAD, str_or_atom(R)};
+decode_error_close(invalid_close_reason = R) -> {?WS_CLOSE_INVALID_PAYLOAD, str_or_atom(R)};
+decode_error_close(R) -> {?WS_CLOSE_PROTOCOL_ERROR, str_or_atom(R)}.
+
 -doc "Default runtime opts (everything off / unbounded).".
 -spec default_runtime_opts() -> runtime_opts().
 default_runtime_opts() ->
@@ -163,10 +186,9 @@ dispatch_frame(_Ctx, {close, Code, Reason}, _View, _Handler) ->
 dispatch_frame(Ctx, {Type, Data}, View, Handler) when Type =:= text orelse Type =:= binary ->
     case oversize(Data, maps:get(runtime_opts, View)) of
         true ->
-            ReasonBin = <<"Message Too Big">>,
             [
-                {send_close, ?WS_CLOSE_MESSAGE_TOO_BIG, ReasonBin},
-                {close_session, {fail, ?WS_CLOSE_MESSAGE_TOO_BIG, ReasonBin}}
+                {send_close, ?WS_CLOSE_MESSAGE_TOO_BIG, ?MESSAGE_TOO_BIG},
+                {close_session, {fail, ?WS_CLOSE_MESSAGE_TOO_BIG, ?MESSAGE_TOO_BIG}}
             ];
         false ->
             handler_frame_actions(Ctx, {Type, Data}, View, Handler)

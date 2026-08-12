@@ -1,0 +1,17 @@
+# Autobahn|Testsuite (crossbario/autobahn-testsuite), the reference RFC 6455
+# conformance runner, in fuzzing-client mode against a WebSocket server.
+#
+# Pinned by manifest digest rather than by tag, for the reason the h1spec image
+# is pinned by commit: upstream publishes `latest` and moves it, and a suite
+# that changes underneath a green run is not a receipt. The tag this repository
+# builds carries the wstest version behind that digest, so a pin bump rebuilds.
+#
+# Nothing is added on top. The image ships wstest and its case set; the spec
+# and the report directory are mounted at run time, so an edit to either costs
+# no rebuild. The default command runs the server mode, which tests a client
+# and is not what this is for, so invoke with the client mode as trailing args:
+#   docker run --rm --network=host \
+#     -v $PWD/autobahn-reports:/reports \
+#     nhttp/autobahn:<ver> \
+#     wstest --mode fuzzingclient --spec /reports/fuzzingclient.json
+FROM crossbario/autobahn-testsuite@sha256:519915fb568b04c9383f70a1c405ae3ff44ab9e35835b085239c258b6fac3074

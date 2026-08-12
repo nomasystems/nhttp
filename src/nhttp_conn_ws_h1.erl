@@ -145,6 +145,17 @@ ws_receive(Parent, Debug, State, IdleTimeout) ->
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - LIFECYCLE
 %%%-----------------------------------------------------------------------------
+-doc """
+Build the frame decoder from the runtime opts the open callback settled
+on. Armed here rather than at session construction because
+`max_message_size` bounds what the decoder accumulates, and until
+`handle_ws_open/2` returns there is no limit to give it.
+""".
+-spec arm_decoder(#state{}) -> #state{}.
+arm_decoder(#state{protocol_state = #h1_state{h1_ws = Ws} = H1} = State) ->
+    #{runtime_opts := Opts} = view(Ws),
+    State#state{protocol_state = H1#h1_state{ws_decoder = nhttp_ws:decoder_new(server, Opts)}}.
+
 -spec drain_peer(#state{}) -> ok.
 drain_peer(#state{socket = undefined}) ->
     ok;
@@ -216,11 +227,24 @@ open(
     ok = nhttp_stats:incr_ws_session(),
     View0 = view(Ws0),
     Actions = nhttp_conn_ws:open(nhttp_conn:log_ctx(State1), View0, Handler),
-    apply_actions(State1, Actions).
+    arm_decoder(apply_actions(State1, Actions)).
 
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - INCOMING DATA
 %%%-----------------------------------------------------------------------------
+-spec activate(pid(), [sys:debug_option()], #state{}) -> no_return().
+activate(Parent, Debug, #state{socket = Socket} = State) ->
+    case nhttp_sock:setopts(Socket, [{active, once}]) of
+        ok -> loop(Parent, Debug, State);
+        {error, _} -> finish({transport, closed}, normal, State)
+    end.
+
+-spec drain(pid(), [sys:debug_option()], #state{}, binary()) -> no_return().
+drain(Parent, Debug, State, <<>>) ->
+    activate(Parent, Debug, State);
+drain(Parent, Debug, State, _Rest) ->
+    process(Parent, Debug, State).
+
 -spec handle_data(pid(), [sys:debug_option()], #state{}, binary()) -> no_return().
 handle_data(
     Parent, Debug, #state{protocol_state = #h1_state{ws_buffer = Buffer} = H1} = State, Data
@@ -235,35 +259,33 @@ handle_data(
 process(
     Parent,
     Debug,
-    #state{protocol_state = #h1_state{ws_buffer = Buffer} = H1, socket = Socket} = State
+    #state{protocol_state = #h1_state{ws_buffer = Buffer, ws_decoder = Dec} = H1} = State
 ) ->
-    case nhttp_ws:decode(Buffer) of
-        {ok, Message, Rest} ->
-            State0 = State#state{protocol_state = H1#h1_state{ws_buffer = Rest}},
+    case nhttp_ws:decode_with_state(Buffer, Dec) of
+        {ok, Message, Rest, NewDec} ->
+            State0 = State#state{
+                protocol_state = H1#h1_state{ws_buffer = Rest, ws_decoder = NewDec}
+            },
             #state{handler = Handler, protocol_state = #h1_state{h1_ws = Ws}} = State0,
             View = view(Ws),
             Actions = nhttp_conn_ws:dispatch_frame(
                 nhttp_conn:log_ctx(State0), Message, View, Handler
             ),
             State1 = apply_actions(State0, Actions),
-            case Rest of
-                <<>> ->
-                    case nhttp_sock:setopts(Socket, [{active, once}]) of
-                        ok -> loop(Parent, Debug, State1);
-                        {error, _} -> finish({transport, closed}, normal, State1)
-                    end;
-                _ ->
-                    process(Parent, Debug, State1)
-            end;
-        {more, _Needed} ->
-            case nhttp_sock:setopts(Socket, [{active, once}]) of
-                ok -> loop(Parent, Debug, State);
-                {error, _} -> finish({transport, closed}, normal, State)
-            end;
+            drain(Parent, Debug, State1, Rest);
+        {continue, Rest, NewDec} ->
+            State1 = State#state{
+                protocol_state = H1#h1_state{ws_buffer = Rest, ws_decoder = NewDec}
+            },
+            drain(Parent, Debug, State1, Rest);
+        {more, _Needed, NewDec} ->
+            activate(Parent, Debug, State#state{
+                protocol_state = H1#h1_state{ws_decoder = NewDec}
+            });
         {error, Reason} ->
-            ReasonBin = nhttp_conn_ws:str_or_atom(Reason),
-            send_close(State, ?WS_CLOSE_PROTOCOL_ERROR, ReasonBin),
-            finish({fail, ?WS_CLOSE_PROTOCOL_ERROR, ReasonBin}, {ws_error, Reason}, State)
+            {Code, ReasonBin} = nhttp_conn_ws:decode_error_close(Reason),
+            send_close(State, Code, ReasonBin),
+            finish({fail, Code, ReasonBin}, {ws_error, Reason}, State)
     end.
 
 %%%-----------------------------------------------------------------------------
