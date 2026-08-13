@@ -76,8 +76,14 @@ end_per_testcase(_TestCase, _Config) ->
             ok;
         Pid when is_pid(Pid) ->
             case is_process_alive(Pid) of
-                true -> catch nhttp:stop(Pid);
-                false -> ok
+                true ->
+                    try
+                        nhttp:stop(Pid)
+                    catch
+                        _:_ -> ok
+                    end;
+                false ->
+                    ok
             end
     end,
     ok.
@@ -119,7 +125,11 @@ conn_crash_does_not_kill_acceptor(_Config) ->
     ok = gen_tcp:send(Sock2, get_request()),
     {ok, _} = gen_tcp:recv(Sock2, 0, 5000),
     gen_tcp:close(Sock2),
-    catch gen_tcp:close(Sock),
+    try
+        gen_tcp:close(Sock)
+    catch
+        _:_ -> ok
+    end,
     ok.
 
 conn_crash_releases_counter_slot(_Config) ->
@@ -142,7 +152,16 @@ conn_crash_releases_counter_slot(_Config) ->
     ok = gen_tcp:send(Sock2, get_request()),
     {ok, _} = gen_tcp:recv(Sock2, 0, 5000),
     gen_tcp:close(Sock2),
-    lists:foreach(fun(S) -> catch gen_tcp:close(S) end, Socks),
+    lists:foreach(
+        fun(S) ->
+            try
+                gen_tcp:close(S)
+            catch
+                _:_ -> ok
+            end
+        end,
+        Socks
+    ),
     ok.
 
 drain_completes_in_flight_and_rejects_new(_Config) ->
@@ -174,7 +193,16 @@ drain_completes_in_flight_and_rejects_new(_Config) ->
             gen_tcp:close(ProbeSock),
             ok
     end,
-    lists:foreach(fun(S) -> catch gen_tcp:close(S) end, Socks),
+    lists:foreach(
+        fun(S) ->
+            try
+                gen_tcp:close(S)
+            catch
+                _:_ -> ok
+            end
+        end,
+        Socks
+    ),
     ok.
 
 handler_init_failure_releases_slot(_Config) ->

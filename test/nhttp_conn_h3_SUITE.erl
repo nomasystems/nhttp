@@ -189,14 +189,22 @@ end_per_testcase(_TestCase, _Config) ->
         ListenerPid when is_pid(ListenerPid) ->
             case is_process_alive(ListenerPid) of
                 true ->
-                    catch nhttp:stop(ListenerPid),
+                    try
+                        nhttp:stop(ListenerPid)
+                    catch
+                        _:_ -> ok
+                    end,
                     _ = nhttp_test_helpers:wait_until_down(ListenerPid, 1000),
                     ok;
                 false ->
                     ok
             end
     end,
-    catch unregister(h3_conn_pid_receiver),
+    try
+        unregister(h3_conn_pid_receiver)
+    catch
+        _:_ -> ok
+    end,
     flush_mailbox(),
     ok.
 
@@ -548,8 +556,7 @@ h3_idle_timeout(Config) ->
 h3_hibernate(Config) ->
     {_, _, Port} = start_h3_server(Config, #{}),
 
-    catch unregister(h3_conn_pid_receiver),
-    register(h3_conn_pid_receiver, self()),
+    reregister(h3_conn_pid_receiver),
 
     {QConn, H3} = connect_h3(Port),
     {ok, 200, _, _, H3_1} = h3_request(QConn, H3, <<"GET">>, <<"/conn-pid">>, <<>>),
@@ -578,8 +585,7 @@ h3_hibernate(Config) ->
 h3_graceful_shutdown(Config) ->
     {_, _, Port} = start_h3_server(Config, #{}),
 
-    catch unregister(h3_conn_pid_receiver),
-    register(h3_conn_pid_receiver, self()),
+    reregister(h3_conn_pid_receiver),
 
     {QConn, H3} = connect_h3(Port),
     {ok, 200, _, _, _H3_1} = h3_request(QConn, H3, <<"GET">>, <<"/conn-pid">>, <<>>),
@@ -607,8 +613,7 @@ h3_graceful_shutdown(Config) ->
 h3_parent_exit(Config) ->
     {ListenerPid, _, Port} = start_h3_server(Config, #{}),
 
-    catch unregister(h3_conn_pid_receiver),
-    register(h3_conn_pid_receiver, self()),
+    reregister(h3_conn_pid_receiver),
 
     {QConn, H3} = connect_h3(Port),
     {ok, 200, _, _, _H3_1} = h3_request(QConn, H3, <<"GET">>, <<"/conn-pid">>, <<>>),
@@ -641,8 +646,7 @@ h3_parent_exit(Config) ->
 h3_quic_closed(Config) ->
     {_, _, Port} = start_h3_server(Config, #{}),
 
-    catch unregister(h3_conn_pid_receiver),
-    register(h3_conn_pid_receiver, self()),
+    reregister(h3_conn_pid_receiver),
 
     {QConn, H3} = connect_h3(Port),
     {ok, 200, _, _, _H3_1} = h3_request(QConn, H3, <<"GET">>, <<"/conn-pid">>, <<>>),
@@ -668,8 +672,7 @@ h3_quic_closed(Config) ->
 h3_handler_terminate(Config) ->
     {_, _, Port} = start_h3_server(Config, #{}),
 
-    catch unregister(h3_conn_pid_receiver),
-    register(h3_conn_pid_receiver, self()),
+    reregister(h3_conn_pid_receiver),
 
     {QConn, H3} = connect_h3(Port),
     {ok, 200, _, _, _H3_1} = h3_request(QConn, H3, <<"GET">>, <<"/conn-pid">>, <<>>),
@@ -698,8 +701,7 @@ h3_handler_terminate(Config) ->
 h3_system_get_status(Config) ->
     {_, _, Port} = start_h3_server(Config, #{}),
 
-    catch unregister(h3_conn_pid_receiver),
-    register(h3_conn_pid_receiver, self()),
+    reregister(h3_conn_pid_receiver),
 
     {QConn, H3} = connect_h3(Port),
     {ok, 200, _, _, _H3_1} = h3_request(QConn, H3, <<"GET">>, <<"/conn-pid">>, <<>>),
@@ -721,8 +723,7 @@ h3_system_get_status(Config) ->
 h3_system_suspend_resume(Config) ->
     {_, _, Port} = start_h3_server(Config, #{}),
 
-    catch unregister(h3_conn_pid_receiver),
-    register(h3_conn_pid_receiver, self()),
+    reregister(h3_conn_pid_receiver),
 
     {QConn, H3} = connect_h3(Port),
     {ok, 200, _, _, _H3_1} = h3_request(QConn, H3, <<"GET">>, <<"/conn-pid">>, <<>>),
@@ -746,8 +747,7 @@ h3_system_suspend_resume(Config) ->
 h3_system_code_change(Config) ->
     {_, _, Port} = start_h3_server(Config, #{}),
 
-    catch unregister(h3_conn_pid_receiver),
-    register(h3_conn_pid_receiver, self()),
+    reregister(h3_conn_pid_receiver),
 
     {QConn, H3} = connect_h3(Port),
     {ok, 200, _, _, _H3_1} = h3_request(QConn, H3, <<"GET">>, <<"/conn-pid">>, <<>>),
@@ -772,8 +772,7 @@ h3_system_code_change(Config) ->
 h3_system_terminate(Config) ->
     {_, _, Port} = start_h3_server(Config, #{}),
 
-    catch unregister(h3_conn_pid_receiver),
-    register(h3_conn_pid_receiver, self()),
+    reregister(h3_conn_pid_receiver),
 
     {QConn, H3} = connect_h3(Port),
     {ok, 200, _, _, _H3_1} = h3_request(QConn, H3, <<"GET">>, <<"/conn-pid">>, <<>>),
@@ -1139,3 +1138,11 @@ flush_mailbox() ->
     after 0 ->
         ok
     end.
+
+reregister(Name) ->
+    try
+        unregister(Name)
+    catch
+        _:_ -> ok
+    end,
+    register(Name, self()).

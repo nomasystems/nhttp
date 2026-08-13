@@ -1472,6 +1472,14 @@ count_responses(Binary, Pattern, Count) ->
             count_responses(Rest, Pattern, Count + 1)
     end.
 
+reregister(Name) ->
+    try
+        unregister(Name)
+    catch
+        _:_ -> ok
+    end,
+    register(Name, self()).
+
 %%%-----------------------------------------------------------------------------
 %%% CONNECTION EVENT TESTS
 %%%-----------------------------------------------------------------------------
@@ -1547,8 +1555,7 @@ conn_idle_timeout(_Config) ->
     ok.
 
 conn_graceful_shutdown_h1(_Config) ->
-    catch unregister(conn_pid_receiver),
-    register(conn_pid_receiver, self()),
+    reregister(conn_pid_receiver),
 
     {ok, Pid} = nhttp:start_link(#{
         port => 0,
@@ -1597,8 +1604,7 @@ conn_graceful_shutdown_h2(Config) ->
                 {Cert, ?config(keyfile, Config)}
         end,
 
-    catch unregister(conn_pid_receiver),
-    register(conn_pid_receiver, self()),
+    reregister(conn_pid_receiver),
 
     {ok, Pid} = nhttp:start_link(#{
         port => 0,
@@ -2259,8 +2265,7 @@ h1_websocket_no_handler(_Config) ->
 %%%-----------------------------------------------------------------------------
 
 conn_system_messages(_Config) ->
-    catch unregister(conn_pid_receiver),
-    register(conn_pid_receiver, self()),
+    reregister(conn_pid_receiver),
 
     {ok, Pid} = nhttp:start_link(#{
         port => 0,
@@ -2787,8 +2792,7 @@ h1_pipeline_depth_limit(_Config) ->
     ok.
 
 h1_pipeline_shutdown_mid_batch(_Config) ->
-    catch unregister(conn_pid_receiver),
-    register(conn_pid_receiver, self()),
+    reregister(conn_pid_receiver),
 
     {ok, Pid} = nhttp:start_link(#{
         port => 0,
@@ -3333,8 +3337,7 @@ alpn_h2_first_fallback(_Config) ->
 %%%-----------------------------------------------------------------------------
 
 h1_hibernate_keepalive(_Config) ->
-    catch unregister(conn_pid_receiver),
-    register(conn_pid_receiver, self()),
+    reregister(conn_pid_receiver),
 
     {ok, Pid} = nhttp:start_link(#{
         port => 0,
@@ -3368,8 +3371,7 @@ h1_hibernate_keepalive(_Config) ->
     ok.
 
 h1_hibernate_idle_timeout(_Config) ->
-    catch unregister(conn_pid_receiver),
-    register(conn_pid_receiver, self()),
+    reregister(conn_pid_receiver),
 
     {ok, Pid} = nhttp:start_link(#{
         port => 0,
@@ -3462,8 +3464,7 @@ h2_hibernate_ping(Config) ->
     ok.
 
 h1_websocket_hibernate_ping(_Config) ->
-    catch unregister(conn_pid_receiver),
-    register(conn_pid_receiver, self()),
+    reregister(conn_pid_receiver),
 
     {ok, Pid} = nhttp:start_link(#{
         port => 0,
@@ -4001,8 +4002,7 @@ h1_all_other_methods(_Config) ->
     ok.
 
 h1_system_code_change(_Config) ->
-    catch unregister(conn_pid_receiver),
-    register(conn_pid_receiver, self()),
+    reregister(conn_pid_receiver),
 
     {ok, Pid} = nhttp:start_link(#{
         port => 0,
@@ -4040,8 +4040,7 @@ h1_system_code_change(_Config) ->
     ok.
 
 h1_system_terminate(_Config) ->
-    catch unregister(conn_pid_receiver),
-    register(conn_pid_receiver, self()),
+    reregister(conn_pid_receiver),
 
     {ok, Pid} = nhttp:start_link(#{
         port => 0,

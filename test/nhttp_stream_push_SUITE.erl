@@ -257,7 +257,11 @@ h1_client_closes_midstream(_Config) ->
         ?assert(ObservedReason =:= closed orelse ObservedReason =:= timeout),
         ?assertMatch([{cleanup_ran, true, _}], ets:lookup(?TRY_AFTER_TABLE, cleanup_ran))
     after
-        catch unregister(test_parent_marker),
+        try
+            unregister(test_parent_marker)
+        catch
+            _:_ -> ok
+        end,
         nhttp:stop(Pid)
     end.
 
@@ -428,7 +432,11 @@ h2_rst_stream_midstream(Config) ->
         ?assert(Reason =:= closed orelse Reason =:= timeout),
         ssl:close(Sock)
     after
-        catch unregister(test_parent_marker),
+        try
+            unregister(test_parent_marker)
+        catch
+            _:_ -> ok
+        end,
         nhttp:stop(Pid)
     end.
 
@@ -857,7 +865,11 @@ h3_reset_midstream(Config) ->
         [{_, Reason, _}] = ets:lookup(?TRY_AFTER_TABLE, observed_error),
         ?assert(Reason =:= closed orelse Reason =:= timeout)
     after
-        catch unregister(test_parent_marker),
+        try
+            unregister(test_parent_marker)
+        catch
+            _:_ -> ok
+        end,
         nhttp:stop(Pid)
     end.
 
@@ -950,7 +962,11 @@ h3_client_resets_stream(Config) ->
         ?assert(erlang:is_process_alive(Pid)),
         nhttp_h3_test_client:close(QConn)
     after
-        catch unregister(test_parent_marker),
+        try
+            unregister(test_parent_marker)
+        catch
+            _:_ -> ok
+        end,
         nhttp:stop(Pid)
     end.
 

@@ -81,7 +81,7 @@ init_per_testcase(_TestCase, Config) ->
 
 end_per_testcase(_TestCase, _Config) ->
     case erlang:erase(listener_pid) of
-        Pid when is_pid(Pid) -> catch nhttp:stop(Pid);
+        Pid when is_pid(Pid) -> nhttp:stop(Pid);
         _ -> ok
     end,
     ok.

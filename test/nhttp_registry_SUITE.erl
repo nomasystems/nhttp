@@ -62,8 +62,14 @@ end_per_testcase(_TestCase, _Config) ->
             lists:foreach(
                 fun(Pid) ->
                     case is_pid(Pid) andalso is_process_alive(Pid) of
-                        true -> catch nhttp:stop(Pid);
-                        false -> ok
+                        true ->
+                            try
+                                nhttp:stop(Pid)
+                            catch
+                                _:_ -> ok
+                            end;
+                        false ->
+                            ok
                     end
                 end,
                 Pids
