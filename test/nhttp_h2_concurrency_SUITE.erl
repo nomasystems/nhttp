@@ -261,11 +261,7 @@ drain_waits_for_in_flight_workers(Config) ->
         end,
         ssl:close(Sock)
     after
-        try
-            nhttp:stop(Pid)
-        catch
-            _:_ -> ok
-        end
+        nhttp:stop(Pid)
     end.
 
 %%%-----------------------------------------------------------------------------
