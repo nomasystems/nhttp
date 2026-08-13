@@ -420,16 +420,8 @@ open_extra_stream(#ctx{sock = Sock, sessions = Sessions} = Ctx, StreamId) ->
     Ctx#ctx{sessions = Sessions ++ [{StreamId, Session}]}.
 
 teardown_ws(#ctx{sock = Sock, server = Server}) ->
-    try
-        ssl:close(Sock)
-    catch
-        _:_ -> ok
-    end,
-    try
-        nhttp:stop(Server)
-    catch
-        _:_ -> ok
-    end,
+    ssl:close(Sock),
+    nhttp:stop(Server),
     flush_observer().
 
 h2_connect(Config, Mode, Observer) ->

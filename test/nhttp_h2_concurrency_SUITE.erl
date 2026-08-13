@@ -259,11 +259,7 @@ drain_waits_for_in_flight_workers(Config) ->
         after 6000 ->
             error(drain_timeout)
         end,
-        try
-            ssl:close(Sock)
-        catch
-            _:_ -> ok
-        end
+        ssl:close(Sock)
     after
         try
             nhttp:stop(Pid)

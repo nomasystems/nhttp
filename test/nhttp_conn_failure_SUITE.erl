@@ -253,11 +253,6 @@ h3_abrupt_close_mid_request(Config) ->
         after 5000 ->
             error(conn_did_not_terminate)
         end,
-        try
-            unregister(h3_conn_pid_receiver)
-        catch
-            _:_ -> ok
-        end,
         nhttp:stop(Pid)
     end).
 

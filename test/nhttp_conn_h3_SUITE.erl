@@ -189,21 +189,12 @@ end_per_testcase(_TestCase, _Config) ->
         ListenerPid when is_pid(ListenerPid) ->
             case is_process_alive(ListenerPid) of
                 true ->
-                    try
-                        nhttp:stop(ListenerPid)
-                    catch
-                        _:_ -> ok
-                    end,
+                    nhttp:stop(ListenerPid),
                     _ = nhttp_test_helpers:wait_until_down(ListenerPid, 1000),
                     ok;
                 false ->
                     ok
             end
-    end,
-    try
-        unregister(h3_conn_pid_receiver)
-    catch
-        _:_ -> ok
     end,
     flush_mailbox(),
     ok.

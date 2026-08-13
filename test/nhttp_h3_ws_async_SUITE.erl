@@ -288,16 +288,8 @@ open_extra_stream(#ctx{qconn = QConn, h3 = H3, streams = Streams} = Ctx) ->
     Ctx#ctx{h3 = H3_1, streams = Streams ++ [{StreamId, Session}]}.
 
 teardown_ws(#ctx{server = Server, qconn = QConn}) ->
-    try
-        nhttp_h3_test_client:close(QConn)
-    catch
-        _:_ -> ok
-    end,
-    try
-        nhttp:stop(Server)
-    catch
-        _:_ -> ok
-    end,
+    nhttp_h3_test_client:close(QConn),
+    nhttp:stop(Server),
     flush_observer().
 
 h3_connect(Config, Mode, Observer) ->
