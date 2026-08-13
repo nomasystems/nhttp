@@ -232,8 +232,7 @@ h3_abrupt_close_mid_request(Config) ->
             handler => nhttp_conn_h3_handler,
             versions => [http3]
         }),
-        catch unregister(h3_conn_pid_receiver),
-        register(h3_conn_pid_receiver, self()),
+        reregister(h3_conn_pid_receiver),
         {QConn, H3} = nhttp_h3_test_client:connect(Port),
         {ok, 200, _, _, H3_1} =
             nhttp_h3_test_client:request(QConn, H3, <<"GET">>, <<"/conn-pid">>, <<>>),
@@ -254,7 +253,6 @@ h3_abrupt_close_mid_request(Config) ->
         after 5000 ->
             error(conn_did_not_terminate)
         end,
-        catch unregister(h3_conn_pid_receiver),
         nhttp:stop(Pid)
     end).
 
@@ -302,6 +300,14 @@ with_tls(Config, Fun) ->
 
 get_request(Path) ->
     <<"GET ", Path/binary, " HTTP/1.1\r\nHost: localhost\r\n\r\n">>.
+
+reregister(Name) ->
+    try
+        unregister(Name)
+    catch
+        _:_ -> ok
+    end,
+    register(Name, self()).
 
 run_close_before_init(Versions) ->
     {ok, LSock} = gen_tcp:listen(0, [binary, {active, false}, {reuseaddr, true}]),

@@ -77,7 +77,7 @@ init_per_testcase(_TestCase, Config) ->
 end_per_testcase(_TestCase, Config) ->
     case erlang:get(listener_pid) of
         Pid when is_pid(Pid) ->
-            catch nhttp:stop(Pid),
+            nhttp:stop(Pid),
             erlang:erase(listener_pid);
         _ ->
             ok
@@ -165,7 +165,7 @@ mixed_max_connections_per_transport(Config) ->
     ?assertEqual(<<"Hello!">>, Body),
 
     nhttp_h3_test_client:close(QConn),
-    catch ssl:close(Sock1),
+    ssl:close(Sock1),
     ok.
 
 mixed_drain_waits_both(Config) ->
@@ -186,7 +186,7 @@ mixed_drain_waits_both(Config) ->
     end,
 
     nhttp_h3_test_client:close(QConn),
-    catch ssl:close(Sock),
+    ssl:close(Sock),
 
     MRef = monitor(process, Pid),
     nhttp:stop(Pid),

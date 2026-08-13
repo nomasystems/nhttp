@@ -324,8 +324,8 @@ setup_ws(Mode, ExtraOpts) ->
     {Sock, Server, Session}.
 
 teardown_ws(Sock, Server) ->
-    catch gen_tcp:close(Sock),
-    catch nhttp:stop(Server),
+    gen_tcp:close(Sock),
+    nhttp:stop(Server),
     flush_observer().
 
 recv_observer_event(Tag) ->
