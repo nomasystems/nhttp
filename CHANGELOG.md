@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.3] - 2026-08-20
+
+### Changed
+
+- Requires `nhttp_lib` 1.0.4 for correct HTTP/1.1 `Content-Length` handling. An empty-body response now emits `Content-Length: 0`, a 1xx, 204, or 304 response emits no `Content-Length` field, and a 2xx response to a `CONNECT` request can suppress it (RFC 9110 Section 8.6)
+
 ## [1.0.2] - 2026-08-13
 
 ### Added
