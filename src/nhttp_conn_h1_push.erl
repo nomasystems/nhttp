@@ -127,8 +127,10 @@ continue_after_h1_push(
 ) ->
     case Buffer of
         <<>> ->
-            ok = nhttp_sock:setopts(Socket, [{active, once}]),
-            nhttp_conn_h1:h1_loop(Parent, Debug, State);
+            case nhttp_sock:setopts(Socket, [{active, once}]) of
+                ok -> nhttp_conn_h1:h1_loop(Parent, Debug, State);
+                {error, _} -> nhttp_conn:stop(normal, State)
+            end;
         _ ->
             nhttp_conn_h1:process_h1_pipeline(Parent, Debug, State, 0)
     end.

@@ -32,6 +32,7 @@
     h1_sys_messages/1,
     h2_abrupt_close_mid_stream/1,
     h1_close_before_init/1,
+    h1_tls_close_after_keepalive_response/1,
     h2_close_before_init/1,
     h2_idle_timeout/1,
     h2_socket_error_on_response/1,
@@ -45,6 +46,7 @@
 ]).
 
 -define(IDLE_MS, 150).
+-define(PEER_CLOSE_SETTLE_MS, 300).
 
 %%%-----------------------------------------------------------------------------
 %%% CT CALLBACKS
@@ -59,6 +61,7 @@ all() ->
         h1_socket_error_on_response,
         h1_sys_messages,
         h1_close_before_init,
+        h1_tls_close_after_keepalive_response,
         h2_close_before_init,
         h2_abrupt_close_mid_stream,
         h2_idle_timeout,
@@ -148,6 +151,25 @@ h1_abrupt_close_mid_request(_Config) ->
     ok = nhttp_test_helpers:wait_for_no_conns(Pid, 3000),
     nhttp:stop(Pid),
     ok.
+
+h1_tls_close_after_keepalive_response(Config) ->
+    with_tls(Config, fun(Tls) ->
+        {ok, Pid, Port} = nhttp_test_helpers:start(
+            Tls#{handler => ?MODULE, versions => [http1_1]}
+        ),
+        {ok, Sock} = tls_connect(Port),
+        ok = ssl:send(Sock, get_request(<<"/slow">>)),
+        [ConnPid] = nhttp_test_helpers:wait_for_conns(Pid, 1, 5000),
+        Ref = monitor(process, ConnPid),
+        ok = ssl:close(Sock),
+        receive
+            {'DOWN', Ref, process, ConnPid, Reason} ->
+                ?assertEqual(normal, Reason)
+        after 5000 ->
+            error(conn_did_not_terminate)
+        end,
+        nhttp:stop(Pid)
+    end).
 
 h1_socket_error_on_response(_Config) ->
     {ok, Pid, Port} = start_h1(),
@@ -263,6 +285,9 @@ h3_abrupt_close_mid_request(Config) ->
 init(Args) ->
     {ok, Args}.
 
+handle_request(#{path := <<"/slow">>}, State) ->
+    timer:sleep(?PEER_CLOSE_SETTLE_MS),
+    {reply, nhttp_resp:ok(<<"ok">>), State};
 handle_request(#{path := <<"/stream-forever">>}, State) ->
     Producer = fun stream_forever/1,
     {stream, nhttp_stream:producer(200, [], Producer), State};
@@ -297,6 +322,19 @@ with_tls(Config, Fun) ->
             KeyFile = ?config(keyfile, Config),
             Fun(#{tls => #{certfile => CertFile, keyfile => KeyFile}})
     end.
+
+tls_connect(Port) ->
+    ssl:connect(
+        "127.0.0.1",
+        Port,
+        [
+            binary,
+            {active, false},
+            {verify, verify_none},
+            {alpn_advertised_protocols, [<<"http/1.1">>]}
+        ],
+        5000
+    ).
 
 get_request(Path) ->
     <<"GET ", Path/binary, " HTTP/1.1\r\nHost: localhost\r\n\r\n">>.

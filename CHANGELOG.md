@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.4] - 2026-08-24
+
+### Fixed
+
+- HTTP/1.1 connections no longer crash when the peer closes the socket. A `setopts` call that gives an error now closes the connection normally. A body read that gives an error tells the handler that the peer closed the connection
+
 ## [1.0.3] - 2026-08-20
 
 ### Changed
