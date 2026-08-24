@@ -264,8 +264,10 @@ process_h1_pipeline(
                     send_h1_error(State, header_too_large),
                     nhttp_conn:stop({protocol_error, header_too_large}, State);
                 false ->
-                    ok = nhttp_sock:setopts(Socket, [{active, once}]),
-                    h1_loop(Parent, Debug, arm_head_deadline(State))
+                    case nhttp_sock:setopts(Socket, [{active, once}]) of
+                        ok -> h1_loop(Parent, Debug, arm_head_deadline(State));
+                        {error, _} -> nhttp_conn:stop(normal, State)
+                    end
             end;
         {error, Reason} ->
             send_h1_error(State, Reason),
@@ -593,8 +595,14 @@ drain_h1_body_buffer(
             apply_h1_body_chunks(Parent, Debug, State1, Request, BodyState, ReqSpan, Chunks);
         {more, _MinBytes, NewStream} ->
             State1 = State#state{protocol_state = H1#h1_state{body_stream = NewStream}},
-            ok = nhttp_sock:setopts(State#state.socket, [{active, once}]),
-            await_h1_body_data(Parent, Debug, State1, Request, BodyState, ReqSpan);
+            case nhttp_sock:setopts(State#state.socket, [{active, once}]) of
+                ok ->
+                    await_h1_body_data(Parent, Debug, State1, Request, BodyState, ReqSpan);
+                {error, _} ->
+                    deliver_h1_body_abort(
+                        Parent, Debug, State1, Request, BodyState, ReqSpan, peer_closed
+                    )
+            end;
         {error, Reason} ->
             deliver_h1_body_abort(Parent, Debug, State, Request, BodyState, ReqSpan, Reason)
     end.
@@ -642,20 +650,26 @@ finish_h1_request(
 ) ->
     case KeepAlive of
         true when PipelineDepth < MaxPipelineDepth ->
-            ok = nhttp_sock:setopts(Socket, [{active, once}]),
-            receive
-                {system, From, Request} ->
-                    sys:handle_system_msg(Request, From, Parent, ?MODULE, Debug, State);
-                shutdown ->
-                    nhttp_conn:stop(normal, State);
-                {'EXIT', Parent, Reason} ->
-                    nhttp_conn:stop_parent(Reason, State)
-            after 0 ->
-                process_h1_pipeline(Parent, Debug, State, PipelineDepth + 1)
+            case nhttp_sock:setopts(Socket, [{active, once}]) of
+                ok ->
+                    receive
+                        {system, From, Request} ->
+                            sys:handle_system_msg(Request, From, Parent, ?MODULE, Debug, State);
+                        shutdown ->
+                            nhttp_conn:stop(normal, State);
+                        {'EXIT', Parent, Reason} ->
+                            nhttp_conn:stop_parent(Reason, State)
+                    after 0 ->
+                        process_h1_pipeline(Parent, Debug, State, PipelineDepth + 1)
+                    end;
+                {error, _} ->
+                    nhttp_conn:stop(normal, State)
             end;
         true ->
-            ok = nhttp_sock:setopts(Socket, [{active, once}]),
-            yield_and_continue_h1(Parent, Debug, State);
+            case nhttp_sock:setopts(Socket, [{active, once}]) of
+                ok -> yield_and_continue_h1(Parent, Debug, State);
+                {error, _} -> nhttp_conn:stop(normal, State)
+            end;
         false ->
             nhttp_conn:stop(normal, State)
     end.
@@ -747,15 +761,19 @@ handle_ws_upgrade(
             end,
             case nhttp_sock:send(Socket, Response) of
                 ok ->
-                    ok = nhttp_sock:setopts(Socket, [{packet, raw}, {active, once}]),
-                    nhttp_conn_ws_h1:start(
-                        Parent,
-                        Debug,
-                        State#state{
-                            family = websocket,
-                            protocol_state = H1#h1_state{buffer = <<>>}
-                        }
-                    );
+                    case nhttp_sock:setopts(Socket, [{packet, raw}, {active, once}]) of
+                        ok ->
+                            nhttp_conn_ws_h1:start(
+                                Parent,
+                                Debug,
+                                State#state{
+                                    family = websocket,
+                                    protocol_state = H1#h1_state{buffer = <<>>}
+                                }
+                            );
+                        {error, _} ->
+                            nhttp_conn:stop(normal, State)
+                    end;
                 {error, Reason} ->
                     nhttp_conn:stop({socket_error, Reason}, State)
             end;
