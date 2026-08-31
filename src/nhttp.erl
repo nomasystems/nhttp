@@ -260,7 +260,8 @@ Connection timeouts (milliseconds, or `infinity`).
 
 -type start_error() ::
     {invalid_opts, {nhttp_error:category(), nhttp_error:reason()}}
-    | {listen_failed, inet:posix() | quic_error()}.
+    | {listen_failed, inet:posix() | quic_error()}
+    | {already_started, pid()}.
 
 -type quic_error() :: term().
 
