@@ -21,6 +21,7 @@ all() ->
     [
         classify_term_reason_test,
         init_exit_reason_test,
+        sock_stop_reason_test,
         exit_reason_test,
         select_family_test,
         version_family_mapping_test,
@@ -71,6 +72,18 @@ init_exit_reason_test(_Config) ->
         nhttp_conn:init_exit_reason({proxy_protocol, leftover_bytes})
     ),
     ?assertEqual(socket_transfer_timeout, nhttp_conn:init_exit_reason(socket_transfer_timeout)).
+
+sock_stop_reason_test(_Config) ->
+    ?assertEqual(normal, nhttp_conn:sock_stop_reason(closed)),
+    ?assertEqual(normal, nhttp_conn:sock_stop_reason(einval)),
+    ?assertEqual(normal, nhttp_conn:sock_stop_reason(enotconn)),
+    ?assertEqual(normal, nhttp_conn:sock_stop_reason(econnreset)),
+    ?assertEqual(normal, nhttp_conn:sock_stop_reason(epipe)),
+    ?assertEqual({socket_error, timeout}, nhttp_conn:sock_stop_reason(timeout)),
+    ?assertEqual({socket_error, ebadf}, nhttp_conn:sock_stop_reason(ebadf)),
+    ?assertEqual(
+        {socket_error, {tls_error, bad}}, nhttp_conn:sock_stop_reason({tls_error, bad})
+    ).
 
 exit_reason_test(_Config) ->
     ?assertEqual(shutdown, nhttp_conn:exit_reason(shutdown)),
