@@ -227,7 +227,7 @@ process_h1_pipeline(
     Parent,
     Debug,
     #state{
-        protocol_state = #h1_state{buffer = Buffer} = H1, socket = Socket, opts = Opts
+        protocol_state = #h1_state{buffer = Buffer} = H1, opts = Opts
     } = State,
     PipelineDepth
 ) ->
@@ -264,9 +264,9 @@ process_h1_pipeline(
                     send_h1_error(State, header_too_large),
                     nhttp_conn:stop({protocol_error, header_too_large}, State);
                 false ->
-                    case nhttp_sock:setopts(Socket, [{active, once}]) of
+                    case nhttp_conn:activate(State) of
                         ok -> h1_loop(Parent, Debug, arm_head_deadline(State));
-                        {error, _} -> nhttp_conn:stop(normal, State)
+                        {stop, Reason} -> nhttp_conn:stop(Reason, State)
                     end
             end;
         {error, Reason} ->
@@ -595,12 +595,16 @@ drain_h1_body_buffer(
             apply_h1_body_chunks(Parent, Debug, State1, Request, BodyState, ReqSpan, Chunks);
         {more, _MinBytes, NewStream} ->
             State1 = State#state{protocol_state = H1#h1_state{body_stream = NewStream}},
-            case nhttp_sock:setopts(State#state.socket, [{active, once}]) of
+            case nhttp_conn:activate(State1) of
                 ok ->
                     await_h1_body_data(Parent, Debug, State1, Request, BodyState, ReqSpan);
-                {error, _} ->
+                {stop, normal} ->
                     deliver_h1_body_abort(
                         Parent, Debug, State1, Request, BodyState, ReqSpan, peer_closed
+                    );
+                {stop, Reason} ->
+                    deliver_h1_body_abort(
+                        Parent, Debug, State1, Request, BodyState, ReqSpan, Reason
                     )
             end;
         {error, Reason} ->
@@ -644,13 +648,13 @@ finalize_h1_body_terminal(#state{protocol_state = #h1_state{} = H1} = State, {da
 finish_h1_request(
     Parent,
     Debug,
-    #state{socket = Socket, protocol_state = #h1_state{keep_alive = KeepAlive}} = State,
+    #state{protocol_state = #h1_state{keep_alive = KeepAlive}} = State,
     PipelineDepth,
     MaxPipelineDepth
 ) ->
     case KeepAlive of
         true when PipelineDepth < MaxPipelineDepth ->
-            case nhttp_sock:setopts(Socket, [{active, once}]) of
+            case nhttp_conn:activate(State) of
                 ok ->
                     receive
                         {system, From, Request} ->
@@ -662,13 +666,13 @@ finish_h1_request(
                     after 0 ->
                         process_h1_pipeline(Parent, Debug, State, PipelineDepth + 1)
                     end;
-                {error, _} ->
-                    nhttp_conn:stop(normal, State)
+                {stop, Reason} ->
+                    nhttp_conn:stop(Reason, State)
             end;
         true ->
-            case nhttp_sock:setopts(Socket, [{active, once}]) of
+            case nhttp_conn:activate(State) of
                 ok -> yield_and_continue_h1(Parent, Debug, State);
-                {error, _} -> nhttp_conn:stop(normal, State)
+                {stop, Reason} -> nhttp_conn:stop(Reason, State)
             end;
         false ->
             nhttp_conn:stop(normal, State)
@@ -761,7 +765,7 @@ handle_ws_upgrade(
             end,
             case nhttp_sock:send(Socket, Response) of
                 ok ->
-                    case nhttp_sock:setopts(Socket, [{packet, raw}, {active, once}]) of
+                    case nhttp_conn:activate(State, [{packet, raw}]) of
                         ok ->
                             nhttp_conn_ws_h1:start(
                                 Parent,
@@ -771,11 +775,11 @@ handle_ws_upgrade(
                                     protocol_state = H1#h1_state{buffer = <<>>}
                                 }
                             );
-                        {error, _} ->
-                            nhttp_conn:stop(normal, State)
+                        {stop, Reason} ->
+                            nhttp_conn:stop(Reason, State)
                     end;
                 {error, Reason} ->
-                    nhttp_conn:stop({socket_error, Reason}, State)
+                    nhttp_conn:stop(nhttp_conn:sock_stop_reason(Reason), State)
             end;
         {error, Reason} ->
             send_h1_error_response(

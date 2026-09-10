@@ -91,13 +91,13 @@ dispatch_h1_stream_push(
     end.
 
 -spec h1_stream_push_loop(pid(), [sys:debug_option()], #state{}, h1_push_ctx()) -> no_return().
-h1_stream_push_loop(Parent, Debug, #state{socket = Socket} = State, Ctx) ->
-    case nhttp_sock:setopts(Socket, [{active, once}]) of
+h1_stream_push_loop(Parent, Debug, State, Ctx) ->
+    case nhttp_conn:activate(State) of
         ok ->
             h1_stream_push_recv(Parent, Debug, State, Ctx);
-        {error, _} ->
+        {stop, Reason} ->
             ok = release_h1_worker(Ctx),
-            nhttp_conn:stop(normal, State)
+            nhttp_conn:stop(Reason, State)
     end.
 
 %%%-----------------------------------------------------------------------------
@@ -123,13 +123,13 @@ continue_after_h1_push(
 ) ->
     nhttp_conn:stop(normal, State);
 continue_after_h1_push(
-    Parent, Debug, #state{socket = Socket, protocol_state = #h1_state{buffer = Buffer}} = State
+    Parent, Debug, #state{protocol_state = #h1_state{buffer = Buffer}} = State
 ) ->
     case Buffer of
         <<>> ->
-            case nhttp_sock:setopts(Socket, [{active, once}]) of
+            case nhttp_conn:activate(State) of
                 ok -> nhttp_conn_h1:h1_loop(Parent, Debug, State);
-                {error, _} -> nhttp_conn:stop(normal, State)
+                {stop, Reason} -> nhttp_conn:stop(Reason, State)
             end;
         _ ->
             nhttp_conn_h1:process_h1_pipeline(Parent, Debug, State, 0)
@@ -157,10 +157,10 @@ h1_stream_push_recv(Parent, Debug, #state{idle_timeout = IdleTimeout} = State, C
                     BytesAdded = iolist_size(Data),
                     Ctx2 = Ctx1#h1_push_ctx{bytes = Ctx1#h1_push_ctx.bytes + BytesAdded},
                     h1_stream_push_loop(Parent, Debug, State, Ctx2);
-                {error, _Reason} ->
+                {error, Reason} ->
                     WPid ! {chunk_ack, Ref, {error, closed}},
                     FinalState = finalize_h1_stream_push(State, Ctx1, peer_closed),
-                    nhttp_conn:stop(normal, FinalState)
+                    nhttp_conn:stop(nhttp_conn:sock_stop_reason(Reason), FinalState)
             end;
         {stream_done, WPid, Ref} ->
             Ctx1 = maybe_emit_h1_stream_start(State, Ctx),

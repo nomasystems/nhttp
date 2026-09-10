@@ -34,6 +34,8 @@
 %% INTERNAL EXPORTS (CROSS-MODULE HELPERS USED BY NHTTP_CONN_H1, NHTTP_CONN_H2)
 %%%-----------------------------------------------------------------------------
 -export([
+    activate/1,
+    activate/2,
     alt_svc_headers/2,
     cancel_hibernate_timer/1,
     compress_config/1,
@@ -50,6 +52,7 @@
     mailbox_empty/0,
     select_family/2,
     sock_send/2,
+    sock_stop_reason/1,
     start_hibernate_timer/1,
     stop/2,
     stop_parent/2,
@@ -231,6 +234,28 @@ log_ctx(#state{
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - CONNECTION LOOP
 %%%-----------------------------------------------------------------------------
+-doc """
+Re-arm `{active, once}` on the connection socket for the next read.
+A peer that closed between the last read and this call makes the call
+give an error: `einval` on TCP, because the port is already gone, and
+`closed` on TLS. Both are a normal end of the connection, so the caller
+receives a classified stop reason and never a raised error.
+""".
+-spec activate(#state{}) -> ok | {stop, term()}.
+activate(State) ->
+    activate(State, []).
+
+-doc """
+Same as `activate/1`, with socket options applied together with
+`{active, once}`.
+""".
+-spec activate(#state{}, [gen_tcp:option() | ssl:tls_option()]) -> ok | {stop, term()}.
+activate(#state{socket = Socket}, ExtraOpts) ->
+    case nhttp_sock:setopts(Socket, ExtraOpts ++ [{active, once}]) of
+        ok -> ok;
+        {error, Reason} -> {stop, sock_stop_reason(Reason)}
+    end.
+
 -spec enter_protocol_loop(pid(), [sys:debug_option()], #state{}) -> no_return().
 enter_protocol_loop(Parent, Debug, #state{family = http1} = State) ->
     nhttp_conn_h1:loop(Parent, Debug, State);
@@ -487,22 +512,22 @@ init_exit_reason(shutdown) ->
 init_exit_reason({shutdown, _} = Reason) ->
     Reason;
 init_exit_reason(Reason) ->
-    case is_clean_init_close(Reason) of
+    case is_clean_close(Reason) of
         true -> normal;
         false -> Reason
     end.
 
--spec is_clean_init_close(term()) -> boolean().
-is_clean_init_close(closed) -> true;
-is_clean_init_close(einval) -> true;
-is_clean_init_close(enotconn) -> true;
-is_clean_init_close(econnreset) -> true;
-is_clean_init_close(econnaborted) -> true;
-is_clean_init_close(epipe) -> true;
-is_clean_init_close(etimedout) -> true;
-is_clean_init_close({handshake_error, Reason}) -> is_clean_init_close(Reason);
-is_clean_init_close({proxy_protocol, {recv, Reason}}) -> is_clean_init_close(Reason);
-is_clean_init_close(_) -> false.
+-spec is_clean_close(term()) -> boolean().
+is_clean_close(closed) -> true;
+is_clean_close(einval) -> true;
+is_clean_close(enotconn) -> true;
+is_clean_close(econnreset) -> true;
+is_clean_close(econnaborted) -> true;
+is_clean_close(epipe) -> true;
+is_clean_close(etimedout) -> true;
+is_clean_close({handshake_error, Reason}) -> is_clean_close(Reason);
+is_clean_close({proxy_protocol, {recv, Reason}}) -> is_clean_close(Reason);
+is_clean_close(_) -> false.
 
 -spec maybe_read_proxy(nhttp_sock:t(), nhttp:opts(), #state{}) ->
     {ok, #state{}} | {error, {proxy_protocol, term()}}.
@@ -562,6 +587,18 @@ sock_send(#state{socket = Socket} = State, Data) ->
         {error, Reason} ->
             nhttp_log:sock_send_failed(log_ctx(State), Reason),
             ok
+    end.
+
+-doc """
+Map a socket error to a connection stop reason. A peer close gives
+`normal`, which keeps the connection out of the crash reports. Any other
+error keeps its reason, so `emit_connection_stop/2` reports the fault.
+""".
+-spec sock_stop_reason(term()) -> normal | {socket_error, term()}.
+sock_stop_reason(Reason) ->
+    case is_clean_close(Reason) of
+        true -> normal;
+        false -> {socket_error, Reason}
     end.
 
 -spec start_protocol(pid(), [sys:debug_option()], #state{}) -> no_return().

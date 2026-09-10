@@ -233,10 +233,10 @@ open(
 %% INTERNAL FUNCTIONS - INCOMING DATA
 %%%-----------------------------------------------------------------------------
 -spec activate(pid(), [sys:debug_option()], #state{}) -> no_return().
-activate(Parent, Debug, #state{socket = Socket} = State) ->
-    case nhttp_sock:setopts(Socket, [{active, once}]) of
+activate(Parent, Debug, State) ->
+    case nhttp_conn:activate(State) of
         ok -> loop(Parent, Debug, State);
-        {error, _} -> finish({transport, closed}, normal, State)
+        {stop, Reason} -> finish({transport, closed}, Reason, State)
     end.
 
 -spec drain(pid(), [sys:debug_option()], #state{}, binary()) -> no_return().

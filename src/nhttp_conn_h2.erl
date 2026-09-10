@@ -185,9 +185,9 @@ handle_h2_data(
             NewState = handle_h2_events(
                 State#state{protocol_state = H2#h2_state{h2_conn = NewH2Conn}}, Events
             ),
-            case nhttp_sock:setopts(Socket, [{active, once}]) of
+            case nhttp_conn:activate(NewState) of
                 ok -> h2_loop(Parent, Debug, NewState);
-                {error, _} -> nhttp_conn:stop(normal, NewState)
+                {stop, Reason} -> nhttp_conn:stop(Reason, NewState)
             end;
         {ok, Events, NewH2Conn, FramesToSend} ->
             case nhttp_sock:send(Socket, FramesToSend) of
@@ -195,17 +195,13 @@ handle_h2_data(
                     NewState = handle_h2_events(
                         State#state{protocol_state = H2#h2_state{h2_conn = NewH2Conn}}, Events
                     ),
-                    case nhttp_sock:setopts(Socket, [{active, once}]) of
+                    case nhttp_conn:activate(NewState) of
                         ok -> h2_loop(Parent, Debug, NewState);
-                        {error, _} -> nhttp_conn:stop(normal, NewState)
+                        {stop, Reason} -> nhttp_conn:stop(Reason, NewState)
                     end;
-                {error, closed} ->
-                    nhttp_conn:stop(
-                        normal, State#state{protocol_state = H2#h2_state{h2_conn = NewH2Conn}}
-                    );
                 {error, Reason} ->
                     nhttp_conn:stop(
-                        {socket_error, Reason},
+                        nhttp_conn:sock_stop_reason(Reason),
                         State#state{protocol_state = H2#h2_state{h2_conn = NewH2Conn}}
                     )
             end;
