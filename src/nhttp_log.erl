@@ -13,6 +13,7 @@
     handler_crashed/4,
     request_ctx/3,
     request_id/0,
+    response_encode_failed/2,
     sock_send_failed/2,
     stream_push_producer_crashed/2,
     stream_push_rejected/4,
@@ -132,6 +133,15 @@ inject their own correlation header at the edge.
 request_id() ->
     Bytes = crypto:strong_rand_bytes(8),
     iolist_to_binary([io_lib:format("~2.16.0b", [B]) || <<B:8>> <= Bytes]).
+
+-doc """
+Response encoding rejected a field that the handler supplied. The
+connection answers 500 and closes, because an invalid field on the wire
+can split the response stream.
+""".
+-spec response_encode_failed(ctx(), nhttp_h1:encode_error()) -> ok.
+response_encode_failed(Ctx, Reason) ->
+    logger:warning(Ctx#{event => response_encode_failed, reason => Reason}).
 
 -doc "Best-effort socket send returned `{error, _}`.".
 -spec sock_send_failed(ctx(), term()) -> ok.

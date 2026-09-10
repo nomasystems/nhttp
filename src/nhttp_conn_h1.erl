@@ -361,14 +361,18 @@ apply_h1_request_result(
     Response = nhttp_conn_compress:maybe_compress(
         Response0, Request, nhttp_conn:compress_config(State)
     ),
-    send_h1_response(State, Response),
-    nhttp_conn:emit_request_stop(State, Status, ReqSpan),
-    KeepAlive = should_keep_alive(Request, Response),
-    State#state{
-        protocol_state = H1#h1_state{keep_alive = KeepAlive},
-        handler_state = NewHState,
-        requests_count = State#state.requests_count + 1
-    };
+    case send_h1_response(State, Response) of
+        ok ->
+            nhttp_conn:emit_request_stop(State, Status, ReqSpan),
+            KeepAlive = should_keep_alive(Request, Response),
+            State#state{
+                protocol_state = H1#h1_state{keep_alive = KeepAlive},
+                handler_state = NewHState,
+                requests_count = State#state.requests_count + 1
+            };
+        {error, Reason} ->
+            reply_encode_failed(State, Request, ReqSpan, Reason, NewHState)
+    end;
 apply_h1_request_result(
     State, Request, ReqSpan, {stream, {producer, Status, Headers, Producer}, NewHState}
 ) ->
@@ -810,6 +814,26 @@ lower_or_undefined(Value) -> nhttp_headers:to_lower(Value).
 max_pipeline_depth(#state{opts = Opts}) ->
     maps:get(max_pipeline_depth, Opts, ?DEFAULT_MAX_PIPELINE_DEPTH).
 
+-spec reply_encode_failed(
+    #state{},
+    nhttp_lib:request(),
+    {nhttp_otel:span_ctx(), integer()},
+    nhttp_h1:encode_error(),
+    term()
+) -> #state{}.
+reply_encode_failed(
+    #state{protocol_state = #h1_state{} = H1} = State, Request, ReqSpan, Reason, NewHState
+) ->
+    Ctx = nhttp_log:request_ctx(nhttp_conn:log_ctx(State), Request, undefined),
+    nhttp_log:response_encode_failed(Ctx, Reason),
+    send_h1_error_response(State, ?HTTP_INTERNAL_SERVER_ERROR, <<"Internal Server Error">>),
+    nhttp_conn:emit_request_stop(State, ?HTTP_INTERNAL_SERVER_ERROR, ReqSpan),
+    State#state{
+        protocol_state = H1#h1_state{keep_alive = false},
+        handler_state = NewHState,
+        requests_count = State#state.requests_count + 1
+    }.
+
 -spec send_h1_chunk(#state{}, iodata()) -> ok | {error, term()}.
 send_h1_chunk(#state{socket = Socket}, Data) ->
     Chunk = nhttp_h1:encode_chunk(Data),
@@ -831,7 +855,7 @@ send_h1_error(State, _Reason) ->
         headers => [],
         body => <<"Bad Request">>
     },
-    IOList = nhttp_h1:encode_response(Response),
+    {ok, IOList} = nhttp_h1:encode_response(Response),
     nhttp_conn:sock_send(State, IOList).
 
 -spec send_h1_error_response(#state{}, nhttp_lib:status(), binary()) -> ok.
@@ -842,7 +866,7 @@ send_h1_error_response(State, Status, Body) ->
         headers => [{<<"connection">>, <<"close">>}],
         body => Body
     },
-    IOList = nhttp_h1:encode_response(Response),
+    {ok, IOList} = nhttp_h1:encode_response(Response),
     nhttp_conn:sock_send(State, IOList).
 
 -spec send_h1_last_chunk(#state{}) -> ok.
@@ -850,19 +874,23 @@ send_h1_last_chunk(State) ->
     LastChunk = nhttp_h1:encode_last_chunk(),
     nhttp_conn:sock_send(State, LastChunk).
 
--spec send_h1_response(#state{}, nhttp_lib:response()) -> ok.
+-spec send_h1_response(#state{}, nhttp_lib:response()) -> ok | {error, nhttp_h1:encode_error()}.
 send_h1_response(State, Response0) ->
     Headers = nhttp_conn:alt_svc_headers(State, maps:get(headers, Response0, [])),
     Response = Response0#{headers => Headers},
-    IOList = nhttp_h1:encode_response(Response),
-    nhttp_conn:sock_send(State, IOList).
+    case nhttp_h1:encode_response(Response) of
+        {ok, IOList} -> nhttp_conn:sock_send(State, IOList);
+        {error, _Reason} = Error -> Error
+    end.
 
 -spec send_h1_response_head(#state{}, nhttp_lib:status(), nhttp_lib:headers()) ->
     ok | {error, term()}.
 send_h1_response_head(#state{socket = Socket} = State, Status, Headers0) ->
     Headers = nhttp_conn:alt_svc_headers(State, Headers0),
-    IOList = nhttp_h1:encode_response_head(http1_1, Status, Headers),
-    nhttp_sock:send(Socket, IOList).
+    case nhttp_h1:encode_response_head(http1_1, Status, Headers) of
+        {ok, IOList} -> nhttp_sock:send(Socket, IOList);
+        {error, _Reason} = Error -> Error
+    end.
 
 -spec should_keep_alive(nhttp_lib:request(), nhttp_lib:response()) -> boolean().
 should_keep_alive(

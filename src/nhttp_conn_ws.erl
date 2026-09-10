@@ -141,7 +141,8 @@ close_lifecycle(Ctx, Reason, View, Handler) ->
 -doc """
 Map a frame decoder error to the CLOSE code and reason RFC 6455 gives it.
 A text payload or CLOSE reason that is not valid UTF-8 is 1007 (§8.1), a
-message over the session limit is 1009 (§7.4.1), and every other framing
+message over the session limit is 1009 (§7.4.1), a frame header that
+declares a length over that limit is 1009 too (§10.4), and every other framing
 error is a protocol error. The set of reasons the decoder can return is
 open, so an unknown one is a protocol error too.
 
@@ -151,6 +152,7 @@ side of reassembly trips it.
 """.
 -spec decode_error_close(term()) -> {nhttp_ws:close_code(), binary()}.
 decode_error_close(message_too_large) -> {?WS_CLOSE_MESSAGE_TOO_BIG, ?MESSAGE_TOO_BIG};
+decode_error_close({frame_too_large, _Declared}) -> {?WS_CLOSE_MESSAGE_TOO_BIG, ?MESSAGE_TOO_BIG};
 decode_error_close(invalid_utf8 = R) -> {?WS_CLOSE_INVALID_PAYLOAD, str_or_atom(R)};
 decode_error_close(invalid_close_reason = R) -> {?WS_CLOSE_INVALID_PAYLOAD, str_or_atom(R)};
 decode_error_close(R) -> {?WS_CLOSE_PROTOCOL_ERROR, str_or_atom(R)}.

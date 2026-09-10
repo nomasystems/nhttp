@@ -302,11 +302,11 @@ ws_h2_protocol_error(Config) ->
     Malformed = <<(First bor 16#40):8, Rest/binary>>,
     ok = h2_send_data(Ctx, 1, Malformed),
     ?assertEqual(
-        {close, 1002, <<"decode_failed">>},
+        {close, 1002, <<"reserved_bits_set">>},
         h2_ws_recv_frame(Ctx, 1)
     ),
     ?assertMatch(
-        {closed, {fail, 1002, <<"decode_failed">>}},
+        {closed, {fail, 1002, <<"reserved_bits_set">>}},
         recv_observer_event(closed)
     ),
     teardown_ws(Ctx).

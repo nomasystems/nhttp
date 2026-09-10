@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-09-10
+
+### Changed
+
+- Requires `nhttp_lib` 1.1.0
+- Socket re-arming for the next read is centralized. A `setopts` error on a peer that closed ends the HTTP/1.1, HTTP/2, and WebSocket loops as a normal close
+- The `nhttp.http.request.duration` metric records native time units. The consumer converts them
+
+### Fixed
+
+- `t:nhttp:start_error/0` includes `{already_started, pid()}`
+
 ## [1.0.4] - 2026-08-24
 
 ### Fixed
