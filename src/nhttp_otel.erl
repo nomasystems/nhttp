@@ -302,11 +302,10 @@ record_request_duration(Config, StartTime, Attrs) ->
             ok;
         true ->
             Duration = erlang:monotonic_time() - StartTime,
-            DurationMicros = erlang:convert_time_unit(Duration, native, microsecond),
             Ctx = otel_ctx:get_current(),
             Meter = opentelemetry_experimental:get_meter(?METER_NAME),
             MetricAttrs = request_duration_attributes(Attrs),
-            otel_record_histogram(Ctx, Meter, ?METRIC_REQUEST_DURATION, DurationMicros, MetricAttrs)
+            otel_record_histogram(Ctx, Meter, ?METRIC_REQUEST_DURATION, Duration, MetricAttrs)
     end.
 
 %%%-----------------------------------------------------------------------------
