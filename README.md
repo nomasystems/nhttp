@@ -81,6 +81,22 @@ HTTP/3 runs over QUIC on a UDP socket. HTTP/1.1 and HTTP/2 run over TCP on their
 - **Graceful shutdown** with connection draining
 - **One process per connection**, with HTTP/2 and HTTP/3 streams multiplexed inside it
 
+### HTTP/2 test affordances
+
+These listener options exist so that a client can be tested against a
+slow or stingy HTTP/2 peer. Each one defaults to the current behavior and
+changes nothing on HTTP/1.1 or HTTP/3.
+
+| Option | Default | Effect |
+|--------|---------|--------|
+| `h2_initial_window_size` | 65535 | Alias of `initial_window_size` in `h2_settings`: the receive window that each new stream grants the peer. |
+| `h2_max_frame_size` | 16384 | Alias of `max_frame_size` in `h2_settings`: the largest frame payload the server accepts. |
+| `h2_response_delay` | 0 | Milliseconds to hold the response headers of a `{reply, _, _}` result. `{uniform, MinMs, MaxMs}` draws a value per response. |
+
+An alias must equal the `h2_settings` key when both are present. The
+delay applies to `{reply, _, _}` results only. Error responses, producer
+streams and WebSocket upgrades go out at once.
+
 ## Documentation
 
 [nhttp on HexDocs](https://hexdocs.pm/nhttp)

@@ -44,7 +44,8 @@
     req_span :: {nhttp_otel:span_ctx(), integer()} | undefined,
     bytes_sent = 0 :: non_neg_integer(),
     response_started = false :: boolean(),
-    request :: nhttp_lib:request() | undefined
+    request :: nhttp_lib:request() | undefined,
+    held_response :: {reference(), nhttp_lib:response()} | undefined
 }).
 
 -record(h1_push_ctx, {
@@ -75,7 +76,8 @@
     h2_conn :: nhttp_h2:conn(),
     h2_streams = #{} :: #{nhttp_lib:stream_id() => #h2_stream{}},
     h2_workers = #{} :: #{pid() => nhttp_lib:stream_id()},
-    drain_deadline :: integer() | undefined
+    drain_deadline :: integer() | undefined,
+    response_delay = 0 :: nhttp:h2_response_delay()
 }).
 
 -record(state, {

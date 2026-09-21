@@ -467,6 +467,50 @@ validate_alt_svc(Map) when is_map(Map) ->
 validate_alt_svc(_Other) ->
     invalid_alt_svc_error(not_false_or_map).
 
+-spec validate_h2_alias(
+    h2_initial_window_size | h2_max_frame_size,
+    initial_window_size | max_frame_size,
+    nhttp:opts(),
+    nhttp_h2:settings()
+) -> ok | {error, term()}.
+validate_h2_alias(AliasKey, Key, Opts, Settings) ->
+    case {maps:get(AliasKey, Opts, undefined), maps:get(Key, Settings, undefined)} of
+        {undefined, _} -> ok;
+        {V, undefined} -> validate_h2_setting(Key, V);
+        {V, V} -> validate_h2_setting(Key, V);
+        {V, _Other} -> {error, {invalid_h2_setting, Key, V, "must equal the h2_settings value"}}
+    end.
+
+-spec validate_h2_aliases(nhttp:opts()) -> ok | {error, term()}.
+validate_h2_aliases(Opts) ->
+    Settings = maps:get(h2_settings, Opts, #{}),
+    maybe
+        ok ?= validate_h2_alias(h2_initial_window_size, initial_window_size, Opts, Settings),
+        ok ?= validate_h2_alias(h2_max_frame_size, max_frame_size, Opts, Settings),
+        ok
+    end.
+
+-spec validate_h2_response_delay(nhttp:h2_response_delay() | undefined) -> ok | {error, term()}.
+validate_h2_response_delay(undefined) ->
+    ok;
+validate_h2_response_delay(Ms) when is_integer(Ms), Ms >= 0 ->
+    ok;
+validate_h2_response_delay({uniform, Min, Max}) when
+    is_integer(Min), is_integer(Max), Min >= 0, Min =< Max
+->
+    ok;
+validate_h2_response_delay(V) ->
+    {error,
+        {invalid_h2_response_delay, V,
+            "must be non_neg_integer() or {uniform, MinMs, MaxMs} with MinMs =< MaxMs"}}.
+
+-spec validate_h2_setting(initial_window_size | max_frame_size, pos_integer()) ->
+    ok | {error, term()}.
+validate_h2_setting(initial_window_size, V) ->
+    validate_initial_window_size(V);
+validate_h2_setting(max_frame_size, V) ->
+    validate_max_frame_size(V).
+
 -spec validate_h2_settings(nhttp_h2:settings()) -> ok | {error, term()}.
 validate_h2_settings(Settings) ->
     maybe
@@ -515,6 +559,8 @@ validate_opts(Opts) ->
         ok ?= validate_required_opts(Opts),
         ok ?= validate_versions(Opts),
         ok ?= validate_h2_settings(maps:get(h2_settings, Opts, #{})),
+        ok ?= validate_h2_aliases(Opts),
+        ok ?= validate_h2_response_delay(maps:get(h2_response_delay, Opts, undefined)),
         ok ?= validate_proxy_protocol(maps:get(proxy_protocol, Opts, false)),
         ok ?= validate_acceptor_count(maps:get(acceptor_count, Opts, undefined)),
         ok ?= validate_alt_svc(maps:get(alt_svc, Opts, #{})),

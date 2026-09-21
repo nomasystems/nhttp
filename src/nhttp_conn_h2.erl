@@ -43,6 +43,7 @@
 %% LOCAL MACROS
 %%%-----------------------------------------------------------------------------
 -define(DRAIN_IDLE_WAKE_MS, 100).
+-define(RESPONSE_DELAY_TAG, nhttp_h2_response_delay).
 
 %%%-----------------------------------------------------------------------------
 %% API
@@ -167,6 +168,9 @@ h2_receive(Parent, Debug, State, Timeout) ->
             end;
         {'EXIT', Parent, Reason} ->
             nhttp_conn:stop_parent(Reason, State);
+        {timeout, TimerRef, {?RESPONSE_DELAY_TAG, StreamId}} ->
+            NewState = handle_h2_response_delay(State, StreamId, TimerRef),
+            h2_loop(Parent, Debug, NewState);
         Info ->
             h2_loop(Parent, Debug, nhttp_conn_ws_h2:handle_info(State, Info))
     after Timeout ->
@@ -247,26 +251,20 @@ apply_h2_request_result(State, StreamId, Result) ->
 
 -spec apply_request_result(#state{}, nhttp_lib:stream_id(), term()) -> #state{}.
 apply_request_result(
-    #state{protocol_state = #h2_state{} = H2} = State,
+    #state{protocol_state = #h2_state{response_delay = Delay}} = State,
     StreamId,
-    {reply, #{status := Status} = Response0, NewHState}
+    {reply, #{status := _} = Response0, NewHState}
 ) ->
     Stream = stream(State, StreamId),
     Request = stream_request(Stream),
     Response = nhttp_conn_compress:maybe_compress(
         Response0, Request, nhttp_conn:compress_config(State)
     ),
-    {NewH2Conn, NewStreams} = send_h2_response(State, StreamId, Response),
-    State1 = State#state{
-        protocol_state = H2#h2_state{h2_conn = NewH2Conn, h2_streams = NewStreams}
-    },
-    State2 = maybe_rst_stream_unread_body(State1, StreamId, Stream),
-    State3 = release_request_worker(State2, StreamId, Stream),
-    nhttp_conn:emit_request_stop(State3, Status, Stream#h2_stream.req_span),
-    State3#state{
-        handler_state = NewHState,
-        requests_count = State3#state.requests_count + 1
-    };
+    State1 = State#state{handler_state = NewHState},
+    case Delay of
+        0 -> complete_h2_reply(State1, StreamId, Stream, Response);
+        _ -> hold_h2_reply(State1, StreamId, Stream, Response, Delay)
+    end;
 apply_request_result(State, StreamId, {stream, {producer, Status, Headers, _Producer}, NewHState}) ->
     start_h2_stream_push_response(State, StreamId, Status, Headers, NewHState);
 apply_request_result(State, StreamId, {accept_body, _BodyState, NewHState}) ->
@@ -303,6 +301,35 @@ apply_request_result(State, StreamId, {nhttp_handler_exception, Class, Reason}) 
     State1 = release_request_worker(State, StreamId, Stream),
     nhttp_conn:emit_request_stop(State1, ?HTTP_INTERNAL_SERVER_ERROR, Stream#h2_stream.req_span),
     State1#state{requests_count = State1#state.requests_count + 1}.
+
+-spec cancel_held_response(#h2_stream{}) -> ok.
+cancel_held_response(#h2_stream{held_response = undefined}) ->
+    ok;
+cancel_held_response(#h2_stream{held_response = {TimerRef, _Response}}) ->
+    ok = erlang:cancel_timer(TimerRef, [{async, true}, {info, false}]),
+    ok.
+
+-doc """
+Send a `{reply, _, _}` response and close the request bookkeeping: the
+unread-body RST_STREAM, the worker release and the request span. With a
+response delay this runs when the hold timer fires.
+""".
+-spec complete_h2_reply(#state{}, nhttp_lib:stream_id(), #h2_stream{}, nhttp_lib:response()) ->
+    #state{}.
+complete_h2_reply(
+    #state{protocol_state = #h2_state{} = H2} = State,
+    StreamId,
+    Stream,
+    #{status := Status} = Response
+) ->
+    {NewH2Conn, NewStreams} = send_h2_response(State, StreamId, Response),
+    State1 = State#state{
+        protocol_state = H2#h2_state{h2_conn = NewH2Conn, h2_streams = NewStreams}
+    },
+    State2 = maybe_rst_stream_unread_body(State1, StreamId, Stream),
+    State3 = release_request_worker(State2, StreamId, Stream),
+    nhttp_conn:emit_request_stop(State3, Status, Stream#h2_stream.req_span),
+    State3#state{requests_count = State3#state.requests_count + 1}.
 
 -spec dispatch_h2_request(#state{}, nhttp_lib:stream_id(), nhttp_lib:request()) -> #state{}.
 dispatch_h2_request(#state{limits = Limits} = State, StreamId, Request) ->
@@ -457,6 +484,12 @@ apply_stream_push_validation(
                 requests_count = State2#state.requests_count + 1
             }
     end.
+
+-spec draw_response_delay(nhttp:h2_response_delay()) -> non_neg_integer().
+draw_response_delay(Ms) when is_integer(Ms) ->
+    Ms;
+draw_response_delay({uniform, MinMs, MaxMs}) ->
+    MinMs + rand:uniform(MaxMs - MinMs + 1) - 1.
 
 -doc """
 Bridge accept_body into the streaming body recv loop.
@@ -652,6 +685,22 @@ handle_h2_request_trailers(
             State#state{protocol_state = H2#h2_state{h2_streams = Streams#{StreamId => Stream1}}}
     end.
 
+-doc """
+Hold timer fired for a delayed reply. A stream that was reset or closed
+during the hold, or a timer reference that no longer matches, is ignored.
+""".
+-spec handle_h2_response_delay(#state{}, nhttp_lib:stream_id(), reference()) -> #state{}.
+handle_h2_response_delay(
+    #state{protocol_state = #h2_state{h2_streams = Streams}} = State, StreamId, TimerRef
+) ->
+    case maps:get(StreamId, Streams, undefined) of
+        #h2_stream{type = request, held_response = {TimerRef, Response}} = Stream ->
+            Released = Stream#h2_stream{held_response = undefined},
+            complete_h2_reply(State, StreamId, Released, Response);
+        _ ->
+            State
+    end.
+
 -spec handle_h2_streaming_body_too_large(#state{}, nhttp_lib:stream_id(), #h2_stream{}) ->
     #state{}.
 handle_h2_streaming_body_too_large(State, StreamId, Stream) ->
@@ -665,6 +714,41 @@ handle_h2_streaming_body_too_large(State, StreamId, Stream) ->
             ok
     end,
     handle_h2_limit_error(State, StreamId, body_too_large).
+
+-doc """
+Park a compressed `{reply, _, _}` response on its stream until the
+response-delay timer fires. The worker exits right after it posts the
+result, so it is released here and its `DOWN` is flushed. The stream
+keeps `type = request` and drops any DATA that arrives during the hold.
+""".
+-spec hold_h2_reply(
+    #state{}, nhttp_lib:stream_id(), #h2_stream{}, nhttp_lib:response(), nhttp:h2_response_delay()
+) -> #state{}.
+hold_h2_reply(
+    #state{protocol_state = #h2_state{h2_streams = Streams, h2_workers = Workers} = H2} = State,
+    StreamId,
+    #h2_stream{worker = WPid} = Stream,
+    Response,
+    Delay
+) ->
+    TimerRef = erlang:start_timer(
+        draw_response_delay(Delay), self(), {?RESPONSE_DELAY_TAG, StreamId}
+    ),
+    ok = demonitor_worker(Stream),
+    Held = Stream#h2_stream{
+        worker = undefined,
+        worker_ref = undefined,
+        worker_mref = undefined,
+        pending_ack = undefined,
+        streaming_body = false,
+        held_response = {TimerRef, Response}
+    },
+    State#state{
+        protocol_state = H2#h2_state{
+            h2_streams = Streams#{StreamId => Held},
+            h2_workers = maps:remove(WPid, Workers)
+        }
+    }.
 
 -doc """
 After a terminal handler result (`reply` / `stream`) on a request whose
@@ -710,7 +794,8 @@ release_request_worker(
                     worker_ref = undefined,
                     worker_mref = undefined,
                     pending_ack = undefined,
-                    request = undefined
+                    request = undefined,
+                    held_response = undefined
                 },
                 Streams#{StreamId => Cleared}
         end,
@@ -778,6 +863,16 @@ stream(#state{protocol_state = #h2_state{h2_streams = Streams}}, StreamId) ->
 -spec stream_request(#h2_stream{}) -> nhttp_lib:request().
 stream_request(#h2_stream{request = R}) when is_map(R) ->
     R.
+
+-spec track_held_stream_end(#state{}, nhttp_lib:stream_id(), #h2_stream{}, nhttp_h2:fin()) ->
+    #state{}.
+track_held_stream_end(State, _StreamId, _Stream, nofin) ->
+    State;
+track_held_stream_end(
+    #state{protocol_state = #h2_state{h2_streams = Streams} = H2} = State, StreamId, Stream, fin
+) ->
+    Ended = Stream#h2_stream{end_stream = true},
+    State#state{protocol_state = H2#h2_state{h2_streams = Streams#{StreamId => Ended}}}.
 
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - WORKER MESSAGE HANDLERS
@@ -921,6 +1016,8 @@ handle_h2_event(
             State;
         #h2_stream{type = websocket} ->
             nhttp_conn_ws_h2:handle_data(State, StreamId, Data, Fin);
+        #h2_stream{type = request, held_response = {_, _}} = Stream ->
+            track_held_stream_end(State, StreamId, Stream, Fin);
         #h2_stream{type = request} = Stream ->
             handle_h2_request_data(State, StreamId, Stream, Data, Fin);
         _ ->
@@ -1124,6 +1221,7 @@ handle_h2_worker_stream_reset(
         pending_ack = PendingRef
     } = Stream,
     emit_h2_stream_complete(State, StreamId, Stream, peer_reset),
+    ok = cancel_held_response(Stream),
     case PendingRef of
         undefined when WPid =/= undefined ->
             WPid ! {chunk_ack, Ref, {error, closed}},

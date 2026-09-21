@@ -134,154 +134,160 @@ end_per_testcase(_TC, _Config) ->
 %%% TEST CASES
 %%%-----------------------------------------------------------------------------
 
-echo_post(Config) ->
-    {Pid, Port} = start_server(Config, #{}),
+echo_post(_Config) ->
+    {Pid, Port} = nhttp_test_helpers:h2_start_server(?MODULE, #{}),
     try
         Body = <<"hello-streamed-h2-body">>,
-        {ok, Sock} = h2_connect(Port),
-        ok = send_post(Sock, 1, <<"/echo">>, Body),
-        Frames = recv_stream(Sock, 1, 3000),
-        ?assertEqual(<<"200">>, response_status(Frames)),
-        ?assertEqual(Body, response_body(Frames, 1)),
+        {ok, Sock} = nhttp_test_helpers:h2_connect(Port),
+        ok = nhttp_test_helpers:h2_send_post(Sock, 1, <<"/echo">>, Body),
+        Frames = nhttp_test_helpers:h2_recv_stream(Sock, 1, 3000),
+        ?assertEqual(<<"200">>, nhttp_test_helpers:h2_response_status(Frames)),
+        ?assertEqual(Body, nhttp_test_helpers:h2_response_body(Frames, 1)),
         ssl:close(Sock)
     after
         nhttp:stop(Pid)
     end.
 
-echo_post_split_data(Config) ->
-    {Pid, Port} = start_server(Config, #{}),
+echo_post_split_data(_Config) ->
+    {Pid, Port} = nhttp_test_helpers:h2_start_server(?MODULE, #{}),
     try
         Part1 = <<"first-part-">>,
         Part2 = <<"second-part">>,
         Body = <<Part1/binary, Part2/binary>>,
-        {ok, Sock} = h2_connect(Port),
-        ok = send_headers(Sock, 1, <<"/echo">>, byte_size(Body), false),
-        ok = send_data(Sock, 1, Part1, false),
+        {ok, Sock} = nhttp_test_helpers:h2_connect(Port),
+        ok = nhttp_test_helpers:h2_send_headers(Sock, 1, <<"/echo">>, byte_size(Body), false),
+        ok = nhttp_test_helpers:h2_send_data(Sock, 1, Part1, false),
         timer:sleep(50),
-        ok = send_data(Sock, 1, Part2, true),
-        Frames = recv_stream(Sock, 1, 3000),
-        ?assertEqual(<<"200">>, response_status(Frames)),
-        ?assertEqual(Body, response_body(Frames, 1)),
+        ok = nhttp_test_helpers:h2_send_data(Sock, 1, Part2, true),
+        Frames = nhttp_test_helpers:h2_recv_stream(Sock, 1, 3000),
+        ?assertEqual(<<"200">>, nhttp_test_helpers:h2_response_status(Frames)),
+        ?assertEqual(Body, nhttp_test_helpers:h2_response_body(Frames, 1)),
         ssl:close(Sock)
     after
         nhttp:stop(Pid)
     end.
 
-echo_post_many_data_frames(Config) ->
-    {Pid, Port} = start_server(Config, #{}),
+echo_post_many_data_frames(_Config) ->
+    {Pid, Port} = nhttp_test_helpers:h2_start_server(?MODULE, #{}),
     try
         Parts = [
             <<"chunk-", (integer_to_binary(N))/binary, "|">>
          || N <- lists:seq(1, 128)
         ],
         Body = iolist_to_binary(Parts),
-        {ok, Sock} = h2_connect(Port),
-        ok = send_headers(Sock, 1, <<"/echo">>, byte_size(Body), false),
+        {ok, Sock} = nhttp_test_helpers:h2_connect(Port),
+        ok = nhttp_test_helpers:h2_send_headers(Sock, 1, <<"/echo">>, byte_size(Body), false),
         ok = send_data_frames(Sock, 1, Parts),
-        Frames = recv_stream(Sock, 1, 5000),
-        ?assertEqual(<<"200">>, response_status(Frames)),
-        ?assertEqual(Body, response_body(Frames, 1)),
+        Frames = nhttp_test_helpers:h2_recv_stream(Sock, 1, 5000),
+        ?assertEqual(<<"200">>, nhttp_test_helpers:h2_response_status(Frames)),
+        ?assertEqual(Body, nhttp_test_helpers:h2_response_body(Frames, 1)),
         ssl:close(Sock)
     after
         nhttp:stop(Pid)
     end.
 
-reply_mid_body_rst_no_error(Config) ->
-    {Pid, Port} = start_server(Config, #{}),
+reply_mid_body_rst_no_error(_Config) ->
+    {Pid, Port} = nhttp_test_helpers:h2_start_server(?MODULE, #{}),
     try
-        {ok, Sock} = h2_connect(Port),
+        {ok, Sock} = nhttp_test_helpers:h2_connect(Port),
         Body = <<"the-handler-replies-on-the-first-chunk">>,
-        ok = send_headers(Sock, 1, <<"/reply-mid-body">>, byte_size(Body), false),
+        ok = nhttp_test_helpers:h2_send_headers(
+            Sock, 1, <<"/reply-mid-body">>, byte_size(Body), false
+        ),
         Chunk1 = binary:part(Body, 0, 8),
-        ok = send_data(Sock, 1, Chunk1, false),
-        Frames = recv_stream(Sock, 1, 3000),
-        ?assertEqual(<<"200">>, response_status(Frames)),
-        ?assertEqual(<<"early">>, response_body(Frames, 1)),
+        ok = nhttp_test_helpers:h2_send_data(Sock, 1, Chunk1, false),
+        Frames = nhttp_test_helpers:h2_recv_stream(Sock, 1, 3000),
+        ?assertEqual(<<"200">>, nhttp_test_helpers:h2_response_status(Frames)),
+        ?assertEqual(<<"early">>, nhttp_test_helpers:h2_response_body(Frames, 1)),
         ?assert(has_rst_no_error(Frames, 1)),
         ssl:close(Sock)
     after
         nhttp:stop(Pid)
     end.
 
-max_body_size_413(Config) ->
-    {Pid, Port} = start_server(Config, #{max_body_size => 8}),
+max_body_size_413(_Config) ->
+    {Pid, Port} = nhttp_test_helpers:h2_start_server(?MODULE, #{max_body_size => 8}),
     try
-        {ok, Sock} = h2_connect(Port),
+        {ok, Sock} = nhttp_test_helpers:h2_connect(Port),
         Body = <<"way-too-many-bytes-for-the-cap">>,
-        ok = send_headers(Sock, 1, <<"/echo">>, byte_size(Body), false),
-        ok = send_data(Sock, 1, Body, true),
-        Frames = recv_stream(Sock, 1, 3000),
-        ?assertEqual(<<"413">>, response_status(Frames)),
+        ok = nhttp_test_helpers:h2_send_headers(Sock, 1, <<"/echo">>, byte_size(Body), false),
+        ok = nhttp_test_helpers:h2_send_data(Sock, 1, Body, true),
+        Frames = nhttp_test_helpers:h2_recv_stream(Sock, 1, 3000),
+        ?assertEqual(<<"413">>, nhttp_test_helpers:h2_response_status(Frames)),
         ssl:close(Sock)
     after
         nhttp:stop(Pid)
     end.
 
-trailers_streaming(Config) ->
-    {Pid, Port} = start_server(Config, #{}),
+trailers_streaming(_Config) ->
+    {Pid, Port} = nhttp_test_helpers:h2_start_server(?MODULE, #{}),
     try
-        {ok, Sock} = h2_connect(Port),
+        {ok, Sock} = nhttp_test_helpers:h2_connect(Port),
         Body = <<"hello">>,
-        ok = send_headers(Sock, 1, <<"/trailers-stream">>, byte_size(Body), false),
+        ok = nhttp_test_helpers:h2_send_headers(
+            Sock, 1, <<"/trailers-stream">>, byte_size(Body), false
+        ),
         timer:sleep(100),
-        ok = send_data(Sock, 1, Body, false),
+        ok = nhttp_test_helpers:h2_send_data(Sock, 1, Body, false),
         timer:sleep(50),
         ok = send_trailers(Sock, 1, [{<<"x-trailer">>, <<"abc">>}]),
-        Frames = recv_stream(Sock, 1, 5000),
-        ?assertEqual(<<"200">>, response_status(Frames)),
-        ?assertEqual(<<"hello|x-trailer=abc">>, response_body(Frames, 1)),
+        Frames = nhttp_test_helpers:h2_recv_stream(Sock, 1, 5000),
+        ?assertEqual(<<"200">>, nhttp_test_helpers:h2_response_status(Frames)),
+        ?assertEqual(<<"hello|x-trailer=abc">>, nhttp_test_helpers:h2_response_body(Frames, 1)),
         ssl:close(Sock)
     after
         nhttp:stop(Pid)
     end.
 
-trailers_buffered(Config) ->
-    {Pid, Port} = start_server(Config, #{}),
+trailers_buffered(_Config) ->
+    {Pid, Port} = nhttp_test_helpers:h2_start_server(?MODULE, #{}),
     try
-        {ok, Sock} = h2_connect(Port),
+        {ok, Sock} = nhttp_test_helpers:h2_connect(Port),
         Body = <<"hello">>,
-        ok = send_headers(Sock, 1, <<"/trailers-buffered">>, byte_size(Body), false),
-        ok = send_data(Sock, 1, Body, false),
+        ok = nhttp_test_helpers:h2_send_headers(
+            Sock, 1, <<"/trailers-buffered">>, byte_size(Body), false
+        ),
+        ok = nhttp_test_helpers:h2_send_data(Sock, 1, Body, false),
         ok = send_trailers(Sock, 1, [{<<"x-trailer">>, <<"abc">>}]),
-        Frames = recv_stream(Sock, 1, 5000),
-        ?assertEqual(<<"200">>, response_status(Frames)),
-        ?assertEqual(<<"hello|x-trailer=abc">>, response_body(Frames, 1)),
+        Frames = nhttp_test_helpers:h2_recv_stream(Sock, 1, 5000),
+        ?assertEqual(<<"200">>, nhttp_test_helpers:h2_response_status(Frames)),
+        ?assertEqual(<<"hello|x-trailer=abc">>, nhttp_test_helpers:h2_response_body(Frames, 1)),
         ssl:close(Sock)
     after
         nhttp:stop(Pid)
     end.
 
-bad_handler_return(Config) ->
-    {Pid, Port} = start_server(Config, #{}),
+bad_handler_return(_Config) ->
+    {Pid, Port} = nhttp_test_helpers:h2_start_server(?MODULE, #{}),
     try
-        {ok, Sock} = h2_connect(Port),
-        ok = send_headers(Sock, 1, <<"/bad-return">>, 0, true),
-        Frames = recv_stream(Sock, 1, 3000),
+        {ok, Sock} = nhttp_test_helpers:h2_connect(Port),
+        ok = nhttp_test_helpers:h2_send_headers(Sock, 1, <<"/bad-return">>, 0, true),
+        Frames = nhttp_test_helpers:h2_recv_stream(Sock, 1, 3000),
         ?assert(has_rst_stream(Frames, 1)),
         ssl:close(Sock)
     after
         nhttp:stop(Pid)
     end.
 
-ws_upgrade_on_h2_rejected(Config) ->
-    {Pid, Port} = start_server(Config, #{}),
+ws_upgrade_on_h2_rejected(_Config) ->
+    {Pid, Port} = nhttp_test_helpers:h2_start_server(?MODULE, #{}),
     try
-        {ok, Sock} = h2_connect(Port),
-        ok = send_headers(Sock, 1, <<"/ws-upgrade">>, 0, true),
-        Frames = recv_stream(Sock, 1, 3000),
-        ?assertEqual(<<"500">>, response_status(Frames)),
+        {ok, Sock} = nhttp_test_helpers:h2_connect(Port),
+        ok = nhttp_test_helpers:h2_send_headers(Sock, 1, <<"/ws-upgrade">>, 0, true),
+        Frames = nhttp_test_helpers:h2_recv_stream(Sock, 1, 3000),
+        ?assertEqual(<<"500">>, nhttp_test_helpers:h2_response_status(Frames)),
         ssl:close(Sock)
     after
         nhttp:stop(Pid)
     end.
 
-ws_upgrade_on_h2_session_rejected(Config) ->
-    {Pid, Port} = start_server(Config, #{}),
+ws_upgrade_on_h2_session_rejected(_Config) ->
+    {Pid, Port} = nhttp_test_helpers:h2_start_server(?MODULE, #{}),
     try
-        {ok, Sock} = h2_connect(Port),
-        ok = send_headers(Sock, 1, <<"/ws-upgrade-session">>, 0, true),
-        Frames = recv_stream(Sock, 1, 3000),
-        ?assertEqual(<<"500">>, response_status(Frames)),
+        {ok, Sock} = nhttp_test_helpers:h2_connect(Port),
+        ok = nhttp_test_helpers:h2_send_headers(Sock, 1, <<"/ws-upgrade-session">>, 0, true),
+        Frames = nhttp_test_helpers:h2_recv_stream(Sock, 1, 3000),
+        ?assertEqual(<<"500">>, nhttp_test_helpers:h2_response_status(Frames)),
         ssl:close(Sock)
     after
         nhttp:stop(Pid)
@@ -300,23 +306,6 @@ has_rst_stream(Frames, StreamId) ->
 %%% SERVER HELPERS
 %%%-----------------------------------------------------------------------------
 
-start_server(Config, Extra) ->
-    CertFile = ?config(certfile, Config),
-    KeyFile = ?config(keyfile, Config),
-    Opts = maps:merge(
-        #{
-            port => 0,
-            handler => ?MODULE,
-            tls => #{certfile => CertFile, keyfile => KeyFile},
-            versions => [http2],
-            timeouts => #{idle => 5000}
-        },
-        Extra
-    ),
-    {ok, Pid} = nhttp:start_link(Opts),
-    {ok, Port} = nhttp:get_port(Pid),
-    {Pid, Port}.
-
 find_test_conf_dir() ->
     ModPath = code:which(?MODULE),
     TestDir = filename:dirname(ModPath),
@@ -326,60 +315,10 @@ find_test_conf_dir() ->
 %%% H2 CLIENT HELPERS
 %%%-----------------------------------------------------------------------------
 
-h2_connect(Port) ->
-    {ok, Sock} = ssl:connect(
-        "127.0.0.1",
-        Port,
-        [
-            binary,
-            {active, false},
-            {verify, verify_none},
-            {alpn_advertised_protocols, [<<"h2">>]}
-        ],
-        5000
-    ),
-    ok = ssl:send(Sock, <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>),
-    ok = ssl:send(Sock, <<0, 0, 0, 4, 0, 0, 0, 0, 0>>),
-    _ = ssl:recv(Sock, 0, 1000),
-    ok = ssl:send(Sock, <<0, 0, 0, 4, 1, 0, 0, 0, 0>>),
-    {ok, Sock}.
-
-send_post(Sock, StreamId, Path, Body) ->
-    ok = send_headers(Sock, StreamId, Path, byte_size(Body), false),
-    send_data(Sock, StreamId, Body, true).
-
-send_headers(Sock, StreamId, Path, Length, EndStream) ->
-    {ok, Enc} = nhttp_hpack:new(),
-    Headers = [
-        {<<":method">>, <<"POST">>},
-        {<<":scheme">>, <<"https">>},
-        {<<":authority">>, <<"localhost">>},
-        {<<":path">>, Path},
-        {<<"content-length">>, integer_to_binary(Length)}
-    ],
-    {ok, IOList, _Enc1} = nhttp_hpack:encode(Headers, Enc),
-    Block = iolist_to_binary(IOList),
-    Flags =
-        case EndStream of
-            true -> 16#05;
-            false -> 16#04
-        end,
-    Frame = <<(byte_size(Block)):24, 1, Flags, 0:1, StreamId:31, Block/binary>>,
-    ssl:send(Sock, Frame).
-
-send_data(Sock, StreamId, Data, EndStream) ->
-    Flags =
-        case EndStream of
-            true -> 16#01;
-            false -> 16#00
-        end,
-    Frame = <<(byte_size(Data)):24, 0, Flags, 0:1, StreamId:31, Data/binary>>,
-    ssl:send(Sock, Frame).
-
 send_data_frames(Sock, StreamId, [Last]) ->
-    send_data(Sock, StreamId, Last, true);
+    nhttp_test_helpers:h2_send_data(Sock, StreamId, Last, true);
 send_data_frames(Sock, StreamId, [Part | Rest]) ->
-    ok = send_data(Sock, StreamId, Part, false),
+    ok = nhttp_test_helpers:h2_send_data(Sock, StreamId, Part, false),
     send_data_frames(Sock, StreamId, Rest).
 
 send_trailers(Sock, StreamId, Trailers) ->
@@ -390,108 +329,11 @@ send_trailers(Sock, StreamId, Trailers) ->
     Frame = <<(byte_size(Block)):24, 1, Flags, 0:1, StreamId:31, Block/binary>>,
     ssl:send(Sock, Frame).
 
-recv_stream(Sock, StreamId, Timeout) ->
-    Frames = recv_stream_until_done(Sock, StreamId, Timeout, <<>>, []),
-    Tail = recv_stream_tail(Sock, 200, <<>>, []),
-    Frames ++ Tail.
-
-recv_stream_until_done(Sock, StreamId, Timeout, Buf, Acc) ->
-    case stream_done(Acc, StreamId) of
-        true ->
-            Acc;
-        false ->
-            case ssl:recv(Sock, 0, Timeout) of
-                {ok, Data} ->
-                    NewBuf = <<Buf/binary, Data/binary>>,
-                    {Frames, Rest} = decode_frames(NewBuf, []),
-                    recv_stream_until_done(Sock, StreamId, Timeout, Rest, Acc ++ Frames);
-                {error, _} ->
-                    Acc
-            end
-    end.
-
-recv_stream_tail(Sock, Timeout, Buf, Acc) ->
-    case ssl:recv(Sock, 0, Timeout) of
-        {ok, Data} ->
-            NewBuf = <<Buf/binary, Data/binary>>,
-            {Frames, Rest} = decode_frames(NewBuf, []),
-            recv_stream_tail(Sock, Timeout, Rest, Acc ++ Frames);
-        {error, _} ->
-            Acc
-    end.
-
-stream_done(Frames, StreamId) ->
-    lists:any(
-        fun
-            ({data, SId, _, fin}) when SId =:= StreamId -> true;
-            ({headers, SId, _, fin}) when SId =:= StreamId -> true;
-            ({rst_stream, SId, _}) when SId =:= StreamId -> true;
-            (_) -> false
-        end,
-        Frames
-    ).
-
-response_status(Frames) ->
-    case [P || {headers, _, P, _} <- Frames] of
-        [Block | _] ->
-            {ok, Dec} = nhttp_hpack:new(),
-            case nhttp_hpack:decode(Block, Dec) of
-                {ok, Headers, _} -> proplists:get_value(<<":status">>, Headers);
-                _ -> undefined
-            end;
-        [] ->
-            undefined
-    end.
-
-response_body(Frames, StreamId) ->
-    iolist_to_binary([P || {data, SId, P, _} <- Frames, SId =:= StreamId]).
-
 has_rst_no_error(Frames, StreamId) ->
     lists:any(
         fun
-            ({rst_stream, SId, no_error}) when SId =:= StreamId -> true;
+            ({rst_stream, SId, 0}) when SId =:= StreamId -> true;
             (_) -> false
         end,
         Frames
     ).
-
-decode_frames(<<Len:24, Type:8, Flags:8, _R:1, StreamId:31, Payload:Len/binary, Rest/binary>>, Acc) ->
-    Frame = decode_frame(Type, Flags, StreamId, Payload),
-    decode_frames(Rest, [Frame | Acc]);
-decode_frames(Other, Acc) ->
-    {lists:reverse(Acc), Other}.
-
-decode_frame(0, Flags, StreamId, Payload) ->
-    Fin =
-        case Flags band 1 of
-            1 -> fin;
-            0 -> nofin
-        end,
-    {data, StreamId, Payload, Fin};
-decode_frame(1, Flags, StreamId, Payload) ->
-    Fin =
-        case Flags band 1 of
-            1 -> fin;
-            0 -> nofin
-        end,
-    {headers, StreamId, Payload, Fin};
-decode_frame(3, _Flags, StreamId, <<Code:32>>) ->
-    {rst_stream, StreamId, error_code(Code)};
-decode_frame(Type, _Flags, StreamId, Payload) ->
-    {other, StreamId, Type, Payload}.
-
-error_code(0) -> no_error;
-error_code(1) -> protocol_error;
-error_code(2) -> internal_error;
-error_code(3) -> flow_control_error;
-error_code(4) -> settings_timeout;
-error_code(5) -> stream_closed;
-error_code(6) -> frame_size_error;
-error_code(7) -> refused_stream;
-error_code(8) -> cancel;
-error_code(9) -> compression_error;
-error_code(10) -> connect_error;
-error_code(11) -> enhance_your_calm;
-error_code(12) -> inadequate_security;
-error_code(13) -> http_1_1_required;
-error_code(N) -> N.

@@ -167,6 +167,7 @@ RFC 9001 §9.2).
     header_name/0,
     header_value/0,
     headers/0,
+    h2_response_delay/0,
 
     method/0,
     name/0,
@@ -197,6 +198,9 @@ RFC 9001 §9.2).
     alt_svc => #{ma => non_neg_integer()} | false,
     backlog => pos_integer(),
     buffer => pos_integer(),
+    h2_initial_window_size => 1..16#7fffffff,
+    h2_max_frame_size => 16#4000..16#ffffff,
+    h2_response_delay => h2_response_delay(),
     h2_settings => nhttp_h2:settings(),
     handler := module(),
     handler_args => term(),
@@ -211,6 +215,15 @@ RFC 9001 §9.2).
     tls => tls(),
     proxy_protocol => boolean() | proxy_protocol_opts()
 }.
+
+-doc """
+Delay before the response headers of a `{reply, _, _}` handler result on
+HTTP/2, in milliseconds. `{uniform, MinMs, MaxMs}` draws a value in that
+range for each response. Error responses, producer streams and WebSocket
+upgrades are not delayed. Default 0.
+""".
+-type h2_response_delay() ::
+    non_neg_integer() | {uniform, non_neg_integer(), non_neg_integer()}.
 
 -doc """
 Connection timeouts (milliseconds, or `infinity`).
