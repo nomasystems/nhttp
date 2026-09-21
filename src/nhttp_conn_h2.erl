@@ -316,24 +316,30 @@ cancel_held_response(#h2_stream{held_response = {TimerRef, _Response}}) ->
 -doc """
 Send a `{reply, _, _}` response and close the request bookkeeping: the
 unread-body RST_STREAM, the worker release and the request span. With a
-response delay this runs when the hold timer fires.
+response delay this runs when the hold timer fires. An `on_response`
+policy releases the credit of the request ahead of the HEADERS, in the
+same socket write.
 """.
 -spec complete_h2_reply(#state{}, nhttp_lib:stream_id(), #h2_stream{}, nhttp_lib:response()) ->
     #state{}.
 complete_h2_reply(
-    #state{protocol_state = #h2_state{} = H2} = State,
+    #state{protocol_state = #h2_state{conn_credit = {on_response, _, _}}} = State,
     StreamId,
     Stream,
-    #{status := Status} = Response
+    Response
 ) ->
-    {NewH2Conn, NewStreams} = send_h2_response(State, StreamId, Response),
-    State1 = State#state{
-        protocol_state = H2#h2_state{h2_conn = NewH2Conn, h2_streams = NewStreams}
-    },
-    State2 = maybe_rst_stream_unread_body(State1, StreamId, Stream),
-    State3 = release_request_worker(State2, StreamId, Stream),
-    nhttp_conn:emit_request_stop(State3, Status, Stream#h2_stream.req_span),
-    State3#state{requests_count = State3#state.requests_count + 1}.
+    {State1, Credit} = release_response_credit(State, StreamId, Stream),
+    finish_h2_reply(State1, StreamId, Stream, Response, Credit);
+complete_h2_reply(
+    #state{protocol_state = #h2_state{stream_credit = on_response}} = State,
+    StreamId,
+    Stream,
+    Response
+) ->
+    {State1, Credit} = release_response_credit(State, StreamId, Stream),
+    finish_h2_reply(State1, StreamId, Stream, Response, Credit);
+complete_h2_reply(State, StreamId, Stream, Response) ->
+    finish_h2_reply(State, StreamId, Stream, Response, []).
 
 -spec dispatch_h2_request(#state{}, nhttp_lib:stream_id(), nhttp_lib:request()) -> #state{}.
 dispatch_h2_request(#state{limits = Limits} = State, StreamId, Request) ->
@@ -360,6 +366,25 @@ dispatch_h2_streaming_request(#state{limits = Limits} = State, StreamId, Request
         {error, LimitError} ->
             handle_h2_limit_error(State, StreamId, LimitError)
     end.
+
+-spec finish_h2_reply(
+    #state{}, nhttp_lib:stream_id(), #h2_stream{}, nhttp_lib:response(), iodata()
+) -> #state{}.
+finish_h2_reply(
+    #state{protocol_state = #h2_state{} = H2} = State,
+    StreamId,
+    Stream,
+    #{status := Status} = Response,
+    Credit
+) ->
+    {NewH2Conn, NewStreams} = send_h2_response(State, StreamId, Response, Credit),
+    State1 = State#state{
+        protocol_state = H2#h2_state{h2_conn = NewH2Conn, h2_streams = NewStreams}
+    },
+    State2 = maybe_rst_stream_unread_body(State1, StreamId, Stream),
+    State3 = release_request_worker(State2, StreamId, Stream),
+    nhttp_conn:emit_request_stop(State3, Status, Stream#h2_stream.req_span),
+    State3#state{requests_count = State3#state.requests_count + 1}.
 
 -spec spawn_h2_request_worker(
     #state{}, nhttp_lib:stream_id(), nhttp_lib:request(), boolean()
@@ -456,7 +481,20 @@ apply_conn_credit(
             conn_credit = {delay, Ms, queue:in({DueAt, StreamId, Size}, Due)}
         }
     },
-    arm_credit_timer(Queued, DueAt, Now).
+    arm_credit_timer(Queued, DueAt, Now);
+apply_conn_credit(
+    #state{
+        protocol_state = #h2_state{conn_credit = {on_response, _, _}, h2_streams = Streams} = H2
+    } = State,
+    StreamId,
+    Size
+) ->
+    #h2_stream{conn_uncredited = Acc} = Stream = maps:get(StreamId, Streams),
+    State#state{
+        protocol_state = H2#h2_state{
+            h2_streams = Streams#{StreamId => Stream#h2_stream{conn_uncredited = Acc + Size}}
+        }
+    }.
 
 -spec apply_stream_credit(#state{}, nhttp_lib:stream_id(), pos_integer()) -> #state{}.
 apply_stream_credit(
@@ -502,7 +540,19 @@ apply_stream_credit(
             stream_credit = {delay, Ms, queue:in({DueAt, StreamId, Size}, Due)}
         }
     },
-    arm_credit_timer(Queued, DueAt, Now).
+    arm_credit_timer(Queued, DueAt, Now);
+apply_stream_credit(
+    #state{protocol_state = #h2_state{stream_credit = on_response, h2_streams = Streams} = H2} =
+        State,
+    StreamId,
+    Size
+) ->
+    #h2_stream{uncredited = Acc} = Stream = maps:get(StreamId, Streams),
+    State#state{
+        protocol_state = H2#h2_state{
+            h2_streams = Streams#{StreamId => Stream#h2_stream{uncredited = Acc + Size}}
+        }
+    }.
 
 -spec apply_stream_push_validation(
     #state{},
@@ -606,6 +656,28 @@ credit_connection(#state{protocol_state = #h2_state{h2_conn = H2Conn} = H2} = St
         {error, _} ->
             State
     end.
+
+-doc """
+Turn every full batch of the `on_response` connection accumulator into
+one WINDOW_UPDATE frame. A batch of 0 sends the whole accumulator.
+""".
+-spec credit_connection_batches(#state{}, iodata()) -> {#state{}, iodata()}.
+credit_connection_batches(
+    #state{protocol_state = #h2_state{conn_credit = {on_response, Batch, Acc}} = H2} = State,
+    Frames
+) when Acc > 0, Acc >= Batch ->
+    Increment =
+        case Batch of
+            0 -> Acc;
+            _ -> Batch
+        end,
+    Popped = State#state{
+        protocol_state = H2#h2_state{conn_credit = {on_response, Batch, Acc - Increment}}
+    },
+    {State1, Frame} = window_update_frame(Popped, connection, Increment),
+    credit_connection_batches(State1, [Frames, Frame]);
+credit_connection_batches(State, Frames) ->
+    {State, Frames}.
 
 -spec credit_stream(#state{}, nhttp_lib:stream_id(), pos_integer()) -> #state{}.
 credit_stream(
@@ -874,6 +946,10 @@ head_credit_due({threshold, _N}) ->
     undefined;
 head_credit_due({threshold, _N, _Acc}) ->
     undefined;
+head_credit_due(on_response) ->
+    undefined;
+head_credit_due({on_response, _Batch, _Acc}) ->
+    undefined;
 head_credit_due({delay, _Ms, Due}) ->
     case queue:peek(Due) of
         {value, {DueAt, _StreamId, _Size}} -> DueAt;
@@ -915,6 +991,12 @@ hold_h2_reply(
         }
     }.
 
+-spec join_credit(iodata(), iodata()) -> [iodata()].
+join_credit([], []) ->
+    [];
+join_credit(ConnFrames, StreamFrames) ->
+    [ConnFrames, StreamFrames].
+
 -doc """
 After a terminal handler result (`reply` / `stream`) on a request whose
 body was still in flight, send RST_STREAM(NO_ERROR) to ask the peer to
@@ -944,6 +1026,18 @@ rearm_credit_timer(
         undefined -> State;
         DueAt -> arm_credit_timer(State, DueAt, Now)
     end.
+
+-spec release_conn_response_credit(#state{}, non_neg_integer()) -> {#state{}, iodata()}.
+release_conn_response_credit(
+    #state{protocol_state = #h2_state{conn_credit = {on_response, Batch, Acc}} = H2} = State,
+    Octets
+) ->
+    Queued = State#state{
+        protocol_state = H2#h2_state{conn_credit = {on_response, Batch, Acc + Octets}}
+    },
+    credit_connection_batches(Queued, []);
+release_conn_response_credit(State, _Octets) ->
+    {State, []}.
 
 -spec release_due_conn_credit(#state{}, integer()) -> #state{}.
 release_due_conn_credit(
@@ -1018,6 +1112,32 @@ release_request_worker(
     State#state{protocol_state = H2#h2_state{h2_streams = Streams1, h2_workers = Workers1}}.
 
 -doc """
+Release the credit an `on_response` policy held for the request of
+`Stream`. The connection octets move into the batch accumulator and
+every full batch becomes one WINDOW_UPDATE. The stream octets become one
+WINDOW_UPDATE. The frames go ahead of the response HEADERS, because
+HEADERS with END_STREAM closes the stream and the codec refuses credit
+on a closed stream.
+""".
+-spec release_response_credit(#state{}, nhttp_lib:stream_id(), #h2_stream{}) ->
+    {#state{}, iodata()}.
+release_response_credit(
+    State, StreamId, #h2_stream{uncredited = StreamOctets, conn_uncredited = ConnOctets}
+) ->
+    {State1, ConnFrames} = release_conn_response_credit(State, ConnOctets),
+    {State2, StreamFrames} = release_stream_response_credit(State1, StreamId, StreamOctets),
+    {State2, join_credit(ConnFrames, StreamFrames)}.
+
+-spec release_stream_response_credit(#state{}, nhttp_lib:stream_id(), non_neg_integer()) ->
+    {#state{}, iodata()}.
+release_stream_response_credit(
+    #state{protocol_state = #h2_state{stream_credit = on_response}} = State, StreamId, Octets
+) when Octets > 0 ->
+    window_update_frame(State, StreamId, Octets);
+release_stream_response_credit(State, _StreamId, _Octets) ->
+    {State, []}.
+
+-doc """
 Credit the peer for `Size` consumed octets on both receive windows
 through the resolved policies. The `eager` pair is the default and sends
 both WINDOW_UPDATE frames at once.
@@ -1081,6 +1201,25 @@ track_held_stream_end(
 ) ->
     Ended = Stream#h2_stream{end_stream = true},
     State#state{protocol_state = H2#h2_state{h2_streams = Streams#{StreamId => Ended}}}.
+
+-doc """
+Build one WINDOW_UPDATE for `Target` without sending it. A stream the
+codec no longer has yields no frame. An overflow keeps the codec state
+and yields no frame, which is the codec contract.
+""".
+-spec window_update_frame(#state{}, connection | nhttp_lib:stream_id(), pos_integer()) ->
+    {#state{}, iodata()}.
+window_update_frame(
+    #state{protocol_state = #h2_state{h2_conn = H2Conn} = H2} = State, Target, Size
+) ->
+    case nhttp_h2:send_window_update(H2Conn, Target, Size) of
+        {ok, _UnknownStream, []} ->
+            {State, []};
+        {ok, H2Conn1, Frame} ->
+            {State#state{protocol_state = H2#h2_state{h2_conn = H2Conn1}}, Frame};
+        {error, _} ->
+            {State, []}
+    end.
 
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - WORKER MESSAGE HANDLERS
@@ -1495,6 +1634,12 @@ post_buffer_drain(
 response_to_headers(#{status := Status, headers := Headers}) ->
     [{<<":status">>, integer_to_binary(Status)} | Headers].
 
+-spec send_credit_only(#state{}, iodata()) -> ok.
+send_credit_only(_State, []) ->
+    ok;
+send_credit_only(State, Credit) ->
+    nhttp_conn:sock_send(State, Credit).
+
 -spec send_h2_data_unbuffered(
     #state{}, nhttp_lib:stream_id(), iodata(), nhttp_h2:fin()
 ) -> #state{}.
@@ -1564,12 +1709,19 @@ send_h2_headers(
             H2Conn
     end.
 
--spec send_h2_response(#state{}, nhttp_lib:stream_id(), nhttp_lib:response()) ->
+-doc """
+Send a response with `Credit`, the WINDOW_UPDATE frames of an
+`on_response` policy, ahead of it in the same socket write. When the
+codec refuses the HEADERS the credit still goes out, because the codec
+already counted it.
+""".
+-spec send_h2_response(#state{}, nhttp_lib:stream_id(), nhttp_lib:response(), iodata()) ->
     {nhttp_h2:conn(), #{nhttp_lib:stream_id() => #h2_stream{}}}.
 send_h2_response(
     #state{protocol_state = #h2_state{h2_conn = H2Conn, h2_streams = Streams}} = State,
     StreamId,
-    Response
+    Response,
+    Credit
 ) ->
     Headers = nhttp_conn:alt_svc_headers(State, response_to_headers(Response)),
     Body = maps:get(body, Response, <<>>),
@@ -1577,22 +1729,26 @@ send_h2_response(
         <<>> ->
             case nhttp_h2:send_headers(H2Conn, StreamId, Headers, fin) of
                 {ok, NewH2Conn, Frame} ->
-                    nhttp_conn:sock_send(State, Frame),
+                    ok = send_with_credit(State, Credit, Frame),
                     {NewH2Conn, Streams};
                 {error, {stream_closed, _}} ->
+                    ok = send_credit_only(State, Credit),
                     {H2Conn, maps:remove(StreamId, Streams)};
                 {error, connection_closing} ->
+                    ok = send_credit_only(State, Credit),
                     {H2Conn, Streams}
             end;
         _ ->
             case nhttp_h2:send_headers(H2Conn, StreamId, Headers, nofin) of
                 {ok, H2Conn1, HeaderFrame} ->
                     send_h2_response_with_body(
-                        State, H2Conn1, Streams, StreamId, HeaderFrame, Body
+                        State, H2Conn1, Streams, StreamId, HeaderFrame, Body, Credit
                     );
                 {error, {stream_closed, _}} ->
+                    ok = send_credit_only(State, Credit),
                     {H2Conn, maps:remove(StreamId, Streams)};
                 {error, connection_closing} ->
+                    ok = send_credit_only(State, Credit),
                     {H2Conn, Streams}
             end
     end.
@@ -1604,15 +1760,16 @@ send_h2_response(
     #{nhttp_lib:stream_id() => #h2_stream{}},
     nhttp_lib:stream_id(),
     iodata(),
-    binary()
+    binary(),
+    iodata()
 ) -> {nhttp_h2:conn(), #{nhttp_lib:stream_id() => #h2_stream{}}}.
-send_h2_response_with_body(State, H2Conn, Streams, StreamId, HeaderFrame, Body) ->
+send_h2_response_with_body(State, H2Conn, Streams, StreamId, HeaderFrame, Body, Credit) ->
     case nhttp_h2:send_data(H2Conn, StreamId, Body, fin) of
         {ok, NewH2Conn, DataFrame} ->
-            nhttp_conn:sock_send(State, [HeaderFrame, DataFrame]),
+            ok = send_with_credit(State, Credit, [HeaderFrame, DataFrame]),
             {NewH2Conn, Streams};
         {partial, NewH2Conn, DataFrame, Remaining, PendingEndStream, _Window} ->
-            nhttp_conn:sock_send(State, [HeaderFrame, DataFrame]),
+            ok = send_with_credit(State, Credit, [HeaderFrame, DataFrame]),
             Stream = maps:get(StreamId, Streams, #h2_stream{}),
             NewStream = Stream#h2_stream{
                 send_buffer = Remaining,
@@ -1620,10 +1777,10 @@ send_h2_response_with_body(State, H2Conn, Streams, StreamId, HeaderFrame, Body) 
             },
             {NewH2Conn, Streams#{StreamId => NewStream}};
         {error, {stream_closed, _}} ->
-            nhttp_conn:sock_send(State, HeaderFrame),
+            ok = send_with_credit(State, Credit, HeaderFrame),
             {H2Conn, maps:remove(StreamId, Streams)};
         {error, {unknown_stream, _}} ->
-            nhttp_conn:sock_send(State, HeaderFrame),
+            ok = send_with_credit(State, Credit, HeaderFrame),
             {H2Conn, Streams}
     end.
 
@@ -1632,3 +1789,9 @@ send_h2_rst_stream(State, StreamId) ->
     {ok, Frame} = nhttp_h2_frame:rst_stream(StreamId, internal_error),
     nhttp_conn:sock_send(State, Frame),
     ok.
+
+-spec send_with_credit(#state{}, iodata(), iodata()) -> ok.
+send_with_credit(State, [], Frames) ->
+    nhttp_conn:sock_send(State, Frames);
+send_with_credit(State, Credit, Frames) ->
+    nhttp_conn:sock_send(State, [Credit, Frames]).

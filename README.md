@@ -94,19 +94,41 @@ changes nothing on HTTP/1.1 or HTTP/3.
 | `h2_response_delay` | 0 | Milliseconds to hold the response headers of a `{reply, _, _}` result. `{uniform, MinMs, MaxMs}` draws a value per response. |
 | `h2_connection_window_policy` | `eager` | Credit policy for the connection receive window. |
 | `h2_stream_window_policy` | `eager` | Credit policy for each stream receive window. |
+| `h2_credit_batch` | 0 | Octets per WINDOW_UPDATE under the `on_response` connection policy. 0 sends the whole accumulator with each response. Valid only when a policy is `on_response`. |
 
 An alias must equal the `h2_settings` key when both are present. The
 delay applies to `{reply, _, _}` results only. Error responses, producer
 streams and WebSocket upgrades go out at once.
 
-A credit policy has four shapes. `eager` sends a WINDOW_UPDATE for each
+A credit policy has five shapes. `eager` sends a WINDOW_UPDATE for each
 body chunk as soon as the handler consumed it. `{threshold, N}` holds the
 credit until the uncredited octets reach `N`, then sends the accumulated
 total. `{delay, Ms}` sends the credit for each chunk `Ms` milliseconds
-after the handler consumed it. `never` sends no credit. The two policies
-are independent. No policy credits more than the handler consumed. A
-stream that closes before its delayed credit is due gets no stream
-WINDOW_UPDATE. The connection credit for those octets still goes out.
+after the handler consumed it. `on_response` holds the credit of a request
+until the HEADERS of its `{reply, _, _}` result go out. The credit goes in
+the same socket write, ahead of the HEADERS. `never` sends no credit.
+
+The two policies are independent. No policy credits more than the handler
+consumed. Error responses, `{abort, _, _}` results and stream resets
+release no `on_response` credit. A stream that closes before its delayed
+credit is due gets no stream WINDOW_UPDATE. The connection credit for
+those octets still goes out.
+
+Under the `on_response` connection policy the responded octets move into
+one accumulator. Each time the accumulator reaches `h2_credit_batch`, one
+WINDOW_UPDATE of exactly that size goes out with the response, and the
+remainder carries. This example imitates APNs, which credits half of its
+window at a time, sends no stream credit, and answers 129 to 388 ms after
+the request:
+
+```erlang
+#{
+    h2_connection_window_policy => on_response,
+    h2_credit_batch => 32830,
+    h2_stream_window_policy => never,
+    h2_response_delay => {uniform, 129, 388}
+}
+```
 
 ## Documentation
 
