@@ -168,6 +168,7 @@ RFC 9001 §9.2).
     header_value/0,
     headers/0,
     h2_response_delay/0,
+    h2_window_policy/0,
 
     method/0,
     name/0,
@@ -198,10 +199,12 @@ RFC 9001 §9.2).
     alt_svc => #{ma => non_neg_integer()} | false,
     backlog => pos_integer(),
     buffer => pos_integer(),
+    h2_connection_window_policy => h2_window_policy(),
     h2_initial_window_size => 1..16#7fffffff,
     h2_max_frame_size => 16#4000..16#ffffff,
     h2_response_delay => h2_response_delay(),
     h2_settings => nhttp_h2:settings(),
+    h2_stream_window_policy => h2_window_policy(),
     handler := module(),
     handler_args => term(),
     compression => boolean(),
@@ -224,6 +227,17 @@ upgrades are not delayed. Default 0.
 """.
 -type h2_response_delay() ::
     non_neg_integer() | {uniform, non_neg_integer(), non_neg_integer()}.
+
+-doc """
+Credit policy for an HTTP/2 receive window. `eager` sends a WINDOW_UPDATE
+for each body chunk as soon as the handler consumed it. `{threshold, N}`
+holds the credit until the uncredited octets reach `N`, then sends the
+accumulated total. `{delay, Ms}` sends the credit for each chunk `Ms`
+milliseconds after the handler consumed it. `never` sends no credit.
+Default `eager`.
+""".
+-type h2_window_policy() ::
+    eager | {threshold, pos_integer()} | {delay, non_neg_integer()} | never.
 
 -doc """
 Connection timeouts (milliseconds, or `infinity`).

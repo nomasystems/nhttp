@@ -30,6 +30,7 @@
     listener_h2_alias_conflicts_with_settings/1,
     listener_h2_alias_out_of_range/1,
     listener_h2_response_delay_invalid/1,
+    listener_h2_window_policy_invalid/1,
     listener_invalid_tls/1,
     listener_invalid_versions/1,
     listener_listen_failed/1,
@@ -47,6 +48,7 @@ all() ->
         listener_h2_alias_conflicts_with_settings,
         listener_h2_alias_out_of_range,
         listener_h2_response_delay_invalid,
+        listener_h2_window_policy_invalid,
         listener_invalid_tls,
         listener_invalid_versions,
         listener_listen_failed,
@@ -148,6 +150,37 @@ listener_h2_response_delay_invalid(_Config) ->
     ),
     ok.
 
+listener_h2_window_policy_invalid(_Config) ->
+    Base = #{port => 0, handler => ?MODULE, versions => [http1_1]},
+    Invalid = [
+        on_response,
+        lazy,
+        {threshold, 0},
+        {threshold, -1},
+        {threshold, 2147483648},
+        {threshold, n},
+        {delay, -1},
+        {delay, 1.5},
+        {uniform, 1, 2}
+    ],
+    Valid = [eager, never, {threshold, 1}, {threshold, 2147483647}, {delay, 0}, {delay, 250}],
+    lists:foreach(
+        fun({Key, Policy}) ->
+            assert_error_contains(
+                "invalid_h2_window_policy", nhttp:start_link(Base#{Key => Policy})
+            )
+        end,
+        [{Key, Policy} || Key <- policy_keys(), Policy <- Invalid]
+    ),
+    lists:foreach(
+        fun({Key, Policy}) ->
+            {ok, Pid} = nhttp:start_link(Base#{Key => Policy}),
+            nhttp:stop(Pid)
+        end,
+        [{Key, Policy} || Key <- policy_keys(), Policy <- Valid]
+    ),
+    ok.
+
 listener_invalid_versions(_Config) ->
     assert_error_contains(
         "invalid_versions",
@@ -223,6 +256,9 @@ assert_error_contains(Substr, Result) ->
     ?assertMatch({error, _}, Result),
     Flat = lists:flatten(io_lib:format("~p", [Result])),
     ?assertNotEqual(nomatch, string:find(Flat, Substr)).
+
+policy_keys() ->
+    [h2_connection_window_policy, h2_stream_window_policy].
 
 acceptor_sys_lifecycle(_Config) ->
     {ok, Pid} = nhttp:start_link(#{

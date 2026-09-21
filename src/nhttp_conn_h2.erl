@@ -42,6 +42,7 @@
 %%%-----------------------------------------------------------------------------
 %% LOCAL MACROS
 %%%-----------------------------------------------------------------------------
+-define(CREDIT_DELAY_TAG, nhttp_h2_credit_delay).
 -define(DRAIN_IDLE_WAKE_MS, 100).
 -define(RESPONSE_DELAY_TAG, nhttp_h2_response_delay).
 
@@ -170,6 +171,9 @@ h2_receive(Parent, Debug, State, Timeout) ->
             nhttp_conn:stop_parent(Reason, State);
         {timeout, TimerRef, {?RESPONSE_DELAY_TAG, StreamId}} ->
             NewState = handle_h2_response_delay(State, StreamId, TimerRef),
+            h2_loop(Parent, Debug, NewState);
+        {timeout, TimerRef, ?CREDIT_DELAY_TAG} ->
+            NewState = handle_h2_credit_delay(State, TimerRef),
             h2_loop(Parent, Debug, NewState);
         Info ->
             h2_loop(Parent, Debug, nhttp_conn_ws_h2:handle_info(State, Info))
@@ -419,6 +423,87 @@ abort_stream_worker(
             State
     end.
 
+-spec apply_conn_credit(#state{}, nhttp_lib:stream_id(), pos_integer()) -> #state{}.
+apply_conn_credit(
+    #state{protocol_state = #h2_state{conn_credit = eager}} = State, _StreamId, Size
+) ->
+    credit_connection(State, Size);
+apply_conn_credit(
+    #state{protocol_state = #h2_state{conn_credit = never}} = State, _StreamId, _Size
+) ->
+    State;
+apply_conn_credit(
+    #state{protocol_state = #h2_state{conn_credit = {threshold, N, Acc}} = H2} = State,
+    _StreamId,
+    Size
+) ->
+    case Acc + Size of
+        Total when Total >= N ->
+            Reset = State#state{protocol_state = H2#h2_state{conn_credit = {threshold, N, 0}}},
+            credit_connection(Reset, Total);
+        Total ->
+            State#state{protocol_state = H2#h2_state{conn_credit = {threshold, N, Total}}}
+    end;
+apply_conn_credit(
+    #state{protocol_state = #h2_state{conn_credit = {delay, Ms, Due}} = H2} = State,
+    StreamId,
+    Size
+) ->
+    Now = erlang:monotonic_time(millisecond),
+    DueAt = Now + Ms,
+    Queued = State#state{
+        protocol_state = H2#h2_state{
+            conn_credit = {delay, Ms, queue:in({DueAt, StreamId, Size}, Due)}
+        }
+    },
+    arm_credit_timer(Queued, DueAt, Now).
+
+-spec apply_stream_credit(#state{}, nhttp_lib:stream_id(), pos_integer()) -> #state{}.
+apply_stream_credit(
+    #state{protocol_state = #h2_state{stream_credit = eager}} = State, StreamId, Size
+) ->
+    credit_stream(State, StreamId, Size);
+apply_stream_credit(
+    #state{protocol_state = #h2_state{stream_credit = never}} = State, _StreamId, _Size
+) ->
+    State;
+apply_stream_credit(
+    #state{
+        protocol_state = #h2_state{stream_credit = {threshold, N}, h2_streams = Streams} = H2
+    } = State,
+    StreamId,
+    Size
+) ->
+    #h2_stream{uncredited = Acc} = Stream = maps:get(StreamId, Streams),
+    case Acc + Size of
+        Total when Total >= N ->
+            Reset = State#state{
+                protocol_state = H2#h2_state{
+                    h2_streams = Streams#{StreamId => Stream#h2_stream{uncredited = 0}}
+                }
+            },
+            credit_stream(Reset, StreamId, Total);
+        Total ->
+            State#state{
+                protocol_state = H2#h2_state{
+                    h2_streams = Streams#{StreamId => Stream#h2_stream{uncredited = Total}}
+                }
+            }
+    end;
+apply_stream_credit(
+    #state{protocol_state = #h2_state{stream_credit = {delay, Ms, Due}} = H2} = State,
+    StreamId,
+    Size
+) ->
+    Now = erlang:monotonic_time(millisecond),
+    DueAt = Now + Ms,
+    Queued = State#state{
+        protocol_state = H2#h2_state{
+            stream_credit = {delay, Ms, queue:in({DueAt, StreamId, Size}, Due)}
+        }
+    },
+    arm_credit_timer(Queued, DueAt, Now).
+
 -spec apply_stream_push_validation(
     #state{},
     nhttp_lib:stream_id(),
@@ -483,6 +568,57 @@ apply_stream_push_validation(
                 handler_state = NewHState,
                 requests_count = State2#state.requests_count + 1
             }
+    end.
+
+-doc """
+Arm the one credit timer of the connection for `DueAt` unless it is
+already armed for an earlier or equal instant. A later timer is
+cancelled first. Its stale message is ignored by the reference check in
+`handle_h2_credit_delay/2`.
+""".
+-spec arm_credit_timer(#state{}, integer(), integer()) -> #state{}.
+arm_credit_timer(
+    #state{protocol_state = #h2_state{credit_timer = {_Ref, Armed}}} = State, DueAt, _Now
+) when
+    Armed =< DueAt
+->
+    State;
+arm_credit_timer(
+    #state{protocol_state = #h2_state{credit_timer = Timer} = H2} = State, DueAt, Now
+) ->
+    ok = cancel_credit_timer(Timer),
+    Ref = erlang:start_timer(max(0, DueAt - Now), self(), ?CREDIT_DELAY_TAG),
+    State#state{protocol_state = H2#h2_state{credit_timer = {Ref, DueAt}}}.
+
+-spec cancel_credit_timer({reference(), integer()} | undefined) -> ok.
+cancel_credit_timer(undefined) ->
+    ok;
+cancel_credit_timer({Ref, _DueAt}) ->
+    ok = erlang:cancel_timer(Ref, [{async, true}, {info, false}]),
+    ok.
+
+-spec credit_connection(#state{}, pos_integer()) -> #state{}.
+credit_connection(#state{protocol_state = #h2_state{h2_conn = H2Conn} = H2} = State, Size) ->
+    case nhttp_h2:send_window_update(H2Conn, connection, Size) of
+        {ok, H2Conn1, Frame} ->
+            ok = nhttp_conn:sock_send(State, Frame),
+            State#state{protocol_state = H2#h2_state{h2_conn = H2Conn1}};
+        {error, _} ->
+            State
+    end.
+
+-spec credit_stream(#state{}, nhttp_lib:stream_id(), pos_integer()) -> #state{}.
+credit_stream(
+    #state{protocol_state = #h2_state{h2_conn = H2Conn} = H2} = State, StreamId, Size
+) ->
+    case nhttp_h2:send_window_update(H2Conn, StreamId, Size) of
+        {ok, _UnknownStream, []} ->
+            State;
+        {ok, H2Conn1, Frame} ->
+            ok = nhttp_conn:sock_send(State, Frame),
+            State#state{protocol_state = H2#h2_state{h2_conn = H2Conn1}};
+        {error, _} ->
+            State
     end.
 
 -spec draw_response_delay(nhttp:h2_response_delay()) -> non_neg_integer().
@@ -553,15 +689,15 @@ forward_terminal_body_event(WPid, Ref, true, Trailers) ->
     ok.
 
 -doc """
-Worker acked a body chunk. Pop the oldest pending byte size and emit
-WINDOW_UPDATE for that many bytes on both the connection-level and the
-stream-level flow-control windows so the peer can resume sending.
+Worker acked a body chunk. Pop the oldest pending byte size and hand it
+to the credit policies of the connection and the stream receive windows.
 Acks for `fin` / `abort` events carry no flow-control debt and are
 absorbed silently when the pending queue is empty.
 """.
 -spec handle_h2_body_chunk_ack(#state{}, pid(), reference()) -> #state{}.
 handle_h2_body_chunk_ack(
-    #state{protocol_state = #h2_state{h2_streams = Streams, h2_workers = Workers}} = State,
+    #state{protocol_state = #h2_state{h2_streams = Streams, h2_workers = Workers} = H2} =
+        State,
     WPid,
     Ref
 ) ->
@@ -576,14 +712,12 @@ handle_h2_body_chunk_ack(
                     case queue:out(Pending) of
                         {{value, Size}, Rest} ->
                             Stream1 = Stream#h2_stream{body_window_pending = Rest},
-                            State1 = replenish_recv_window(State, StreamId, Size),
-                            #state{protocol_state = #h2_state{h2_streams = Streams1} = H2After} =
-                                State1,
-                            State1#state{
-                                protocol_state = H2After#h2_state{
-                                    h2_streams = Streams1#{StreamId => Stream1}
+                            Popped = State#state{
+                                protocol_state = H2#h2_state{
+                                    h2_streams = Streams#{StreamId => Stream1}
                                 }
-                            };
+                            },
+                            replenish_recv_window(Popped, StreamId, Size);
                         {empty, _Rest} ->
                             State
                     end;
@@ -592,6 +726,22 @@ handle_h2_body_chunk_ack(
             end
         end
     ).
+
+-doc """
+Credit timer fired. Sends every delayed credit that is due on both
+windows, oldest first, and re-arms the timer for the earliest entry
+left. A timer reference that no longer matches is ignored.
+""".
+-spec handle_h2_credit_delay(#state{}, reference()) -> #state{}.
+handle_h2_credit_delay(
+    #state{protocol_state = #h2_state{credit_timer = {TimerRef, _DueAt}} = H2} = State, TimerRef
+) ->
+    Now = erlang:monotonic_time(millisecond),
+    Disarmed = State#state{protocol_state = H2#h2_state{credit_timer = undefined}},
+    Released = release_due_stream_credit(release_due_conn_credit(Disarmed, Now), Now),
+    rearm_credit_timer(Released, Now);
+handle_h2_credit_delay(State, _TimerRef) ->
+    State.
 
 -doc """
 DATA event on a stream that has been dispatched to a worker. Buffers
@@ -715,6 +865,21 @@ handle_h2_streaming_body_too_large(State, StreamId, Stream) ->
     end,
     handle_h2_limit_error(State, StreamId, body_too_large).
 
+-spec head_credit_due(h2_conn_credit() | h2_stream_credit()) -> integer() | undefined.
+head_credit_due(eager) ->
+    undefined;
+head_credit_due(never) ->
+    undefined;
+head_credit_due({threshold, _N}) ->
+    undefined;
+head_credit_due({threshold, _N, _Acc}) ->
+    undefined;
+head_credit_due({delay, _Ms, Due}) ->
+    case queue:peek(Due) of
+        {value, {DueAt, _StreamId, _Size}} -> DueAt;
+        empty -> undefined
+    end.
+
 -doc """
 Park a compressed `{reply, _, _}` response on its stream until the
 response-delay timer fires. The worker exits right after it posts the
@@ -763,6 +928,57 @@ maybe_rst_stream_unread_body(State, StreamId, #h2_stream{end_stream = false}) ->
     send_h2_rst_stream_with_code(State, StreamId, no_error),
     State.
 
+-spec next_credit_due(integer() | undefined, integer() | undefined) -> integer() | undefined.
+next_credit_due(undefined, StreamDue) ->
+    StreamDue;
+next_credit_due(ConnDue, undefined) ->
+    ConnDue;
+next_credit_due(ConnDue, StreamDue) ->
+    min(ConnDue, StreamDue).
+
+-spec rearm_credit_timer(#state{}, integer()) -> #state{}.
+rearm_credit_timer(
+    #state{protocol_state = #h2_state{conn_credit = Conn, stream_credit = Stream}} = State, Now
+) ->
+    case next_credit_due(head_credit_due(Conn), head_credit_due(Stream)) of
+        undefined -> State;
+        DueAt -> arm_credit_timer(State, DueAt, Now)
+    end.
+
+-spec release_due_conn_credit(#state{}, integer()) -> #state{}.
+release_due_conn_credit(
+    #state{protocol_state = #h2_state{conn_credit = {delay, Ms, Due}} = H2} = State, Now
+) ->
+    case queue:out(Due) of
+        {{value, {DueAt, _StreamId, Size}}, Rest} when DueAt =< Now ->
+            Popped = State#state{protocol_state = H2#h2_state{conn_credit = {delay, Ms, Rest}}},
+            release_due_conn_credit(credit_connection(Popped, Size), Now);
+        {{value, _NotDue}, _Rest} ->
+            State;
+        {empty, _Due} ->
+            State
+    end;
+release_due_conn_credit(State, _Now) ->
+    State.
+
+-spec release_due_stream_credit(#state{}, integer()) -> #state{}.
+release_due_stream_credit(
+    #state{protocol_state = #h2_state{stream_credit = {delay, Ms, Due}} = H2} = State, Now
+) ->
+    case queue:out(Due) of
+        {{value, {DueAt, StreamId, Size}}, Rest} when DueAt =< Now ->
+            Popped = State#state{
+                protocol_state = H2#h2_state{stream_credit = {delay, Ms, Rest}}
+            },
+            release_due_stream_credit(credit_stream(Popped, StreamId, Size), Now);
+        {{value, _NotDue}, _Rest} ->
+            State;
+        {empty, _Due} ->
+            State
+    end;
+release_due_stream_credit(State, _Now) ->
+    State.
+
 -spec release_request_worker(#state{}, nhttp_lib:stream_id(), #h2_stream{}) -> #state{}.
 release_request_worker(
     #state{protocol_state = #h2_state{h2_streams = Streams, h2_workers = Workers} = H2} = State,
@@ -801,30 +1017,22 @@ release_request_worker(
         end,
     State#state{protocol_state = H2#h2_state{h2_streams = Streams1, h2_workers = Workers1}}.
 
+-doc """
+Credit the peer for `Size` consumed octets on both receive windows
+through the resolved policies. The `eager` pair is the default and sends
+both WINDOW_UPDATE frames at once.
+""".
 -spec replenish_recv_window(#state{}, nhttp_lib:stream_id(), non_neg_integer()) -> #state{}.
 replenish_recv_window(State, _StreamId, 0) ->
     State;
 replenish_recv_window(
-    #state{protocol_state = #h2_state{h2_conn = H2Conn} = H2} = State, StreamId, Size
+    #state{protocol_state = #h2_state{conn_credit = eager, stream_credit = eager}} = State,
+    StreamId,
+    Size
 ) ->
-    State1 =
-        case nhttp_h2:send_window_update(H2Conn, connection, Size) of
-            {ok, H2Conn1, Frame1} ->
-                nhttp_conn:sock_send(State, Frame1),
-                State#state{protocol_state = H2#h2_state{h2_conn = H2Conn1}};
-            {error, _} ->
-                State
-        end,
-    #state{protocol_state = #h2_state{h2_conn = ConnAfter} = H2After} = State1,
-    case nhttp_h2:send_window_update(ConnAfter, StreamId, Size) of
-        {ok, _UnknownStream, []} ->
-            State1;
-        {ok, H2Conn2, Frame2} ->
-            nhttp_conn:sock_send(State1, Frame2),
-            State1#state{protocol_state = H2After#h2_state{h2_conn = H2Conn2}};
-        {error, _} ->
-            State1
-    end.
+    credit_stream(credit_connection(State, Size), StreamId, Size);
+replenish_recv_window(State, StreamId, Size) ->
+    apply_stream_credit(apply_conn_credit(State, StreamId, Size), StreamId, Size).
 
 -spec send_h2_rst_stream_with_code(#state{}, nhttp_lib:stream_id(), atom()) -> ok.
 send_h2_rst_stream_with_code(State, StreamId, ErrorCode) ->

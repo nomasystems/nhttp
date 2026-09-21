@@ -40,6 +40,7 @@
     streaming_body = false :: boolean(),
     pending_trailers :: nhttp_lib:headers() | undefined,
     body_window_pending = queue:new() :: queue:queue(non_neg_integer()),
+    uncredited = 0 :: non_neg_integer(),
     status :: nhttp_lib:status() | undefined,
     req_span :: {nhttp_otel:span_ctx(), integer()} | undefined,
     bytes_sent = 0 :: non_neg_integer(),
@@ -72,12 +73,27 @@
     body_deadline_at :: integer() | undefined
 }).
 
+-type h2_credit_due() :: queue:queue({integer(), nhttp_lib:stream_id(), non_neg_integer()}).
+-type h2_conn_credit() ::
+    eager
+    | never
+    | {threshold, pos_integer(), non_neg_integer()}
+    | {delay, non_neg_integer(), h2_credit_due()}.
+-type h2_stream_credit() ::
+    eager
+    | never
+    | {threshold, pos_integer()}
+    | {delay, non_neg_integer(), h2_credit_due()}.
+
 -record(h2_state, {
     h2_conn :: nhttp_h2:conn(),
     h2_streams = #{} :: #{nhttp_lib:stream_id() => #h2_stream{}},
     h2_workers = #{} :: #{pid() => nhttp_lib:stream_id()},
     drain_deadline :: integer() | undefined,
-    response_delay = 0 :: nhttp:h2_response_delay()
+    conn_credit = eager :: h2_conn_credit(),
+    credit_timer :: {reference(), integer()} | undefined,
+    response_delay = 0 :: nhttp:h2_response_delay(),
+    stream_credit = eager :: h2_stream_credit()
 }).
 
 -record(state, {

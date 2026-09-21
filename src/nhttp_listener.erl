@@ -522,6 +522,38 @@ validate_h2_settings(Settings) ->
         ok
     end.
 
+-spec validate_h2_window_policies(nhttp:opts()) -> ok | {error, term()}.
+validate_h2_window_policies(Opts) ->
+    maybe
+        ok ?=
+            validate_h2_window_policy(
+                h2_connection_window_policy, maps:get(h2_connection_window_policy, Opts, eager)
+            ),
+        ok ?=
+            validate_h2_window_policy(
+                h2_stream_window_policy, maps:get(h2_stream_window_policy, Opts, eager)
+            ),
+        ok
+    end.
+
+-spec validate_h2_window_policy(
+    h2_connection_window_policy | h2_stream_window_policy, nhttp:h2_window_policy() | term()
+) -> ok | {error, term()}.
+validate_h2_window_policy(_Key, eager) ->
+    ok;
+validate_h2_window_policy(_Key, never) ->
+    ok;
+validate_h2_window_policy(_Key, {threshold, N}) when
+    is_integer(N), N >= 1, N =< ?H2_MAX_WINDOW_SIZE
+->
+    ok;
+validate_h2_window_policy(_Key, {delay, Ms}) when is_integer(Ms), Ms >= 0 ->
+    ok;
+validate_h2_window_policy(Key, V) ->
+    {error,
+        {invalid_h2_window_policy, Key, V,
+            "must be eager, {threshold, 1..2147483647}, {delay, Ms} or never"}}.
+
 -spec validate_header_table_size(non_neg_integer() | undefined) -> ok | {error, term()}.
 validate_header_table_size(undefined) ->
     ok;
@@ -561,6 +593,7 @@ validate_opts(Opts) ->
         ok ?= validate_h2_settings(maps:get(h2_settings, Opts, #{})),
         ok ?= validate_h2_aliases(Opts),
         ok ?= validate_h2_response_delay(maps:get(h2_response_delay, Opts, undefined)),
+        ok ?= validate_h2_window_policies(Opts),
         ok ?= validate_proxy_protocol(maps:get(proxy_protocol, Opts, false)),
         ok ?= validate_acceptor_count(maps:get(acceptor_count, Opts, undefined)),
         ok ?= validate_alt_svc(maps:get(alt_svc, Opts, #{})),

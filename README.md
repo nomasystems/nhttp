@@ -92,10 +92,21 @@ changes nothing on HTTP/1.1 or HTTP/3.
 | `h2_initial_window_size` | 65535 | Alias of `initial_window_size` in `h2_settings`: the receive window that each new stream grants the peer. |
 | `h2_max_frame_size` | 16384 | Alias of `max_frame_size` in `h2_settings`: the largest frame payload the server accepts. |
 | `h2_response_delay` | 0 | Milliseconds to hold the response headers of a `{reply, _, _}` result. `{uniform, MinMs, MaxMs}` draws a value per response. |
+| `h2_connection_window_policy` | `eager` | Credit policy for the connection receive window. |
+| `h2_stream_window_policy` | `eager` | Credit policy for each stream receive window. |
 
 An alias must equal the `h2_settings` key when both are present. The
 delay applies to `{reply, _, _}` results only. Error responses, producer
 streams and WebSocket upgrades go out at once.
+
+A credit policy has four shapes. `eager` sends a WINDOW_UPDATE for each
+body chunk as soon as the handler consumed it. `{threshold, N}` holds the
+credit until the uncredited octets reach `N`, then sends the accumulated
+total. `{delay, Ms}` sends the credit for each chunk `Ms` milliseconds
+after the handler consumed it. `never` sends no credit. The two policies
+are independent. No policy credits more than the handler consumed. A
+stream that closes before its delayed credit is due gets no stream
+WINDOW_UPDATE. The connection credit for those octets still goes out.
 
 ## Documentation
 
