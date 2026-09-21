@@ -732,6 +732,8 @@ replenish_recv_window(
         end,
     #state{protocol_state = #h2_state{h2_conn = ConnAfter} = H2After} = State1,
     case nhttp_h2:send_window_update(ConnAfter, StreamId, Size) of
+        {ok, _UnknownStream, []} ->
+            State1;
         {ok, H2Conn2, Frame2} ->
             nhttp_conn:sock_send(State1, Frame2),
             State1#state{protocol_state = H2After#h2_state{h2_conn = H2Conn2}};
@@ -936,7 +938,7 @@ handle_h2_event(
 handle_h2_event(State, {goaway, _LastStreamId, ErrorCode, _DebugData}) ->
     nhttp_conn_ws_h2:notify_goaway(State, ErrorCode);
 handle_h2_event(State, {settings, _NewSettings}) ->
-    State;
+    flush_stream_buffer(State, 0);
 handle_h2_event(State, settings_ack) ->
     State;
 handle_h2_event(State, {window_update, StreamId, _Increment}) ->

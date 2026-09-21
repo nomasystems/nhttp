@@ -28,6 +28,7 @@
     h2_client_rst_during_stream/1,
     h2_connection_error_goaway/1,
     h2_drain_kills_active_worker/1,
+    h2_settings_window_raise_flushes_buffer/1,
     h2_streaming_body_too_large/1,
     h2_sys_messages/1,
     h2_uri_too_long/1,
@@ -43,6 +44,8 @@
 ]).
 
 -define(BIG_BODY, 200000).
+-define(DEFAULT_WINDOW, 65535).
+-define(SETTINGS_INITIAL_WINDOW_SIZE, 4).
 
 %%%-----------------------------------------------------------------------------
 %%% CT CALLBACKS
@@ -53,6 +56,7 @@ all() ->
         h2_client_rst_during_stream,
         h2_connection_error_goaway,
         h2_drain_kills_active_worker,
+        h2_settings_window_raise_flushes_buffer,
         h2_streaming_body_too_large,
         h2_sys_messages,
         h2_uri_too_long,
@@ -152,6 +156,23 @@ h2_window_exhaustion_then_update(Config) ->
     ?assert(Got1 < ?BIG_BODY),
     Total = drain_with_window_updates(Sock, Got1, 30),
     ?assertEqual(?BIG_BODY, Total),
+    ssl:close(Sock),
+    nhttp:stop(Pid),
+    ok.
+
+h2_settings_window_raise_flushes_buffer(Config) ->
+    {ok, Pid, Port} = start(Config, #{}),
+    {ok, Sock} = nhttp_test_helpers:h2_connect(Port),
+    ok = nhttp_test_helpers:h2_send_settings(Sock, [{?SETTINGS_INITIAL_WINDOW_SIZE, 0}]),
+    ?assert(lists:member({settings, 0, <<>>}, nhttp_test_helpers:h2_recv(Sock, 500))),
+    ok = nhttp_test_helpers:h2_send_request(Sock, 1, <<"/big">>),
+    Frames = nhttp_test_helpers:h2_recv(Sock, 500),
+    ?assert(lists:keymember(headers, 1, Frames)),
+    ?assertEqual(0, stream_data_size(Frames, 1)),
+    ok = nhttp_test_helpers:h2_send_settings(Sock, [
+        {?SETTINGS_INITIAL_WINDOW_SIZE, ?DEFAULT_WINDOW}
+    ]),
+    ?assertEqual(?DEFAULT_WINDOW, stream_data_size(nhttp_test_helpers:h2_recv(Sock, 1000), 1)),
     ssl:close(Sock),
     nhttp:stop(Pid),
     ok.

@@ -33,6 +33,7 @@
     h2_send_raw/2,
     h2_send_request/3,
     h2_send_rst_stream/3,
+    h2_send_settings/2,
     h2_send_window_update/3,
     tcp_connect/1
 ]).
@@ -205,6 +206,11 @@ h2_send_raw(Sock, Bytes) ->
 -spec h2_send_rst_stream(ssl:sslsocket(), non_neg_integer(), non_neg_integer()) -> ok.
 h2_send_rst_stream(Sock, StreamId, ErrorCode) ->
     ssl:send(Sock, <<4:24, 3, 0, 0:1, StreamId:31, ErrorCode:32>>).
+
+-spec h2_send_settings(ssl:sslsocket(), [{non_neg_integer(), non_neg_integer()}]) -> ok.
+h2_send_settings(Sock, Settings) ->
+    Payload = <<<<Id:16, Value:32>> || {Id, Value} <- Settings>>,
+    ssl:send(Sock, <<(byte_size(Payload)):24, 4, 0, 0:1, 0:31, Payload/binary>>).
 
 -spec h2_send_window_update(ssl:sslsocket(), non_neg_integer(), non_neg_integer()) -> ok.
 h2_send_window_update(Sock, StreamId, Increment) ->
