@@ -421,23 +421,48 @@ h1_state_from_opts(Opts) ->
         body_deadline = maps:get(body_deadline, Timeouts, infinity)
     }.
 
+-doc """
+Build the HTTP/2 settings the codec advertises. The first-class options
+`h2_initial_window_size` and `h2_max_frame_size` are aliases of the
+`h2_settings` keys and are resolved here, the only place the codec is built.
+""".
+-spec h2_settings_from_opts(nhttp:opts()) -> nhttp_h2:settings().
+h2_settings_from_opts(Opts) ->
+    Settings = maps:fold(
+        fun put_h2_alias/3,
+        maps:get(h2_settings, Opts, #{}),
+        maps:with([h2_initial_window_size, h2_max_frame_size], Opts)
+    ),
+    Settings#{enable_connect_protocol => true}.
+
 -spec init_protocol(#state{}) -> {ok, #state{}} | {error, nhttp_sock:socket_error()}.
 init_protocol(#state{family = http2, socket = Socket, peer = Peer, opts = Opts} = State) ->
-    UserH2Settings = maps:get(h2_settings, Opts, #{}),
-    H2Settings = UserH2Settings#{enable_connect_protocol => true},
-    H2Conn0 = nhttp_h2:new(server, H2Settings),
+    H2Conn0 = nhttp_h2:new(server, h2_settings_from_opts(Opts)),
     H2Conn = nhttp_h2:set_peer(H2Conn0, Peer),
     Preface = nhttp_h2:preface(H2Conn),
     maybe
         ok ?= nhttp_sock:send(Socket, Preface),
         ok ?= nhttp_sock:setopts(Socket, [{active, once}]),
-        {ok, State#state{protocol_state = #h2_state{h2_conn = H2Conn}}}
+        {ok, State#state{
+            protocol_state = #h2_state{
+                h2_conn = H2Conn,
+                response_delay = maps:get(h2_response_delay, Opts, 0)
+            }
+        }}
     end;
 init_protocol(#state{family = http1, socket = Socket, opts = Opts} = State) ->
     case nhttp_sock:setopts(Socket, [{active, once}]) of
         ok -> {ok, State#state{protocol_state = h1_state_from_opts(Opts)}};
         {error, _} = Error -> Error
     end.
+
+-spec put_h2_alias(
+    h2_initial_window_size | h2_max_frame_size, pos_integer(), nhttp_h2:settings()
+) -> nhttp_h2:settings().
+put_h2_alias(h2_initial_window_size, Value, Settings) ->
+    Settings#{initial_window_size => Value};
+put_h2_alias(h2_max_frame_size, Value, Settings) ->
+    Settings#{max_frame_size => Value}.
 
 -spec version_to_family(nhttp_lib:version()) -> http1 | http2 | http3.
 version_to_family(http1_0) -> http1;

@@ -30,16 +30,28 @@
     h2_connect/1,
     h2_open_stream/3,
     h2_recv/2,
+    h2_recv_stream/3,
+    h2_response_body/2,
+    h2_response_status/1,
+    h2_send_data/4,
+    h2_send_headers/5,
+    h2_send_post/4,
     h2_send_raw/2,
     h2_send_request/3,
     h2_send_rst_stream/3,
     h2_send_settings/2,
     h2_send_window_update/3,
+    h2_server_settings/1,
+    h2_start_server/2,
+    h2_stream_done/2,
     tcp_connect/1
 ]).
 
 -define(DEFAULT_TIMEOUT, 5000).
+-define(H2_IDLE_TIMEOUT, 5000).
 -define(POLL_INTERVAL, 25).
+-define(SETTINGS_RECV_MS, 1000).
+-define(STREAM_TAIL_MS, 200).
 
 -type h2_frame() ::
     {data, non_neg_integer(), binary(), fin | nofin}
@@ -122,6 +134,23 @@ start(Opts) ->
     {ok, Port} = nhttp:get_port(Pid),
     {ok, Pid, Port}.
 
+-doc "Start an HTTP/2-only TLS listener on a free port with the test certificates.".
+-spec h2_start_server(module(), nhttp:opts()) -> {pid(), inet:port_number()}.
+h2_start_server(Handler, Extra) ->
+    {CertFile, KeyFile} = certs(),
+    {ok, Pid, Port} = start(
+        maps:merge(
+            #{
+                handler => Handler,
+                tls => #{certfile => CertFile, keyfile => KeyFile},
+                versions => [http2],
+                timeouts => #{idle => ?H2_IDLE_TIMEOUT}
+            },
+            Extra
+        )
+    ),
+    {Pid, Port}.
+
 -spec conn_pids(pid()) -> [pid()].
 conn_pids(ListenerPid) ->
     lists:append([conns_in(TSup) || TSup <- transport_sups(ListenerPid)]).
@@ -170,22 +199,21 @@ drain_tcp(Sock, Acc) ->
 
 -spec h2_connect(inet:port_number()) -> {ok, ssl:sslsocket()}.
 h2_connect(Port) ->
-    {ok, Sock} = ssl:connect(
-        "127.0.0.1",
-        Port,
-        [
-            binary,
-            {active, false},
-            {verify, verify_none},
-            {alpn_advertised_protocols, [<<"h2">>]}
-        ],
-        5000
-    ),
-    ok = ssl:send(Sock, <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>),
-    ok = ssl:send(Sock, <<0, 0, 0, 4, 0, 0, 0, 0, 0>>),
+    {ok, Sock} = h2_connect_preface(Port),
     _ = ssl:recv(Sock, 0, 2000),
     ok = ssl:send(Sock, <<0, 0, 0, 4, 1, 0, 0, 0, 0>>),
     {ok, Sock}.
+
+-doc """
+Open a connection and return the parameters of the SETTINGS frame the
+server sends in its preface, as `{Identifier, Value}` pairs.
+""".
+-spec h2_server_settings(inet:port_number()) -> [{non_neg_integer(), non_neg_integer()}].
+h2_server_settings(Port) ->
+    {ok, Sock} = h2_connect_preface(Port),
+    Frames = h2_recv(Sock, ?SETTINGS_RECV_MS),
+    ok = ssl:close(Sock),
+    [{Id, Value} || {settings, 0, Payload} <- Frames, <<Id:16, Value:32>> <= Payload].
 
 -spec h2_send_request(ssl:sslsocket(), non_neg_integer(), binary()) -> ok.
 h2_send_request(Sock, StreamId, Path) ->
@@ -219,6 +247,86 @@ h2_send_window_update(Sock, StreamId, Increment) ->
 -spec h2_recv(ssl:sslsocket(), timeout()) -> [h2_frame()].
 h2_recv(Sock, Timeout) ->
     h2_recv(Sock, Timeout, <<>>, []).
+
+-doc """
+Receive frames until the stream ends (END_STREAM or RST_STREAM), then
+drain the socket for a short tail so frames sent right after are seen.
+""".
+-spec h2_recv_stream(ssl:sslsocket(), non_neg_integer(), timeout()) -> [h2_frame()].
+h2_recv_stream(Sock, StreamId, Timeout) ->
+    Frames = recv_stream_until_done(Sock, StreamId, Timeout, <<>>, []),
+    Frames ++ recv_stream_tail(Sock, <<>>, []).
+
+-spec h2_response_body([h2_frame()], non_neg_integer()) -> binary().
+h2_response_body(Frames, StreamId) ->
+    iolist_to_binary([P || {data, SId, P, _} <- Frames, SId =:= StreamId]).
+
+-doc "The `:status` of the first HEADERS frame, decoded with a fresh HPACK table.".
+-spec h2_response_status([h2_frame()]) -> binary() | undefined.
+h2_response_status(Frames) ->
+    case [P || {headers, _, P, _} <- Frames] of
+        [Block | _] ->
+            {ok, Dec} = nhttp_hpack:new(),
+            case nhttp_hpack:decode(Block, Dec) of
+                {ok, Headers, _} -> proplists:get_value(<<":status">>, Headers);
+                {error, _} -> undefined
+            end;
+        [] ->
+            undefined
+    end.
+
+-doc "True once `Frames` carries END_STREAM or RST_STREAM for `StreamId`.".
+-spec h2_stream_done([h2_frame()], non_neg_integer()) -> boolean().
+h2_stream_done(Frames, StreamId) ->
+    lists:any(
+        fun
+            ({data, SId, _, fin}) when SId =:= StreamId -> true;
+            ({headers, SId, _, fin}) when SId =:= StreamId -> true;
+            ({rst_stream, SId, _}) when SId =:= StreamId -> true;
+            (_) -> false
+        end,
+        Frames
+    ).
+
+-spec h2_send_data(ssl:sslsocket(), non_neg_integer(), binary(), boolean()) ->
+    ok | {error, term()}.
+h2_send_data(Sock, StreamId, Data, EndStream) ->
+    Flags =
+        case EndStream of
+            true -> 16#01;
+            false -> 16#00
+        end,
+    Frame = <<(byte_size(Data)):24, 0, Flags, 0:1, StreamId:31, Data/binary>>,
+    ssl:send(Sock, Frame).
+
+-doc "Send a POST HEADERS frame with `content-length` set to `Length`.".
+-spec h2_send_headers(
+    ssl:sslsocket(), non_neg_integer(), binary(), non_neg_integer(), boolean()
+) -> ok | {error, term()}.
+h2_send_headers(Sock, StreamId, Path, Length, EndStream) ->
+    {ok, Enc} = nhttp_hpack:new(),
+    Headers = [
+        {<<":method">>, <<"POST">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"localhost">>},
+        {<<":path">>, Path},
+        {<<"content-length">>, integer_to_binary(Length)}
+    ],
+    {ok, IOList, _Enc1} = nhttp_hpack:encode(Headers, Enc),
+    Block = iolist_to_binary(IOList),
+    Flags =
+        case EndStream of
+            true -> 16#05;
+            false -> 16#04
+        end,
+    Frame = <<(byte_size(Block)):24, 1, Flags, 0:1, StreamId:31, Block/binary>>,
+    ssl:send(Sock, Frame).
+
+-spec h2_send_post(ssl:sslsocket(), non_neg_integer(), binary(), binary()) ->
+    ok | {error, term()}.
+h2_send_post(Sock, StreamId, Path, Body) ->
+    ok = h2_send_headers(Sock, StreamId, Path, byte_size(Body), false),
+    h2_send_data(Sock, StreamId, Body, true).
 
 -spec decode_h2_frames(binary()) -> {[h2_frame()], binary()}.
 decode_h2_frames(Bin) ->
@@ -274,6 +382,50 @@ decode_h2_frame(8, _Flags, StreamId, <<Inc:32>>) ->
 decode_h2_frame(Type, _Flags, StreamId, Payload) ->
     {other, StreamId, Type, Payload}.
 
+-spec h2_connect_preface(inet:port_number()) -> {ok, ssl:sslsocket()}.
+h2_connect_preface(Port) ->
+    {ok, Sock} = ssl:connect(
+        "127.0.0.1",
+        Port,
+        [
+            binary,
+            {active, false},
+            {verify, verify_none},
+            {alpn_advertised_protocols, [<<"h2">>]}
+        ],
+        5000
+    ),
+    ok = ssl:send(Sock, <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>),
+    ok = ssl:send(Sock, <<0, 0, 0, 4, 0, 0, 0, 0, 0>>),
+    {ok, Sock}.
+
 -spec h2_fin(non_neg_integer()) -> fin | nofin.
 h2_fin(Flags) when Flags band 1 =:= 1 -> fin;
 h2_fin(_Flags) -> nofin.
+
+-spec recv_stream_until_done(
+    ssl:sslsocket(), non_neg_integer(), timeout(), binary(), [h2_frame()]
+) -> [h2_frame()].
+recv_stream_until_done(Sock, StreamId, Timeout, Buf, Acc) ->
+    case h2_stream_done(Acc, StreamId) of
+        true ->
+            Acc;
+        false ->
+            case ssl:recv(Sock, 0, Timeout) of
+                {ok, Data} ->
+                    {Frames, Rest} = decode_h2_frames(<<Buf/binary, Data/binary>>),
+                    recv_stream_until_done(Sock, StreamId, Timeout, Rest, Acc ++ Frames);
+                {error, _} ->
+                    Acc
+            end
+    end.
+
+-spec recv_stream_tail(ssl:sslsocket(), binary(), [h2_frame()]) -> [h2_frame()].
+recv_stream_tail(Sock, Buf, Acc) ->
+    case ssl:recv(Sock, 0, ?STREAM_TAIL_MS) of
+        {ok, Data} ->
+            {Frames, Rest} = decode_h2_frames(<<Buf/binary, Data/binary>>),
+            recv_stream_tail(Sock, Rest, Acc ++ Frames);
+        {error, _} ->
+            Acc
+    end.

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## unreleased
 
+### Added
+
+- Listener options `h2_initial_window_size` and `h2_max_frame_size`, aliases of the `h2_settings` keys
+- Listener option `h2_response_delay`, a fixed or uniform delay before the response headers of a `{reply, _, _}` result on HTTP/2
+
 ### Changed
 
 - Updates `nhttp_lib` reference
