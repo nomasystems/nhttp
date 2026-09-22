@@ -27,6 +27,11 @@
 -export([
     acceptor_sys_lifecycle/1,
     acceptor_sys_terminate/1,
+    listener_h2_alias_conflicts_with_settings/1,
+    listener_h2_alias_out_of_range/1,
+    listener_h2_credit_batch_invalid/1,
+    listener_h2_response_delay_invalid/1,
+    listener_h2_window_policy_invalid/1,
     listener_invalid_tls/1,
     listener_invalid_versions/1,
     listener_listen_failed/1,
@@ -41,6 +46,11 @@ all() ->
     [
         acceptor_sys_lifecycle,
         acceptor_sys_terminate,
+        listener_h2_alias_conflicts_with_settings,
+        listener_h2_alias_out_of_range,
+        listener_h2_credit_batch_invalid,
+        listener_h2_response_delay_invalid,
+        listener_h2_window_policy_invalid,
         listener_invalid_tls,
         listener_invalid_versions,
         listener_listen_failed,
@@ -73,6 +83,149 @@ handle_request(_Request, State) ->
 %%%-----------------------------------------------------------------------------
 %%% TEST CASES
 %%%-----------------------------------------------------------------------------
+
+listener_h2_alias_conflicts_with_settings(_Config) ->
+    assert_error_contains(
+        "invalid_h2_setting",
+        nhttp:start_link(#{
+            port => 0,
+            handler => ?MODULE,
+            versions => [http1_1],
+            h2_max_frame_size => 16384,
+            h2_settings => #{max_frame_size => 32768}
+        })
+    ),
+    assert_error_contains(
+        "invalid_h2_setting",
+        nhttp:start_link(#{
+            port => 0,
+            handler => ?MODULE,
+            versions => [http1_1],
+            h2_initial_window_size => 1000,
+            h2_settings => #{initial_window_size => 2000}
+        })
+    ),
+    {ok, Pid} = nhttp:start_link(#{
+        port => 0,
+        handler => ?MODULE,
+        versions => [http1_1],
+        h2_initial_window_size => 1000,
+        h2_max_frame_size => 32768,
+        h2_settings => #{initial_window_size => 1000, max_frame_size => 32768}
+    }),
+    nhttp:stop(Pid),
+    ok.
+
+listener_h2_alias_out_of_range(_Config) ->
+    Base = #{port => 0, handler => ?MODULE, versions => [http1_1]},
+    ?assertEqual(
+        nhttp:start_link(Base#{h2_settings => #{max_frame_size => 16383}}),
+        nhttp:start_link(Base#{h2_max_frame_size => 16383})
+    ),
+    assert_error_contains("max_frame_size", nhttp:start_link(Base#{h2_max_frame_size => 16383})),
+    ?assertEqual(
+        nhttp:start_link(Base#{h2_settings => #{initial_window_size => 0}}),
+        nhttp:start_link(Base#{h2_initial_window_size => 0})
+    ),
+    assert_error_contains(
+        "initial_window_size", nhttp:start_link(Base#{h2_initial_window_size => 0})
+    ),
+    ok.
+
+listener_h2_response_delay_invalid(_Config) ->
+    Base = #{port => 0, handler => ?MODULE, versions => [http1_1]},
+    Invalid = [-1, 1.5, ms, {uniform, 200, 100}, {uniform, -1, 5}, {uniform, 1}],
+    lists:foreach(
+        fun(Delay) ->
+            assert_error_contains(
+                "invalid_h2_response_delay", nhttp:start_link(Base#{h2_response_delay => Delay})
+            )
+        end,
+        Invalid
+    ),
+    lists:foreach(
+        fun(Delay) ->
+            {ok, Pid} = nhttp:start_link(Base#{h2_response_delay => Delay}),
+            nhttp:stop(Pid)
+        end,
+        [0, 250, {uniform, 5, 5}, {uniform, 100, 200}]
+    ),
+    ok.
+
+listener_h2_credit_batch_invalid(_Config) ->
+    Base = #{port => 0, handler => ?MODULE, versions => [http1_1]},
+    Invalid = [
+        #{h2_credit_batch => 0},
+        #{h2_credit_batch => 32830, h2_connection_window_policy => eager},
+        #{h2_credit_batch => 32830, h2_stream_window_policy => {threshold, 1}},
+        #{h2_credit_batch => -1, h2_connection_window_policy => on_response},
+        #{h2_credit_batch => 1.5, h2_connection_window_policy => on_response},
+        #{h2_credit_batch => 2147483648, h2_connection_window_policy => on_response},
+        #{h2_credit_batch => big, h2_stream_window_policy => on_response}
+    ],
+    Valid = [
+        #{h2_credit_batch => 0, h2_connection_window_policy => on_response},
+        #{h2_credit_batch => 32830, h2_stream_window_policy => on_response},
+        #{
+            h2_credit_batch => 2147483647,
+            h2_connection_window_policy => on_response,
+            h2_stream_window_policy => on_response
+        }
+    ],
+    lists:foreach(
+        fun(Opts) ->
+            assert_error_contains(
+                "invalid_h2_credit_batch", nhttp:start_link(maps:merge(Base, Opts))
+            )
+        end,
+        Invalid
+    ),
+    lists:foreach(
+        fun(Opts) ->
+            {ok, Pid} = nhttp:start_link(maps:merge(Base, Opts)),
+            nhttp:stop(Pid)
+        end,
+        Valid
+    ),
+    ok.
+
+listener_h2_window_policy_invalid(_Config) ->
+    Base = #{port => 0, handler => ?MODULE, versions => [http1_1]},
+    Invalid = [
+        lazy,
+        {threshold, 0},
+        {threshold, -1},
+        {threshold, 2147483648},
+        {threshold, n},
+        {delay, -1},
+        {delay, 1.5},
+        {uniform, 1, 2}
+    ],
+    Valid = [
+        eager,
+        never,
+        on_response,
+        {threshold, 1},
+        {threshold, 2147483647},
+        {delay, 0},
+        {delay, 250}
+    ],
+    lists:foreach(
+        fun({Key, Policy}) ->
+            assert_error_contains(
+                "invalid_h2_window_policy", nhttp:start_link(Base#{Key => Policy})
+            )
+        end,
+        [{Key, Policy} || Key <- policy_keys(), Policy <- Invalid]
+    ),
+    lists:foreach(
+        fun({Key, Policy}) ->
+            {ok, Pid} = nhttp:start_link(Base#{Key => Policy}),
+            nhttp:stop(Pid)
+        end,
+        [{Key, Policy} || Key <- policy_keys(), Policy <- Valid]
+    ),
+    ok.
 
 listener_invalid_versions(_Config) ->
     assert_error_contains(
@@ -149,6 +302,9 @@ assert_error_contains(Substr, Result) ->
     ?assertMatch({error, _}, Result),
     Flat = lists:flatten(io_lib:format("~p", [Result])),
     ?assertNotEqual(nomatch, string:find(Flat, Substr)).
+
+policy_keys() ->
+    [h2_connection_window_policy, h2_stream_window_policy].
 
 acceptor_sys_lifecycle(_Config) ->
     {ok, Pid} = nhttp:start_link(#{

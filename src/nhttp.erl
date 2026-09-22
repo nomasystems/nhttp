@@ -167,6 +167,8 @@ RFC 9001 §9.2).
     header_name/0,
     header_value/0,
     headers/0,
+    h2_response_delay/0,
+    h2_window_policy/0,
 
     method/0,
     name/0,
@@ -197,7 +199,13 @@ RFC 9001 §9.2).
     alt_svc => #{ma => non_neg_integer()} | false,
     backlog => pos_integer(),
     buffer => pos_integer(),
+    h2_connection_window_policy => h2_window_policy(),
+    h2_credit_batch => non_neg_integer(),
+    h2_initial_window_size => 1..16#7fffffff,
+    h2_max_frame_size => 16#4000..16#ffffff,
+    h2_response_delay => h2_response_delay(),
     h2_settings => nhttp_h2:settings(),
+    h2_stream_window_policy => h2_window_policy(),
     handler := module(),
     handler_args => term(),
     compression => boolean(),
@@ -211,6 +219,30 @@ RFC 9001 §9.2).
     tls => tls(),
     proxy_protocol => boolean() | proxy_protocol_opts()
 }.
+
+-doc """
+Delay before the response headers of a `{reply, _, _}` handler result on
+HTTP/2, in milliseconds. `{uniform, MinMs, MaxMs}` draws a value in that
+range for each response. Error responses, producer streams and WebSocket
+upgrades are not delayed. Default 0.
+""".
+-type h2_response_delay() ::
+    non_neg_integer() | {uniform, non_neg_integer(), non_neg_integer()}.
+
+-doc """
+Credit policy for an HTTP/2 receive window. `eager` sends a WINDOW_UPDATE
+for each body chunk as soon as the handler consumed it. `{threshold, N}`
+holds the credit until the uncredited octets reach `N`, then sends the
+accumulated total. `{delay, Ms}` sends the credit for each chunk `Ms`
+milliseconds after the handler consumed it. `on_response` sends the
+credit for the body of a request ahead of the response headers of its
+`{reply, _, _}` result. On the connection window `h2_credit_batch`
+holds that credit until the responded octets reach the batch, then
+sends one WINDOW_UPDATE of exactly the batch. `never` sends no credit.
+Default `eager`.
+""".
+-type h2_window_policy() ::
+    eager | {threshold, pos_integer()} | {delay, non_neg_integer()} | on_response | never.
 
 -doc """
 Connection timeouts (milliseconds, or `infinity`).

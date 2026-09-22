@@ -467,6 +467,50 @@ validate_alt_svc(Map) when is_map(Map) ->
 validate_alt_svc(_Other) ->
     invalid_alt_svc_error(not_false_or_map).
 
+-spec validate_h2_alias(
+    h2_initial_window_size | h2_max_frame_size,
+    initial_window_size | max_frame_size,
+    nhttp:opts(),
+    nhttp_h2:settings()
+) -> ok | {error, term()}.
+validate_h2_alias(AliasKey, Key, Opts, Settings) ->
+    case {maps:get(AliasKey, Opts, undefined), maps:get(Key, Settings, undefined)} of
+        {undefined, _} -> ok;
+        {V, undefined} -> validate_h2_setting(Key, V);
+        {V, V} -> validate_h2_setting(Key, V);
+        {V, _Other} -> {error, {invalid_h2_setting, Key, V, "must equal the h2_settings value"}}
+    end.
+
+-spec validate_h2_aliases(nhttp:opts()) -> ok | {error, term()}.
+validate_h2_aliases(Opts) ->
+    Settings = maps:get(h2_settings, Opts, #{}),
+    maybe
+        ok ?= validate_h2_alias(h2_initial_window_size, initial_window_size, Opts, Settings),
+        ok ?= validate_h2_alias(h2_max_frame_size, max_frame_size, Opts, Settings),
+        ok
+    end.
+
+-spec validate_h2_response_delay(nhttp:h2_response_delay() | undefined) -> ok | {error, term()}.
+validate_h2_response_delay(undefined) ->
+    ok;
+validate_h2_response_delay(Ms) when is_integer(Ms), Ms >= 0 ->
+    ok;
+validate_h2_response_delay({uniform, Min, Max}) when
+    is_integer(Min), is_integer(Max), Min >= 0, Min =< Max
+->
+    ok;
+validate_h2_response_delay(V) ->
+    {error,
+        {invalid_h2_response_delay, V,
+            "must be non_neg_integer() or {uniform, MinMs, MaxMs} with MinMs =< MaxMs"}}.
+
+-spec validate_h2_setting(initial_window_size | max_frame_size, pos_integer()) ->
+    ok | {error, term()}.
+validate_h2_setting(initial_window_size, V) ->
+    validate_initial_window_size(V);
+validate_h2_setting(max_frame_size, V) ->
+    validate_max_frame_size(V).
+
 -spec validate_h2_settings(nhttp_h2:settings()) -> ok | {error, term()}.
 validate_h2_settings(Settings) ->
     maybe
@@ -477,6 +521,59 @@ validate_h2_settings(Settings) ->
         ok ?= validate_max_frame_size(maps:get(max_frame_size, Settings, undefined)),
         ok
     end.
+
+-spec validate_h2_credit_batch(nhttp:opts()) -> ok | {error, term()}.
+validate_h2_credit_batch(Opts) ->
+    OnResponse =
+        maps:get(h2_connection_window_policy, Opts, eager) =:= on_response orelse
+            maps:get(h2_stream_window_policy, Opts, eager) =:= on_response,
+    case maps:get(h2_credit_batch, Opts, undefined) of
+        undefined ->
+            ok;
+        V when is_integer(V), V >= 0, V =< ?H2_MAX_WINDOW_SIZE, OnResponse ->
+            ok;
+        V when is_integer(V), V >= 0, V =< ?H2_MAX_WINDOW_SIZE ->
+            {error,
+                {invalid_h2_credit_batch, V,
+                    "needs h2_connection_window_policy or h2_stream_window_policy on_response"}};
+        V ->
+            {error, {invalid_h2_credit_batch, V, "must be 0..2147483647"}}
+    end.
+
+-spec validate_h2_window_policies(nhttp:opts()) -> ok | {error, term()}.
+validate_h2_window_policies(Opts) ->
+    maybe
+        ok ?=
+            validate_h2_window_policy(
+                h2_connection_window_policy, maps:get(h2_connection_window_policy, Opts, eager)
+            ),
+        ok ?=
+            validate_h2_window_policy(
+                h2_stream_window_policy, maps:get(h2_stream_window_policy, Opts, eager)
+            ),
+        ok ?= validate_h2_credit_batch(Opts),
+        ok
+    end.
+
+-spec validate_h2_window_policy(
+    h2_connection_window_policy | h2_stream_window_policy, nhttp:h2_window_policy() | term()
+) -> ok | {error, term()}.
+validate_h2_window_policy(_Key, eager) ->
+    ok;
+validate_h2_window_policy(_Key, never) ->
+    ok;
+validate_h2_window_policy(_Key, {threshold, N}) when
+    is_integer(N), N >= 1, N =< ?H2_MAX_WINDOW_SIZE
+->
+    ok;
+validate_h2_window_policy(_Key, {delay, Ms}) when is_integer(Ms), Ms >= 0 ->
+    ok;
+validate_h2_window_policy(_Key, on_response) ->
+    ok;
+validate_h2_window_policy(Key, V) ->
+    {error,
+        {invalid_h2_window_policy, Key, V,
+            "must be eager, {threshold, 1..2147483647}, {delay, Ms}, on_response or never"}}.
 
 -spec validate_header_table_size(non_neg_integer() | undefined) -> ok | {error, term()}.
 validate_header_table_size(undefined) ->
@@ -515,6 +612,9 @@ validate_opts(Opts) ->
         ok ?= validate_required_opts(Opts),
         ok ?= validate_versions(Opts),
         ok ?= validate_h2_settings(maps:get(h2_settings, Opts, #{})),
+        ok ?= validate_h2_aliases(Opts),
+        ok ?= validate_h2_response_delay(maps:get(h2_response_delay, Opts, undefined)),
+        ok ?= validate_h2_window_policies(Opts),
         ok ?= validate_proxy_protocol(maps:get(proxy_protocol, Opts, false)),
         ok ?= validate_acceptor_count(maps:get(acceptor_count, Opts, undefined)),
         ok ?= validate_alt_svc(maps:get(alt_svc, Opts, #{})),
