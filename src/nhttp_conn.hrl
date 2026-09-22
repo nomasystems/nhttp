@@ -41,6 +41,7 @@
     pending_trailers :: nhttp_lib:headers() | undefined,
     body_window_pending = queue:new() :: queue:queue(non_neg_integer()),
     uncredited = 0 :: non_neg_integer(),
+    conn_uncredited = 0 :: non_neg_integer(),
     status :: nhttp_lib:status() | undefined,
     req_span :: {nhttp_otel:span_ctx(), integer()} | undefined,
     bytes_sent = 0 :: non_neg_integer(),
@@ -78,12 +79,14 @@
     eager
     | never
     | {threshold, pos_integer(), non_neg_integer()}
-    | {delay, non_neg_integer(), h2_credit_due()}.
+    | {delay, non_neg_integer(), h2_credit_due()}
+    | {on_response, non_neg_integer(), non_neg_integer()}.
 -type h2_stream_credit() ::
     eager
     | never
     | {threshold, pos_integer()}
-    | {delay, non_neg_integer(), h2_credit_due()}.
+    | {delay, non_neg_integer(), h2_credit_due()}
+    | on_response.
 
 -record(h2_state, {
     h2_conn :: nhttp_h2:conn(),

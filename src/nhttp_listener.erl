@@ -522,6 +522,24 @@ validate_h2_settings(Settings) ->
         ok
     end.
 
+-spec validate_h2_credit_batch(nhttp:opts()) -> ok | {error, term()}.
+validate_h2_credit_batch(Opts) ->
+    OnResponse =
+        maps:get(h2_connection_window_policy, Opts, eager) =:= on_response orelse
+            maps:get(h2_stream_window_policy, Opts, eager) =:= on_response,
+    case maps:get(h2_credit_batch, Opts, undefined) of
+        undefined ->
+            ok;
+        V when is_integer(V), V >= 0, V =< ?H2_MAX_WINDOW_SIZE, OnResponse ->
+            ok;
+        V when is_integer(V), V >= 0, V =< ?H2_MAX_WINDOW_SIZE ->
+            {error,
+                {invalid_h2_credit_batch, V,
+                    "needs h2_connection_window_policy or h2_stream_window_policy on_response"}};
+        V ->
+            {error, {invalid_h2_credit_batch, V, "must be 0..2147483647"}}
+    end.
+
 -spec validate_h2_window_policies(nhttp:opts()) -> ok | {error, term()}.
 validate_h2_window_policies(Opts) ->
     maybe
@@ -533,6 +551,7 @@ validate_h2_window_policies(Opts) ->
             validate_h2_window_policy(
                 h2_stream_window_policy, maps:get(h2_stream_window_policy, Opts, eager)
             ),
+        ok ?= validate_h2_credit_batch(Opts),
         ok
     end.
 
@@ -549,10 +568,12 @@ validate_h2_window_policy(_Key, {threshold, N}) when
     ok;
 validate_h2_window_policy(_Key, {delay, Ms}) when is_integer(Ms), Ms >= 0 ->
     ok;
+validate_h2_window_policy(_Key, on_response) ->
+    ok;
 validate_h2_window_policy(Key, V) ->
     {error,
         {invalid_h2_window_policy, Key, V,
-            "must be eager, {threshold, 1..2147483647}, {delay, Ms} or never"}}.
+            "must be eager, {threshold, 1..2147483647}, {delay, Ms}, on_response or never"}}.
 
 -spec validate_header_table_size(non_neg_integer() | undefined) -> ok | {error, term()}.
 validate_header_table_size(undefined) ->

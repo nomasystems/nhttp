@@ -29,6 +29,7 @@
     acceptor_sys_terminate/1,
     listener_h2_alias_conflicts_with_settings/1,
     listener_h2_alias_out_of_range/1,
+    listener_h2_credit_batch_invalid/1,
     listener_h2_response_delay_invalid/1,
     listener_h2_window_policy_invalid/1,
     listener_invalid_tls/1,
@@ -47,6 +48,7 @@ all() ->
         acceptor_sys_terminate,
         listener_h2_alias_conflicts_with_settings,
         listener_h2_alias_out_of_range,
+        listener_h2_credit_batch_invalid,
         listener_h2_response_delay_invalid,
         listener_h2_window_policy_invalid,
         listener_invalid_tls,
@@ -150,10 +152,46 @@ listener_h2_response_delay_invalid(_Config) ->
     ),
     ok.
 
+listener_h2_credit_batch_invalid(_Config) ->
+    Base = #{port => 0, handler => ?MODULE, versions => [http1_1]},
+    Invalid = [
+        #{h2_credit_batch => 0},
+        #{h2_credit_batch => 32830, h2_connection_window_policy => eager},
+        #{h2_credit_batch => 32830, h2_stream_window_policy => {threshold, 1}},
+        #{h2_credit_batch => -1, h2_connection_window_policy => on_response},
+        #{h2_credit_batch => 1.5, h2_connection_window_policy => on_response},
+        #{h2_credit_batch => 2147483648, h2_connection_window_policy => on_response},
+        #{h2_credit_batch => big, h2_stream_window_policy => on_response}
+    ],
+    Valid = [
+        #{h2_credit_batch => 0, h2_connection_window_policy => on_response},
+        #{h2_credit_batch => 32830, h2_stream_window_policy => on_response},
+        #{
+            h2_credit_batch => 2147483647,
+            h2_connection_window_policy => on_response,
+            h2_stream_window_policy => on_response
+        }
+    ],
+    lists:foreach(
+        fun(Opts) ->
+            assert_error_contains(
+                "invalid_h2_credit_batch", nhttp:start_link(maps:merge(Base, Opts))
+            )
+        end,
+        Invalid
+    ),
+    lists:foreach(
+        fun(Opts) ->
+            {ok, Pid} = nhttp:start_link(maps:merge(Base, Opts)),
+            nhttp:stop(Pid)
+        end,
+        Valid
+    ),
+    ok.
+
 listener_h2_window_policy_invalid(_Config) ->
     Base = #{port => 0, handler => ?MODULE, versions => [http1_1]},
     Invalid = [
-        on_response,
         lazy,
         {threshold, 0},
         {threshold, -1},
@@ -163,7 +201,15 @@ listener_h2_window_policy_invalid(_Config) ->
         {delay, 1.5},
         {uniform, 1, 2}
     ],
-    Valid = [eager, never, {threshold, 1}, {threshold, 2147483647}, {delay, 0}, {delay, 250}],
+    Valid = [
+        eager,
+        never,
+        on_response,
+        {threshold, 1},
+        {threshold, 2147483647},
+        {delay, 0},
+        {delay, 250}
+    ],
     lists:foreach(
         fun({Key, Policy}) ->
             assert_error_contains(

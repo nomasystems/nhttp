@@ -24,6 +24,8 @@
     delay_credits_after_the_delay/1,
     initial_window_size_alias_reaches_codec/1,
     max_frame_size_alias_reaches_codec/1,
+    on_response_batch_credits_with_the_batch_response/1,
+    on_response_credits_each_response/1,
     response_delay_holds_concurrent_streams/1,
     response_delay_holds_reply/1,
     response_delay_reply_only/1,
@@ -35,15 +37,22 @@
 -behaviour(nhttp_handler).
 -export([init/1, handle_request/2, handle_request_body/3]).
 
+-define(BATCH, 32830).
+-define(BATCH_POSTS, 734).
+-define(BATCH_RESPONSES, (?BATCH div ?CHUNK)).
 -define(CANCEL, 8).
 -define(CHUNK, 134).
+-define(CLIENT_WINDOW_RAISE, 2147418112).
+-define(CONN_WINDOW, 65535).
 -define(CHUNK_SPACING_MS, 40).
 -define(CREDIT_DELAY_MS, 200).
 -define(DELAY_CHUNKS, 5).
 -define(DELAY_MS, 300).
 -define(FRAME_SIZE_ERROR, 6).
+-define(MAX_STREAMS, 1000).
 -define(MEASURE_SLACK_MS, 50).
 -define(NEVER_POSTS, 200).
+-define(NO_CREDIT_MS, 100).
 -define(POLICY_POSTS, 20).
 -define(RECV_TIMEOUT, 3000).
 -define(RESET_AFTER_MS, 100).
@@ -98,6 +107,8 @@ all() ->
         delay_credits_after_the_delay,
         initial_window_size_alias_reaches_codec,
         max_frame_size_alias_reaches_codec,
+        on_response_batch_credits_with_the_batch_response,
+        on_response_credits_each_response,
         response_delay_holds_concurrent_streams,
         response_delay_holds_reply,
         response_delay_reply_only,
@@ -152,7 +163,7 @@ connection_threshold_credits_accumulated_total(_Config) ->
 credit_sum_bounded_by_connection_policy(_Config) ->
     lists:foreach(
         fun(Shape) ->
-            assert_credit_sums(#{h2_connection_window_policy => Shape}, Shape, eager)
+            assert_credit_sums(policy_opts(h2_connection_window_policy, Shape), Shape, eager)
         end,
         shapes()
     ).
@@ -160,7 +171,7 @@ credit_sum_bounded_by_connection_policy(_Config) ->
 credit_sum_bounded_by_stream_policy(_Config) ->
     lists:foreach(
         fun(Shape) ->
-            assert_credit_sums(#{h2_stream_window_policy => Shape}, eager, Shape)
+            assert_credit_sums(policy_opts(h2_stream_window_policy, Shape), eager, Shape)
         end,
         shapes()
     ).
@@ -242,6 +253,72 @@ max_frame_size_alias_reaches_codec(_Config) ->
         ssl:close(SockBig)
     after
         nhttp:stop(PidBig)
+    end.
+
+on_response_batch_credits_with_the_batch_response(_Config) ->
+    {Pid, Port} = nhttp_test_helpers:h2_start_server(?MODULE, #{
+        h2_connection_window_policy => on_response,
+        h2_credit_batch => ?BATCH,
+        h2_stream_window_policy => never,
+        h2_response_delay => ?CREDIT_DELAY_MS,
+        h2_settings => #{max_concurrent_streams => ?MAX_STREAMS}
+    }),
+    try
+        {ok, Sock} = nhttp_test_helpers:h2_connect(Port),
+        ok = nhttp_test_helpers:h2_send_window_update(Sock, 0, ?CLIENT_WINDOW_RAISE),
+        Body = binary:copy(<<$b>>, ?CHUNK),
+        StreamIds = stream_ids(?BATCH_POSTS),
+        {Reads, Rest} = post_within_window(Sock, StreamIds, Body, ?CONN_WINDOW),
+        {Tail, _} = collect(Sock, Rest, ?SETTLE_MS),
+        All = lists:append(Reads) ++ Tail,
+        ?assertEqual([], [Id || Id <- StreamIds, response_body(All, Id) =/= Body]),
+        ?assertEqual([?BATCH, ?BATCH], window_updates(All, 0)),
+        ?assertEqual([], [F || {window_update, SId, _} = F <- All, SId > 0]),
+        ?assertEqual(
+            [{window_update, 0, ?BATCH}, {window_update, 0, ?BATCH}],
+            [frame_before_nth_headers(Reads, N) || N <- [?BATCH_RESPONSES, 2 * ?BATCH_RESPONSES]]
+        ),
+        ?assertEqual(
+            (?BATCH_POSTS - 2 * ?BATCH_RESPONSES) * ?CHUNK,
+            ?BATCH_POSTS * ?CHUNK - lists:sum(window_updates(All, 0))
+        ),
+        ssl:close(Sock)
+    after
+        nhttp:stop(Pid)
+    end.
+
+on_response_credits_each_response(_Config) ->
+    {Pid, Port} = nhttp_test_helpers:h2_start_server(?MODULE, #{
+        h2_connection_window_policy => on_response,
+        h2_stream_window_policy => on_response,
+        h2_response_delay => ?CREDIT_DELAY_MS
+    }),
+    try
+        {ok, Sock} = nhttp_test_helpers:h2_connect(Port),
+        Body = binary:copy(<<$e>>, ?CHUNK),
+        StreamIds = stream_ids(?POLICY_POSTS),
+        lists:foreach(
+            fun(Id) -> ok = nhttp_test_helpers:h2_send_post(Sock, Id, <<"/echo">>, Body) end,
+            StreamIds
+        ),
+        {Early, Rest} = collect(Sock, <<>>, ?NO_CREDIT_MS),
+        ?assertEqual([], [F || F <- Early, not is_settings(F)]),
+        {Reads, _} = await_stream_reads(Sock, StreamIds, Rest, ?RECV_TIMEOUT),
+        All = lists:append(Reads),
+        ?assertEqual([], [Id || Id <- StreamIds, response_body(All, Id) =/= Body]),
+        ?assertEqual(lists:duplicate(?POLICY_POSTS, ?CHUNK), window_updates(All, 0)),
+        ?assertEqual(
+            [],
+            [
+                Id
+             || Id <- StreamIds,
+                credits_ahead_of_headers(Reads, Id) =/=
+                    [{window_update, 0, ?CHUNK}, {window_update, Id, ?CHUNK}]
+            ]
+        ),
+        ssl:close(Sock)
+    after
+        nhttp:stop(Pid)
     end.
 
 response_delay_holds_concurrent_streams(_Config) ->
@@ -366,9 +443,9 @@ stream_and_connection_policies_are_independent(_Config) ->
 all_frames({PerStream, Tail}) ->
     lists:append([Frames || {_, Frames} <- PerStream]) ++ Tail.
 
-assert_credit(Shape, Consumed, Sum) ->
+assert_credit(Window, Shape, Consumed, Sum) ->
     ?assert(Sum =< Consumed),
-    ?assertEqual(expected_credit(Shape, Consumed), Sum).
+    ?assertEqual(expected_credit(Window, Shape, Consumed), Sum).
 
 %% Open ?SUM_STREAMS streams, send ?SUM_CHUNKS chunks on each, let the
 %% credit settle while the streams are still open, then close them and
@@ -405,10 +482,12 @@ assert_credit_sums(Opts, ConnShape, StreamShape) ->
         All = Credits ++ Replies ++ Tail,
         Echoed = binary:copy(Chunk, ?SUM_CHUNKS),
         ?assertEqual([], [Id || Id <- StreamIds, response_body(All, Id) =/= Echoed]),
-        assert_credit(ConnShape, ?SUM_STREAMS * PerStream, lists:sum(window_updates(All, 0))),
+        assert_credit(
+            connection, ConnShape, ?SUM_STREAMS * PerStream, lists:sum(window_updates(All, 0))
+        ),
         lists:foreach(
             fun(Id) ->
-                assert_credit(StreamShape, PerStream, lists:sum(window_updates(All, Id)))
+                assert_credit(stream, StreamShape, PerStream, lists:sum(window_updates(All, Id)))
             end,
             StreamIds
         ),
@@ -434,6 +513,21 @@ await_streams(Sock, StreamIds, Buf, Acc, Seen, Timeout) ->
             Seen1 = note_headers_seen(Frames, StreamIds, Seen, now_ms()),
             await_streams(Sock, StreamIds, Rest, Acc ++ Frames, Seen1, Timeout - (now_ms() - T0))
     end.
+
+%% Receive until every stream in StreamIds is done. Returns the frames
+%% grouped by socket read, in order, and the undecoded tail of the
+%% socket buffer. A frame split across two reads belongs to the later one.
+await_stream_reads(Sock, StreamIds, Buf, Timeout) ->
+    await_stream_reads(Sock, StreamIds, Buf, Timeout, []).
+
+await_stream_reads(_Sock, [], Buf, _Timeout, Reads) ->
+    {lists:reverse(Reads), Buf};
+await_stream_reads(Sock, Pending, Buf, Timeout, Reads) ->
+    T0 = now_ms(),
+    {ok, Data} = ssl:recv(Sock, 0, Timeout),
+    {New, Rest} = nhttp_test_helpers:decode_h2_frames(<<Buf/binary, Data/binary>>),
+    Left = [Id || Id <- Pending, not nhttp_test_helpers:h2_stream_done(New, Id)],
+    await_stream_reads(Sock, Left, Rest, Timeout - (now_ms() - T0), [New | Reads]).
 
 %% Receive whatever arrives within Timeout. Returns the frames and the
 %% undecoded tail of the socket buffer.
@@ -471,6 +565,13 @@ collect_window_updates(Sock, Buf, StreamIds, N, Timeout, Acc) ->
             collect_window_updates(Sock, Rest, StreamIds, N, Timeout - (At - T0), Acc ++ Timed)
     end.
 
+%% The run of WINDOW_UPDATE frames right ahead of the HEADERS frame of
+%% StreamId inside the socket read that carried it.
+credits_ahead_of_headers(Reads, StreamId) ->
+    [Read] = [R || R <- Reads, lists:any(fun(F) -> is_headers(F, StreamId) end, R)],
+    Before = lists:reverse(frames_before_headers(Read, StreamId)),
+    lists:reverse(lists:takewhile(fun is_window_update/1, Before)).
+
 early_credits(CreditedAt, SentAt) ->
     [At - T || {At, T} <- lists:zip(CreditedAt, SentAt), At - T < ?CREDIT_DELAY_MS].
 
@@ -483,14 +584,32 @@ error_scope(Frames, StreamId, Code) ->
         {[], []} -> {no_error_seen, Frames}
     end.
 
-expected_credit(never, _Consumed) -> 0;
-expected_credit(_Shape, Consumed) -> Consumed.
+expected_credit(_Window, never, _Consumed) ->
+    0;
+expected_credit(connection, {on_response, Batch}, Consumed) when Batch > 0 ->
+    Consumed - Consumed rem Batch;
+expected_credit(_Window, _Shape, Consumed) ->
+    Consumed.
+
+%% The frame that precedes the Nth HEADERS frame of the run inside the
+%% socket read that carried it, or `first_in_read' when none does.
+frame_before_nth_headers([Read | Reads], N) ->
+    case nth_headers(Read, N, first_in_read) of
+        {found, Before} -> Before;
+        {remaining, Left} -> frame_before_nth_headers(Reads, Left)
+    end.
 
 frames_before_headers(Frames, StreamId) ->
     lists:takewhile(fun(F) -> not is_headers(F, StreamId) end, Frames).
 
 is_headers({headers, SId, _, _}, StreamId) -> SId =:= StreamId;
 is_headers(_, _) -> false.
+
+is_settings({settings, 0, _}) -> true;
+is_settings(_) -> false.
+
+is_window_update({window_update, _, _}) -> true;
+is_window_update(_) -> false.
 
 measure_reply(StreamId, {Sock, Buf, Delays}) ->
     T0 = now_ms(),
@@ -515,6 +634,20 @@ note_headers_seen(Frames, StreamIds, Seen, At) ->
 now_ms() ->
     erlang:monotonic_time(millisecond).
 
+nth_headers([], N, _Prev) ->
+    {remaining, N};
+nth_headers([{headers, _, _, _} | _], 1, Prev) ->
+    {found, Prev};
+nth_headers([{headers, _, _, _} = F | Rest], N, _Prev) ->
+    nth_headers(Rest, N - 1, F);
+nth_headers([F | Rest], N, _Prev) ->
+    nth_headers(Rest, N, F).
+
+policy_opts(Key, {on_response, Batch}) ->
+    #{Key => on_response, h2_credit_batch => Batch};
+policy_opts(Key, Shape) ->
+    #{Key => Shape}.
+
 %% POST Body on each stream in turn and await its response. Returns the
 %% frames per stream and the undecoded tail of the socket buffer.
 post_each(Sock, StreamIds, Body) ->
@@ -526,6 +659,27 @@ post_each(Sock, [Id | Ids], Body, Buf, Acc) ->
     ok = nhttp_test_helpers:h2_send_post(Sock, Id, <<"/echo">>, Body),
     {Frames, _Seen, Rest} = await_streams(Sock, [Id], Buf, ?RECV_TIMEOUT),
     post_each(Sock, Ids, Body, Rest, [{Id, Frames} | Acc]).
+
+%% POST Body on the streams in waves. A wave holds as many bodies as the
+%% connection window allows. The responses of a wave are awaited before
+%% the next wave, and the connection increments they carry refill the
+%% window. Returns the frames grouped by socket read and the tail.
+post_within_window(Sock, StreamIds, Body, Window) ->
+    post_within_window(Sock, StreamIds, Body, Window, <<>>, []).
+
+post_within_window(_Sock, [], _Body, _Window, Buf, Reads) ->
+    {Reads, Buf};
+post_within_window(Sock, StreamIds, Body, Window, Buf, Reads) ->
+    {[_ | _] = Wave, Later} = lists:split(
+        min(length(StreamIds), Window div byte_size(Body)), StreamIds
+    ),
+    lists:foreach(
+        fun(Id) -> ok = nhttp_test_helpers:h2_send_post(Sock, Id, <<"/echo">>, Body) end, Wave
+    ),
+    {WaveReads, Rest} = await_stream_reads(Sock, Wave, Buf, ?RECV_TIMEOUT),
+    Refill = lists:sum(window_updates(lists:append(WaveReads), 0)),
+    Window1 = Window - length(Wave) * byte_size(Body) + Refill,
+    post_within_window(Sock, Later, Body, Window1, Rest, Reads ++ WaveReads).
 
 response_body(Frames, StreamId) ->
     nhttp_test_helpers:h2_response_body(Frames, StreamId).
@@ -556,7 +710,14 @@ send_spaced_chunks(Sock, StreamId, Chunk, N) ->
     [T | send_spaced_chunks(Sock, StreamId, Chunk, N - 1)].
 
 shapes() ->
-    [eager, {threshold, ?SUM_THRESHOLD}, {delay, ?SUM_DELAY_MS}, never].
+    [
+        eager,
+        {threshold, ?SUM_THRESHOLD},
+        {delay, ?SUM_DELAY_MS},
+        {on_response, 0},
+        {on_response, ?BATCH},
+        never
+    ].
 
 stream_id(N) ->
     2 * N - 1.

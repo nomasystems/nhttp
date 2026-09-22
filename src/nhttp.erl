@@ -200,6 +200,7 @@ RFC 9001 §9.2).
     backlog => pos_integer(),
     buffer => pos_integer(),
     h2_connection_window_policy => h2_window_policy(),
+    h2_credit_batch => non_neg_integer(),
     h2_initial_window_size => 1..16#7fffffff,
     h2_max_frame_size => 16#4000..16#ffffff,
     h2_response_delay => h2_response_delay(),
@@ -233,11 +234,15 @@ Credit policy for an HTTP/2 receive window. `eager` sends a WINDOW_UPDATE
 for each body chunk as soon as the handler consumed it. `{threshold, N}`
 holds the credit until the uncredited octets reach `N`, then sends the
 accumulated total. `{delay, Ms}` sends the credit for each chunk `Ms`
-milliseconds after the handler consumed it. `never` sends no credit.
+milliseconds after the handler consumed it. `on_response` sends the
+credit for the body of a request ahead of the response headers of its
+`{reply, _, _}` result. On the connection window `h2_credit_batch`
+holds that credit until the responded octets reach the batch, then
+sends one WINDOW_UPDATE of exactly the batch. `never` sends no credit.
 Default `eager`.
 """.
 -type h2_window_policy() ::
-    eager | {threshold, pos_integer()} | {delay, non_neg_integer()} | never.
+    eager | {threshold, pos_integer()} | {delay, non_neg_integer()} | on_response | never.
 
 -doc """
 Connection timeouts (milliseconds, or `infinity`).
