@@ -421,6 +421,13 @@ h1_state_from_opts(Opts) ->
         body_deadline = maps:get(body_deadline, Timeouts, infinity)
     }.
 
+-spec h2_conn_credit(nhttp:h2_window_policy(), non_neg_integer()) -> h2_conn_credit().
+h2_conn_credit(eager, _Batch) -> eager;
+h2_conn_credit(never, _Batch) -> never;
+h2_conn_credit({threshold, N}, _Batch) -> {threshold, N, 0};
+h2_conn_credit({delay, Ms}, _Batch) -> {delay, Ms, queue:new()};
+h2_conn_credit(on_response, Batch) -> {on_response, Batch, 0}.
+
 -doc """
 Build the HTTP/2 settings the codec advertises. The first-class options
 `h2_initial_window_size` and `h2_max_frame_size` are aliases of the
@@ -435,6 +442,13 @@ h2_settings_from_opts(Opts) ->
     ),
     Settings#{enable_connect_protocol => true}.
 
+-spec h2_stream_credit(nhttp:h2_window_policy()) -> h2_stream_credit().
+h2_stream_credit(eager) -> eager;
+h2_stream_credit(never) -> never;
+h2_stream_credit({threshold, N}) -> {threshold, N};
+h2_stream_credit({delay, Ms}) -> {delay, Ms, queue:new()};
+h2_stream_credit(on_response) -> on_response.
+
 -spec init_protocol(#state{}) -> {ok, #state{}} | {error, nhttp_sock:socket_error()}.
 init_protocol(#state{family = http2, socket = Socket, peer = Peer, opts = Opts} = State) ->
     H2Conn0 = nhttp_h2:new(server, h2_settings_from_opts(Opts)),
@@ -446,7 +460,12 @@ init_protocol(#state{family = http2, socket = Socket, peer = Peer, opts = Opts} 
         {ok, State#state{
             protocol_state = #h2_state{
                 h2_conn = H2Conn,
-                response_delay = maps:get(h2_response_delay, Opts, 0)
+                conn_credit = h2_conn_credit(
+                    maps:get(h2_connection_window_policy, Opts, eager),
+                    maps:get(h2_credit_batch, Opts, 0)
+                ),
+                response_delay = maps:get(h2_response_delay, Opts, 0),
+                stream_credit = h2_stream_credit(maps:get(h2_stream_window_policy, Opts, eager))
             }
         }}
     end;

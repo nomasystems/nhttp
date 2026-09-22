@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Listener options `h2_initial_window_size` and `h2_max_frame_size`, aliases of the `h2_settings` keys
 - Listener option `h2_response_delay`, a fixed or uniform delay before the response headers of a `{reply, _, _}` result on HTTP/2
+- Listener options `h2_connection_window_policy` and `h2_stream_window_policy`, credit policies for the HTTP/2 receive windows with the shapes `eager`, `{threshold, N}`, `{delay, Ms}` and `never`
+- The `on_response` shape of both credit policies, which sends the credit for a request ahead of the HEADERS of its `{reply, _, _}` response, and the listener option `h2_credit_batch` that batches the connection credit
 
 ### Changed
 
