@@ -151,7 +151,7 @@ h2_window_exhaustion_then_update(Config) ->
     {ok, Pid, Port} = start(Config, #{}),
     {ok, Sock} = nhttp_test_helpers:h2_connect(Port),
     ok = nhttp_test_helpers:h2_send_request(Sock, 1, <<"/big">>),
-    Got1 = stream_data_size(nhttp_test_helpers:h2_recv(Sock, 1000), 1),
+    Got1 = nhttp_test_helpers:stream_data_size(nhttp_test_helpers:h2_recv(Sock, 1000), 1),
     ?assert(Got1 > 0),
     ?assert(Got1 < ?BIG_BODY),
     Total = drain_with_window_updates(Sock, Got1, 30),
@@ -168,11 +168,14 @@ h2_settings_window_raise_flushes_buffer(Config) ->
     ok = nhttp_test_helpers:h2_send_request(Sock, 1, <<"/big">>),
     Frames = nhttp_test_helpers:h2_recv(Sock, 500),
     ?assert(lists:keymember(headers, 1, Frames)),
-    ?assertEqual(0, stream_data_size(Frames, 1)),
+    ?assertEqual(0, nhttp_test_helpers:stream_data_size(Frames, 1)),
     ok = nhttp_test_helpers:h2_send_settings(Sock, [
         {?SETTINGS_INITIAL_WINDOW_SIZE, ?DEFAULT_WINDOW}
     ]),
-    ?assertEqual(?DEFAULT_WINDOW, stream_data_size(nhttp_test_helpers:h2_recv(Sock, 1000), 1)),
+    ?assertEqual(
+        ?DEFAULT_WINDOW,
+        nhttp_test_helpers:stream_data_size(nhttp_test_helpers:h2_recv(Sock, 1000), 1)
+    ),
     ssl:close(Sock),
     nhttp:stop(Pid),
     ok.
@@ -283,20 +286,8 @@ drain_with_window_updates(_Sock, Acc, _Rounds) when Acc >= ?BIG_BODY ->
 drain_with_window_updates(Sock, Acc, Rounds) ->
     ok = nhttp_test_helpers:h2_send_window_update(Sock, 0, 10 * ?BIG_BODY),
     ok = nhttp_test_helpers:h2_send_window_update(Sock, 1, 10 * ?BIG_BODY),
-    Got = stream_data_size(nhttp_test_helpers:h2_recv(Sock, 400), 1),
+    Got = nhttp_test_helpers:stream_data_size(nhttp_test_helpers:h2_recv(Sock, 400), 1),
     drain_with_window_updates(Sock, Acc + Got, Rounds - 1).
-
-stream_data_size(Frames, StreamId) ->
-    lists:foldl(
-        fun
-            ({data, Sid, Payload, _Fin}, Acc) when Sid =:= StreamId ->
-                Acc + byte_size(Payload);
-            (_, Acc) ->
-                Acc
-        end,
-        0,
-        Frames
-    ).
 
 status_of(Frames, StreamId) ->
     case [P || {headers, Sid, P, _} <- Frames, Sid =:= StreamId] of

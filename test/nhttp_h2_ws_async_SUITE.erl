@@ -53,8 +53,20 @@ Reuses the transport-agnostic `nhttp_h1_ws_async_handler` test handler.
     stale_ws_close_mismatched_ref/1,
     unknown_cast_ignored/1,
     stream_reset_handler_closed_crash/1,
-    stream_reset_no_closed_callback/1
+    stream_reset_no_closed_callback/1,
+    ws_h2_frame_above_window_delivered_after_credit/1,
+    ws_h2_close_queued_behind_frame/1,
+    ws_h2_send_buffer_full_resets_frame/1,
+    ws_h2_send_buffer_full_resets_close/1
 ]).
+
+-define(BIG_FRAME, 100000).
+-define(DEFAULT_WINDOW, 65535).
+-define(ENHANCE_YOUR_CALM, 11).
+-define(QUEUED_TAIL, 1020).
+-define(RECV_MS, 500).
+-define(SMALL_SEND_BUFFER, 1024).
+-define(WS_LARGE_HEADER, 10).
 
 %%%-----------------------------------------------------------------------------
 %%% CT CALLBACKS
@@ -95,7 +107,11 @@ groups() ->
             stale_ws_close_mismatched_ref,
             unknown_cast_ignored,
             stream_reset_handler_closed_crash,
-            stream_reset_no_closed_callback
+            stream_reset_no_closed_callback,
+            ws_h2_frame_above_window_delivered_after_credit,
+            ws_h2_close_queued_behind_frame,
+            ws_h2_send_buffer_full_resets_frame,
+            ws_h2_send_buffer_full_resets_close
         ]}
     ].
 
@@ -374,6 +390,53 @@ stream_reset_no_closed_callback(Config) ->
     ?assertEqual(3, nhttp_ws:stream_id(Session3)),
     teardown_ws(Ctx).
 
+ws_h2_frame_above_window_delivered_after_credit(Config) ->
+    Ctx = setup_ws(Config, echo, 1),
+    Payload = binary:copy(<<"w">>, ?BIG_FRAME),
+    ok = nhttp_ws:send(ctx_session(Ctx), {binary, Payload}),
+    Head = nhttp_test_helpers:h2_recv(ctx_sock(Ctx), ?RECV_MS),
+    ?assertEqual(?DEFAULT_WINDOW, nhttp_test_helpers:stream_data_size(Head, 1)),
+    Tail = credit_stream(Ctx, 1, ?BIG_FRAME),
+    ?assertEqual({ok, {binary, Payload}, <<>>}, nhttp_ws:decode_unmasked(wire(Head, Tail, 1))),
+    teardown_ws(Ctx).
+
+ws_h2_close_queued_behind_frame(Config) ->
+    Ctx = setup_ws(Config, echo, 1),
+    Payload = binary:copy(<<"w">>, ?BIG_FRAME),
+    ok = nhttp_ws:send(ctx_session(Ctx), {binary, Payload}),
+    Head = nhttp_test_helpers:h2_recv(ctx_sock(Ctx), ?RECV_MS),
+    ?assertEqual(?DEFAULT_WINDOW, nhttp_test_helpers:stream_data_size(Head, 1)),
+    ok = nhttp_ws:close(ctx_session(Ctx), ?WS_CLOSE_NORMAL, <<"bye">>),
+    ?assertMatch({closed, {local, ?WS_CLOSE_NORMAL, <<"bye">>}}, recv_observer_event(closed)),
+    Tail = credit_stream(Ctx, 1, ?BIG_FRAME),
+    ?assertMatch({data, 1, _, fin}, lists:last([F || {data, 1, _, _} = F <- Tail])),
+    {ok, {binary, Payload}, Rest} = nhttp_ws:decode_unmasked(wire(Head, Tail, 1)),
+    ?assertEqual({ok, {close, ?WS_CLOSE_NORMAL, <<"bye">>}, <<>>}, nhttp_ws:decode_unmasked(Rest)),
+    teardown_ws(Ctx).
+
+ws_h2_send_buffer_full_resets_frame(Config) ->
+    Ctx = setup_ws_opts(Config, echo, 1, small_send_buffer()),
+    ok = nhttp_ws:send(ctx_session(Ctx), {binary, binary:copy(<<"w">>, ?BIG_FRAME)}),
+    ?assertMatch({closed, {transport, send_buffer_full}}, recv_observer_event(closed)),
+    Frames = nhttp_test_helpers:h2_recv(ctx_sock(Ctx), ?RECV_MS),
+    ?assertEqual(0, nhttp_test_helpers:stream_data_size(Frames, 1)),
+    ?assert(lists:member({rst_stream, 1, ?ENHANCE_YOUR_CALM}, Frames)),
+    teardown_ws(Ctx).
+
+ws_h2_send_buffer_full_resets_close(Config) ->
+    Ctx = setup_ws_opts(Config, echo, 1, small_send_buffer()),
+    Payload = binary:copy(<<"w">>, ?DEFAULT_WINDOW + ?QUEUED_TAIL - ?WS_LARGE_HEADER),
+    ?assertEqual(?DEFAULT_WINDOW + ?QUEUED_TAIL, iolist_size(nhttp_ws:encode({binary, Payload}))),
+    ok = nhttp_ws:send(ctx_session(Ctx), {binary, Payload}),
+    Head = nhttp_test_helpers:h2_recv(ctx_sock(Ctx), ?RECV_MS),
+    ?assertEqual(?DEFAULT_WINDOW, nhttp_test_helpers:stream_data_size(Head, 1)),
+    ok = nhttp_ws:close(ctx_session(Ctx), ?WS_CLOSE_NORMAL, <<"external">>),
+    ?assertMatch({closed, {transport, send_buffer_full}}, recv_observer_event(closed)),
+    Tail = nhttp_test_helpers:h2_recv(ctx_sock(Ctx), ?RECV_MS),
+    ?assertEqual(0, nhttp_test_helpers:stream_data_size(Tail, 1)),
+    ?assert(lists:member({rst_stream, 1, ?ENHANCE_YOUR_CALM}, Tail)),
+    teardown_ws(Ctx).
+
 %%%-----------------------------------------------------------------------------
 %%% H2 CONNECTION / WS UPGRADE / FRAMING HELPERS
 %%%-----------------------------------------------------------------------------
@@ -396,18 +459,35 @@ pick_session(Sessions, StreamId) ->
     end.
 
 setup_ws(Config, Mode, StreamId) ->
+    setup_ws_opts(Config, Mode, StreamId, #{}).
+
+setup_ws_opts(Config, Mode, StreamId, Opts) ->
     Observer = self(),
     flush_observer(),
-    {Sock, Server} = h2_connect(Config, Mode, Observer),
+    {Sock, Server} = h2_connect_handler(Config, nhttp_h1_ws_async_handler, Mode, Observer, Opts),
     Ctx0 = #ctx{sock = Sock, server = Server},
     open_extra_stream(Ctx0, StreamId).
 
 setup_ws_handler(Config, Handler, Mode, StreamId) ->
     Observer = self(),
     flush_observer(),
-    {Sock, Server} = h2_connect_handler(Config, Handler, Mode, Observer),
+    {Sock, Server} = h2_connect_handler(Config, Handler, Mode, Observer, #{}),
     Ctx0 = #ctx{sock = Sock, server = Server},
     open_extra_stream(Ctx0, StreamId).
+
+small_send_buffer() ->
+    #{h2_settings => #{max_send_buffer => ?SMALL_SEND_BUFFER}}.
+
+credit_stream(#ctx{sock = Sock}, StreamId, Increment) ->
+    ok = nhttp_test_helpers:h2_send_window_update(Sock, 0, Increment),
+    ok = nhttp_test_helpers:h2_send_window_update(Sock, StreamId, Increment),
+    nhttp_test_helpers:h2_recv(Sock, ?RECV_MS).
+
+wire(Head, Tail, StreamId) ->
+    <<
+        (nhttp_test_helpers:h2_response_body(Head, StreamId))/binary,
+        (nhttp_test_helpers:h2_response_body(Tail, StreamId))/binary
+    >>.
 
 open_extra_stream(#ctx{sock = Sock, sessions = Sessions} = Ctx, StreamId) ->
     ok = ssl:send(Sock, h2_ws_upgrade_frame(StreamId)),
@@ -424,10 +504,7 @@ teardown_ws(#ctx{sock = Sock, server = Server}) ->
     nhttp:stop(Server),
     flush_observer().
 
-h2_connect(Config, Mode, Observer) ->
-    h2_connect_handler(Config, nhttp_h1_ws_async_handler, Mode, Observer).
-
-h2_connect_handler(Config, Handler, Mode, Observer) ->
+h2_connect_handler(Config, Handler, Mode, Observer, Opts) ->
     CertFile = ?config(certfile, Config),
     KeyFile = ?config(keyfile, Config),
     HandlerArgs =
@@ -435,7 +512,7 @@ h2_connect_handler(Config, Handler, Mode, Observer) ->
             undefined -> #{observer => Observer};
             _ -> #{observer => Observer, mode => Mode}
         end,
-    {ok, Server} = nhttp:start_link(#{
+    {ok, Server} = nhttp:start_link(Opts#{
         port => 0,
         tls => #{certfile => CertFile, keyfile => KeyFile},
         handler => Handler,

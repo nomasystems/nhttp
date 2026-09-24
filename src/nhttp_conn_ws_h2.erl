@@ -423,23 +423,36 @@ update(#state{protocol_state = #h2_state{h2_streams = Streams} = H2} = State, St
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - SEND HELPERS
 %%%-----------------------------------------------------------------------------
+-spec offer(#state{}, nhttp_lib:stream_id(), iodata(), nhttp_h2:fin()) -> #state{}.
+offer(State, StreamId, Frame, Fin) ->
+    case nhttp_conn_h2:offer_h2_data(State, StreamId, Frame, Fin, []) of
+        {sent, State1} ->
+            State1;
+        {queued, State1} ->
+            State1;
+        {send_buffer_full, State1} ->
+            State2 = nhttp_conn_h2:reset_h2_stream(State1, StreamId, enhance_your_calm),
+            finish(State2, StreamId, {transport, send_buffer_full});
+        {stream_gone, State1} ->
+            State1
+    end.
+
+-doc """
+Offer the CLOSE frame with END_STREAM to the codec send queue. A queued
+frame leaves with the drain and the caller drops the stream entry at once,
+so the `data_sent` event for it finds no entry. A frame the queue bound
+refuses ends the stream with RST_STREAM(ENHANCE_YOUR_CALM) and runs the
+close lifecycle with `{transport, send_buffer_full}`.
+""".
 -spec send_close(#state{}, nhttp_lib:stream_id(), no_code | nhttp_ws:close_code(), binary()) ->
     #state{}.
-send_close(
-    #state{protocol_state = #h2_state{h2_conn = H2Conn} = H2} = State, StreamId, Code, Reason
-) ->
+send_close(State, StreamId, Code, Reason) ->
     CloseFrame =
         case Code of
             no_code -> nhttp_ws:encode(close);
             _ -> nhttp_ws:encode({close, Code, Reason})
         end,
-    case nhttp_h2:send_data(H2Conn, StreamId, CloseFrame, fin) of
-        {ok, NewH2Conn, DataFrame} ->
-            nhttp_conn:sock_send(State, DataFrame),
-            State#state{protocol_state = H2#h2_state{h2_conn = NewH2Conn}};
-        _ ->
-            State
-    end.
+    offer(State, StreamId, CloseFrame, fin).
 
 -spec send_error_response(#state{}, nhttp_lib:stream_id(), nhttp_lib:status()) -> ok.
 send_error_response(
@@ -449,16 +462,15 @@ send_error_response(
     {ok, _, HeaderFrame} = nhttp_h2:send_headers(H2Conn, StreamId, Headers, fin),
     nhttp_conn:sock_send(State, HeaderFrame).
 
+-doc """
+Offer one WebSocket frame to the codec send queue. A frame that outruns
+the send window is queued and leaves with the drain. A frame the queue
+bound refuses ends the stream with RST_STREAM(ENHANCE_YOUR_CALM) and runs
+the close lifecycle with `{transport, send_buffer_full}`.
+""".
 -spec send_frame(#state{}, nhttp_lib:stream_id(), nhttp_ws:ws_message()) -> #state{}.
-send_frame(#state{protocol_state = #h2_state{h2_conn = H2Conn} = H2} = State, StreamId, Message) ->
-    Frame = nhttp_ws:encode(Message),
-    case nhttp_h2:send_data(H2Conn, StreamId, Frame, nofin) of
-        {ok, NewH2Conn, DataFrame} ->
-            nhttp_conn:sock_send(State, DataFrame),
-            State#state{protocol_state = H2#h2_state{h2_conn = NewH2Conn}};
-        _ ->
-            State
-    end.
+send_frame(State, StreamId, Message) ->
+    offer(State, StreamId, nhttp_ws:encode(Message), nofin).
 
 -spec send_headers(#state{}, nhttp_lib:stream_id(), nhttp_lib:headers(), nhttp_h2:fin()) ->
     nhttp_h2:conn().

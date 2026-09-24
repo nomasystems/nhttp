@@ -96,6 +96,10 @@ changes nothing on HTTP/1.1 or HTTP/3.
 | `h2_stream_window_policy` | `eager` | Credit policy for each stream receive window. |
 | `h2_credit_batch` | 0 | Octets per WINDOW_UPDATE under the `on_response` connection policy. 0 sends the whole accumulator with each response. Valid only when a policy is `on_response`. |
 
+`h2_settings` also accepts `max_send_buffer` and `max_queued_streams`, the
+bounds of the codec send queue that holds response bodies while the peer
+withholds credit. The server defaults both to `infinity`.
+
 An alias must equal the `h2_settings` key when both are present. The
 delay applies to `{reply, _, _}` results only. Error responses, producer
 streams and WebSocket upgrades go out at once.

@@ -1,7 +1,7 @@
 {"1.2.0",
 [{<<"nhttp_lib">>,
   {git,"https://github.com/nomasystems/nhttp_lib.git",
-       {ref,"14e36f584e70022a240135b961d203e504693343"}},
+       {ref,"b086510380886094bfd1edeb59c3ab5a6edf7382"}},
   0},
  {<<"nquic">>,{pkg,<<"nquic">>,<<"1.0.3">>},0},
  {<<"opentelemetry_api">>,{pkg,<<"opentelemetry_api">>,<<"1.4.0">>},0},

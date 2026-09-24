@@ -17,6 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Updates `nhttp_lib` reference
+- Response bodies, producer chunks and WebSocket frames on HTTP/2 go through the codec send queue. The server keeps no remainder buffer of its own, and one connection grant reaches every blocked stream, one frame per stream per turn
+- Every RST_STREAM the server sends goes through the codec, which closes the stream and purges the octets it holds for it
+- `h2_settings` accepts `max_send_buffer` and `max_queued_streams`, the bounds of the codec send queue. The server defaults both to `infinity`. A response body, producer chunk or WebSocket frame that the bound refuses ends its stream with RST_STREAM(ENHANCE_YOUR_CALM). A producer sees `{error, closed}` and a WebSocket session closes with `{transport, send_buffer_full}`
+
+### Fixed
+
+- A WebSocket-over-HTTP/2 frame that outran the send window was dropped without a record
+- One large response was able to take a whole connection credit ahead of smaller ones
+- The NO_ERROR RST_STREAM that asks a client to stop sending a request body went out before the response was complete, and the buffered body then followed it on a closed stream (RFC 9113 Section 5.1 and Section 8.1)
 
 ## [1.1.1] - 2026-09-10
 
