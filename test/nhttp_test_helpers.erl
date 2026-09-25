@@ -44,6 +44,7 @@
     h2_server_settings/1,
     h2_start_server/2,
     h2_stream_done/2,
+    stream_data_size/2,
     tcp_connect/1
 ]).
 
@@ -331,6 +332,11 @@ h2_send_post(Sock, StreamId, Path, Body) ->
 -spec decode_h2_frames(binary()) -> {[h2_frame()], binary()}.
 decode_h2_frames(Bin) ->
     decode_h2_frames(Bin, []).
+
+-doc "The octets of every DATA frame of `StreamId` in `Frames`.".
+-spec stream_data_size([h2_frame()], non_neg_integer()) -> non_neg_integer().
+stream_data_size(Frames, StreamId) ->
+    lists:sum([byte_size(Payload) || {data, Sid, Payload, _Fin} <- Frames, Sid =:= StreamId]).
 
 %%%-----------------------------------------------------------------------------
 %%% INTERNAL

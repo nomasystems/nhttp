@@ -71,6 +71,7 @@
 %%%-----------------------------------------------------------------------------
 %% LOCAL MACROS
 %%%-----------------------------------------------------------------------------
+-define(H2_SEND_QUEUE_BOUNDS, #{max_send_buffer => infinity, max_queued_streams => infinity}).
 -define(SOCKET_TRANSFER_TIMEOUT, 5000).
 
 %%%-----------------------------------------------------------------------------
@@ -429,9 +430,13 @@ h2_conn_credit({delay, Ms}, _Batch) -> {delay, Ms, queue:new()};
 h2_conn_credit(on_response, Batch) -> {on_response, Batch, 0}.
 
 -doc """
-Build the HTTP/2 settings the codec advertises. The first-class options
+Build the HTTP/2 settings of the codec. The first-class options
 `h2_initial_window_size` and `h2_max_frame_size` are aliases of the
 `h2_settings` keys and are resolved here, the only place the codec is built.
+The codec send queue is always on, because the server keeps no buffer of
+its own for a response body that outruns the send window. `h2_settings`
+can lower `max_send_buffer` and `max_queued_streams`, which default to
+`infinity`.
 """.
 -spec h2_settings_from_opts(nhttp:opts()) -> nhttp_h2:settings().
 h2_settings_from_opts(Opts) ->
@@ -440,7 +445,8 @@ h2_settings_from_opts(Opts) ->
         maps:get(h2_settings, Opts, #{}),
         maps:with([h2_initial_window_size, h2_max_frame_size], Opts)
     ),
-    Settings#{enable_connect_protocol => true}.
+    Bounded = maps:merge(?H2_SEND_QUEUE_BOUNDS, Settings),
+    Bounded#{enable_connect_protocol => true, send_queue => true}.
 
 -spec h2_stream_credit(nhttp:h2_window_policy()) -> h2_stream_credit().
 h2_stream_credit(eager) -> eager;

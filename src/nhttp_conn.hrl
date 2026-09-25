@@ -27,8 +27,6 @@
     body_acc = [] :: [binary()],
     body_size = 0 :: non_neg_integer(),
     end_stream = false :: boolean(),
-    send_buffer = <<>> :: binary(),
-    send_end_stream = false :: boolean(),
     type = http :: http | request | stream | websocket,
     ws_buffer = <<>> :: binary(),
     ws_decoder :: nhttp_ws:ws_decoder() | undefined,
