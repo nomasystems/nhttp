@@ -151,7 +151,13 @@ dispatch_result(ConnPid, StreamId, Ref, _MRef, _Handler, {reply, _, _} = Result,
     post_result(ConnPid, StreamId, Ref, Result),
     ok;
 dispatch_result(
-    ConnPid, StreamId, Ref, MRef, _Handler, {stream, Spec, _NewHState} = Result, _HState
+    ConnPid,
+    StreamId,
+    Ref,
+    MRef,
+    _Handler,
+    {stream, {producer, _, _, _} = Spec, _NewHState} = Result,
+    _HState
 ) ->
     post_result(ConnPid, StreamId, Ref, Result),
     run_stream_spec(ConnPid, Ref, MRef, Spec);
