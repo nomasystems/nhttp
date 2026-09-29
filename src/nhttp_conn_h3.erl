@@ -700,7 +700,9 @@ maybe_remove_stream_after_terminal(#state{h3_streams = Streams} = State, StreamI
             State#state{h3_streams = maps:remove(StreamId, Streams)}
     end.
 
--spec reset_stream_with_handler(#state{}, nhttp_lib:stream_id(), term(), atom()) ->
+-spec reset_stream_with_handler(
+    #state{}, nhttp_lib:stream_id(), term(), nhttp_h3:h3_error_code()
+) ->
     #state{}.
 reset_stream_with_handler(#state{h3_streams = Streams} = State, StreamId, NewHState, ErrorAtom) ->
     State1 = reset_stream(State, StreamId, h3_error_to_code(ErrorAtom)),
