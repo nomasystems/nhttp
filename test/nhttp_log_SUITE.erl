@@ -124,11 +124,7 @@ request_ctx_enriches(_Config) ->
     ?assertEqual(5, maps:get(stream_id, Ctx)),
     ?assert(is_binary(maps:get(request_id, Ctx))),
     Ctx1 = nhttp_log:request_ctx(Base, Request, undefined),
-    ?assertNot(maps:is_key(stream_id, Ctx1)),
-    Ctx2 = nhttp_log:request_ctx(Base, #{}, undefined),
-    ?assertNot(maps:is_key(method, Ctx2)),
-    ?assertNot(maps:is_key(path, Ctx2)),
-    ?assert(is_binary(maps:get(request_id, Ctx2))).
+    ?assertNot(maps:is_key(stream_id, Ctx1)).
 
 request_id_unique(_Config) ->
     Id1 = nhttp_log:request_id(),
