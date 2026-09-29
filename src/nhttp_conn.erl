@@ -440,11 +440,9 @@ can lower `max_send_buffer` and `max_queued_streams`, which default to
 """.
 -spec h2_settings_from_opts(nhttp:opts()) -> nhttp_h2:settings().
 h2_settings_from_opts(Opts) ->
-    Settings = maps:fold(
-        fun put_h2_alias/3,
-        maps:get(h2_settings, Opts, #{}),
-        maps:with([h2_initial_window_size, h2_max_frame_size], Opts)
-    ),
+    Settings0 = maps:get(h2_settings, Opts, #{}),
+    Settings1 = put_h2_initial_window_size(Opts, Settings0),
+    Settings = put_h2_max_frame_size(Opts, Settings1),
     Bounded = maps:merge(?H2_SEND_QUEUE_BOUNDS, Settings),
     Bounded#{enable_connect_protocol => true, send_queue => true}.
 
@@ -481,13 +479,17 @@ init_protocol(#state{family = http1, socket = Socket, opts = Opts} = State) ->
         {error, _} = Error -> Error
     end.
 
--spec put_h2_alias(
-    h2_initial_window_size | h2_max_frame_size, pos_integer(), nhttp_h2:settings()
-) -> nhttp_h2:settings().
-put_h2_alias(h2_initial_window_size, Value, Settings) ->
-    Settings#{initial_window_size => Value};
-put_h2_alias(h2_max_frame_size, Value, Settings) ->
-    Settings#{max_frame_size => Value}.
+-spec put_h2_initial_window_size(nhttp:opts(), nhttp_h2:settings()) -> nhttp_h2:settings().
+put_h2_initial_window_size(#{h2_initial_window_size := Size}, Settings) ->
+    Settings#{initial_window_size => Size};
+put_h2_initial_window_size(#{}, Settings) ->
+    Settings.
+
+-spec put_h2_max_frame_size(nhttp:opts(), nhttp_h2:settings()) -> nhttp_h2:settings().
+put_h2_max_frame_size(#{h2_max_frame_size := Size}, Settings) ->
+    Settings#{max_frame_size => Size};
+put_h2_max_frame_size(#{}, Settings) ->
+    Settings.
 
 -spec version_to_family(nhttp_lib:version()) -> http1 | http2 | http3.
 version_to_family(http1_0) -> http1;
