@@ -232,13 +232,10 @@ track_is_synchronous_when_tracker_down(_Config) ->
 
 wait_for_socket_runs_handler_terminate(_Config) ->
     Self = self(),
-    Opts = #{
-        handler => ?MODULE,
-        handler_args => {notify, Self},
-        transport => tcp
-    },
+    Opts = #{handler => ?MODULE, handler_args => {notify, Self}},
+    Ctx = #{ssl_opts => [], versions => [http1_1, http2], alt_svc_advertise => disabled},
     {ok, ConnPid} = proc_lib:start_link(
-        nhttp_conn, init, [{my_ref, {tcp, fake_socket}, Opts, Self}]
+        nhttp_conn, init, [{my_ref, {tcp, fake_socket}, Opts, Ctx, Self}]
     ),
     ConnMon = monitor(process, ConnPid),
     exit(ConnPid, shutdown),

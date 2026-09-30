@@ -108,6 +108,7 @@
     family :: http1 | http2 | websocket | undefined,
     protocol_state :: undefined | #h1_state{} | #h2_state{},
     opts :: nhttp:opts(),
+    ctx :: nhttp_conn:ctx(),
     limits = #{} :: nhttp_limits:t(),
     idle_timeout = ?DEFAULT_IDLE_TIMEOUT :: timeout(),
     requests_count = 0 :: non_neg_integer(),

@@ -58,10 +58,6 @@ ChildSpec = nhttp_listener:child_spec(my_http_listener, #{
     | {global, term()}
     | {via, module(), term()}.
 
--type alt_svc_advertise() ::
-    disabled
-    | #{registry := nhttp_registry:tab(), ma := non_neg_integer()}.
-
 %%%-----------------------------------------------------------------------------
 %% MACROS
 %%%-----------------------------------------------------------------------------
@@ -226,7 +222,7 @@ init({Name, Opts}) ->
 %% INTERNAL FUNCTIONS
 %%%-----------------------------------------------------------------------------
 -spec alt_svc_advertise(nhttp:opts(), [nhttp:version()], nhttp_registry:tab()) ->
-    alt_svc_advertise().
+    nhttp_transport_sup:alt_svc_advertise().
 alt_svc_advertise(_Opts, [], _PrimaryTab) ->
     disabled;
 alt_svc_advertise(Opts, _QuicVersions, PrimaryTab) ->
@@ -353,12 +349,6 @@ port_of_transport_sup(TransportSup, tcp) ->
 port_of_transport_sup(TransportSup, quic) ->
     tracker_port_in_transports([TransportSup]).
 
--spec quic_opts_with_registry(nhttp:opts(), alt_svc_advertise()) -> nhttp:opts().
-quic_opts_with_registry(Opts, disabled) ->
-    Opts;
-quic_opts_with_registry(Opts, #{registry := PrimaryTab}) ->
-    Opts#{alt_svc_registry => PrimaryTab}.
-
 -spec reg_name(name()) ->
     {local, atom()} | {global, term()} | {via, module(), term()}.
 reg_name(Name) when is_atom(Name) -> {local, Name};
@@ -400,12 +390,18 @@ tracker_port_or_no_acceptors(TrackerPid) ->
 transport_kind(quic) -> quic;
 transport_kind(_) -> tcp.
 
--spec transport_sup_child(term(), tcp | ssl | quic, [nhttp:version()], map()) ->
-    supervisor:child_spec().
-transport_sup_child(LogicalName, Transport, Versions, Opts) ->
+-spec transport_sup_child(
+    term(),
+    tcp | ssl | quic,
+    [nhttp:version()],
+    nhttp:opts(),
+    nhttp_transport_sup:alt_svc_advertise()
+) -> supervisor:child_spec().
+transport_sup_child(LogicalName, Transport, Versions, Opts, Advertise) ->
     #{
         id => {nhttp_transport_sup, transport_kind(Transport)},
-        start => {nhttp_transport_sup, start_link, [LogicalName, Transport, Versions, Opts]},
+        start =>
+            {nhttp_transport_sup, start_link, [LogicalName, Transport, Versions, Opts, Advertise]},
         restart => permanent,
         shutdown => infinity,
         type => supervisor,
@@ -422,16 +418,18 @@ transport_sup_children(LogicalName, TcpVersions, QuicVersions, PrimaryTab, Opts)
             [] ->
                 [];
             _ ->
-                TcpOpts = Opts#{alt_svc_advertise => Advertise},
-                [transport_sup_child(LogicalName, derive_tcp_transport(Opts), TcpVersions, TcpOpts)]
+                [
+                    transport_sup_child(
+                        LogicalName, derive_tcp_transport(Opts), TcpVersions, Opts, Advertise
+                    )
+                ]
         end,
     QuicChild =
         case QuicVersions of
             [] ->
                 [];
             _ ->
-                QuicOpts = quic_opts_with_registry(Opts, Advertise),
-                [transport_sup_child(LogicalName, quic, QuicVersions, QuicOpts)]
+                [transport_sup_child(LogicalName, quic, QuicVersions, Opts, Advertise)]
         end,
     TcpChild ++ QuicChild.
 

@@ -93,9 +93,10 @@ end_per_testcase(_TestCase, _Config) ->
 %%%-----------------------------------------------------------------------------
 
 conn_sys_lifecycle(_Config) ->
-    Opts = #{handler => ?MODULE, handler_args => [], transport => tcp},
+    Opts = #{handler => ?MODULE, handler_args => []},
+    Ctx = #{ssl_opts => [], versions => [http1_1, http2], alt_svc_advertise => disabled},
     {ok, ConnPid} = proc_lib:start_link(
-        nhttp_conn, init, [{my_ref, {tcp, fake_socket}, Opts, self()}]
+        nhttp_conn, init, [{my_ref, {tcp, fake_socket}, Opts, Ctx, self()}]
     ),
     ?assertMatch({status, ConnPid, _, _}, sys:get_status(ConnPid)),
     ok = sys:suspend(ConnPid),
@@ -355,14 +356,10 @@ run_close_before_init(Versions) ->
     ok = gen_tcp:close(CSock),
     ok = gen_tcp:close(SSock),
     ok = gen_tcp:close(LSock),
-    Opts = #{
-        handler => ?MODULE,
-        handler_args => [],
-        transport => tcp,
-        versions => Versions
-    },
+    Opts = #{handler => ?MODULE, handler_args => []},
+    Ctx = #{ssl_opts => [], versions => Versions, alt_svc_advertise => disabled},
     {ok, ConnPid} = proc_lib:start_link(
-        nhttp_conn, init, [{my_ref, {tcp, SSock}, Opts, self()}]
+        nhttp_conn, init, [{my_ref, {tcp, SSock}, Opts, Ctx, self()}]
     ),
     Ref = monitor(process, ConnPid),
     ConnPid ! {socket_ready, {tcp, SSock}},

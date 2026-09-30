@@ -23,7 +23,7 @@ of the whole transport stays contained below the `one_for_one` listener.
 %%%-----------------------------------------------------------------------------
 %% API
 %%%-----------------------------------------------------------------------------
--export([start_link/4]).
+-export([start_link/5]).
 
 %%%-----------------------------------------------------------------------------
 %% INTERNAL EXPORTS (TESTING)
@@ -34,6 +34,15 @@ of the whole transport stays contained below the `one_for_one` listener.
 %% SUPERVISOR CALLBACKS
 %%%-----------------------------------------------------------------------------
 -export([init/1]).
+
+%%%-----------------------------------------------------------------------------
+%% TYPES
+%%%-----------------------------------------------------------------------------
+-export_type([alt_svc_advertise/0]).
+
+-type alt_svc_advertise() ::
+    disabled
+    | #{registry := nhttp_registry:tab(), ma := non_neg_integer()}.
 
 %%%-----------------------------------------------------------------------------
 %% MACROS
@@ -52,30 +61,37 @@ Start a transport supervisor linked to the calling process.
 `LogicalName` is the listener's logical name, copied into this
 transport's registry table for logs / otel. `Transport` selects the
 listening machinery. `Versions` are the already-validated protocol
-versions this transport serves.
+versions this transport serves. `Advertise` carries the registry and
+`ma` of the HTTP/3 Alt-Svc advertisement, or `disabled`.
 """.
--spec start_link(term(), tcp | ssl | quic, [nhttp:version()], nhttp:opts()) ->
+-spec start_link(
+    term(), tcp | ssl | quic, [nhttp:version()], nhttp:opts(), alt_svc_advertise()
+) ->
     {ok, pid()} | ignore | {error, term()}.
-start_link(LogicalName, Transport, Versions, Opts) ->
-    supervisor:start_link(?MODULE, {LogicalName, Transport, Versions, Opts}).
+start_link(LogicalName, Transport, Versions, Opts, Advertise) ->
+    supervisor:start_link(?MODULE, {LogicalName, Transport, Versions, Opts, Advertise}).
 
 %%%-----------------------------------------------------------------------------
 %% SUPERVISOR CALLBACKS
 %%%-----------------------------------------------------------------------------
--spec init({term(), tcp | ssl | quic, [nhttp:version()], nhttp:opts()}) ->
+-spec init({term(), tcp | ssl | quic, [nhttp:version()], nhttp:opts(), alt_svc_advertise()}) ->
     {ok, {supervisor:sup_flags(), [supervisor:child_spec()]}} | {stop, nhttp:start_error()}.
-init({LogicalName, Transport, Versions, Opts}) ->
+init({LogicalName, Transport, Versions, Opts, Advertise}) ->
     Tab = nhttp_registry:new(),
     ok = nhttp_registry:register_name(Tab, LogicalName),
     case Transport of
-        quic -> init_quic_listener(Tab, Opts, Versions);
-        ssl -> init_tcp_listener(Tab, Opts, Versions, ssl);
-        tcp -> init_tcp_listener(Tab, Opts, Versions, tcp)
+        quic -> init_quic_listener(Tab, Opts, Versions, Advertise);
+        ssl -> init_tcp_listener(Tab, Opts, Versions, ssl, Advertise);
+        tcp -> init_tcp_listener(Tab, Opts, Versions, tcp, Advertise)
     end.
 
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS
 %%%-----------------------------------------------------------------------------
+-spec advertise_registry(alt_svc_advertise()) -> nhttp_registry:tab() | undefined.
+advertise_registry(disabled) -> undefined;
+advertise_registry(#{registry := PrimaryTab}) -> PrimaryTab.
+
 -spec build_listen_opts(nhttp:opts(), tcp | ssl) -> nhttp_sock:listen_opts().
 build_listen_opts(Opts, Transport) ->
     Timeouts = maps:get(timeouts, Opts, #{}),
@@ -89,9 +105,9 @@ build_listen_opts(Opts, Transport) ->
     }.
 
 -spec build_listener_children(
-    nhttp_registry:tab(), module(), module(), map(), pos_integer()
+    nhttp_registry:tab(), module(), module(), nhttp_acceptor_core:ctx(), pos_integer()
 ) -> [supervisor:child_spec()].
-build_listener_children(Tab, ConnModule, AcceptorModule, AcceptorOpts, AcceptorCount) ->
+build_listener_children(Tab, ConnModule, AcceptorModule, AcceptorCtx, AcceptorCount) ->
     [
         #{
             id => nhttp_conn_tracker,
@@ -113,7 +129,7 @@ build_listener_children(Tab, ConnModule, AcceptorModule, AcceptorOpts, AcceptorC
             id => nhttp_acceptor_sup,
             start =>
                 {nhttp_acceptor_sup, start_link, [
-                    Tab, AcceptorModule, AcceptorOpts, AcceptorCount
+                    Tab, AcceptorModule, AcceptorCtx, AcceptorCount
                 ]},
             restart => permanent,
             shutdown => ?SUPERVISOR_SHUTDOWN_TIMEOUT,
@@ -141,36 +157,35 @@ build_tls_options(Tls, Alpn) ->
 default_acceptor_count() ->
     erlang:system_info(schedulers) * 2.
 
--spec init_quic_listener(nhttp_registry:tab(), nhttp:opts(), [nhttp:version()]) ->
+-spec init_quic_listener(
+    nhttp_registry:tab(), nhttp:opts(), [nhttp:version()], alt_svc_advertise()
+) ->
     {ok, {supervisor:sup_flags(), [supervisor:child_spec()]}} | {stop, nhttp:start_error()}.
-init_quic_listener(Tab, Opts, Versions) ->
+init_quic_listener(Tab, Opts, Versions, Advertise) ->
     Port = maps:get(port, Opts),
     Alpn = versions_to_alpn(Versions),
-    HandlerOpts = Opts#{
-        name => nhttp_registry:lookup_name(Tab),
-        registry => Tab,
-        transport => quic,
-        versions => Versions,
-        alpn_preferred_protocols => Alpn
-    },
+    HandlerOpts = #{opts => Opts, name => nhttp_registry:lookup_name(Tab), registry => Tab},
     QuicListenOpts = quic_listen_opts(Alpn, maps:get(tls, Opts), Opts, HandlerOpts),
     case nquic:listen(Port, QuicListenOpts) of
         {ok, Listener} ->
             {ok, ActualPort} = nquic:get_port(Listener),
             ok = nhttp_registry:register_port(Tab, ActualPort),
-            ok = maybe_register_advertise_port(Opts, ActualPort),
+            ok = maybe_register_advertise_port(Advertise, ActualPort),
             MaxConns = maps:get(max_connections, Opts, ?DEFAULT_MAX_CONNECTIONS),
             Counter = nhttp_listener_counter:new(MaxConns),
             ok = nhttp_registry:register_counter(Tab, Counter),
-            AdvertiseTab = maps:get(alt_svc_registry, Opts, undefined),
-            {ok, {transport_sup_flags(), quic_listener_children(Tab, AdvertiseTab)}};
+            {ok, {
+                transport_sup_flags(), quic_listener_children(Tab, advertise_registry(Advertise))
+            }};
         {error, Reason} ->
             {stop, {listen_failed, Reason}}
     end.
 
--spec init_tcp_listener(nhttp_registry:tab(), nhttp:opts(), [nhttp:version()], tcp | ssl) ->
+-spec init_tcp_listener(
+    nhttp_registry:tab(), nhttp:opts(), [nhttp:version()], tcp | ssl, alt_svc_advertise()
+) ->
     {ok, {supervisor:sup_flags(), [supervisor:child_spec()]}} | {stop, nhttp:start_error()}.
-init_tcp_listener(Tab, Opts, Versions, Transport) ->
+init_tcp_listener(Tab, Opts, Versions, Transport, Advertise) ->
     ListenOpts = build_listen_opts(Opts, Transport),
     case nhttp_sock:listen(ListenOpts) of
         {ok, ListenSocket} ->
@@ -187,16 +202,14 @@ init_tcp_listener(Tab, Opts, Versions, Transport) ->
                         []
                 end,
             AcceptorCount = maps:get(acceptor_count, Opts, default_acceptor_count()),
-            AcceptorOpts = Opts#{
-                listen_socket => ListenSocket,
-                actual_port => Port,
-                ssl_opts => SslOpts,
-                transport => Transport,
-                versions => Versions,
-                alpn_preferred_protocols => Alpn
+            AcceptorCtx = #{
+                opts => Opts,
+                port => Port,
+                sub => ListenSocket,
+                conn => #{ssl_opts => SslOpts, versions => Versions, alt_svc_advertise => Advertise}
             },
             Children = build_listener_children(
-                Tab, nhttp_conn, nhttp_acceptor, AcceptorOpts, AcceptorCount
+                Tab, nhttp_conn, nhttp_acceptor, AcceptorCtx, AcceptorCount
             ),
             {ok, {transport_sup_flags(), Children}};
         {error, Reason} ->
@@ -211,12 +224,11 @@ maybe_prepend({Key, {ok, Value}}, Opts) -> [{Key, Value} | Opts].
 maybe_put(_Key, error, Map) -> Map;
 maybe_put(Key, {ok, Value}, Map) -> Map#{Key => Value}.
 
--spec maybe_register_advertise_port(nhttp:opts(), inet:port_number()) -> ok.
-maybe_register_advertise_port(Opts, Port) ->
-    case maps:find(alt_svc_registry, Opts) of
-        {ok, PrimaryTab} -> nhttp_registry:register_advertise_port(PrimaryTab, Port);
-        error -> ok
-    end.
+-spec maybe_register_advertise_port(alt_svc_advertise(), inet:port_number()) -> ok.
+maybe_register_advertise_port(disabled, _Port) ->
+    ok;
+maybe_register_advertise_port(#{registry := PrimaryTab}, Port) ->
+    nhttp_registry:register_advertise_port(PrimaryTab, Port).
 
 -doc """
 Build the nquic listen options for this transport.
@@ -227,7 +239,8 @@ completes, so a replayed non-idempotent method cannot reach the handler
 (RFC 8470, RFC 9001 §9.2). Enabling 0-RTT here would require pairing it
 with a Too Early (425) / defer policy.
 """.
--spec quic_listen_opts([binary()], nhttp:tls(), nhttp:opts(), map()) -> map().
+-spec quic_listen_opts([binary()], nhttp:tls(), nhttp:opts(), nhttp_conn_h3:handler_opts()) ->
+    map().
 quic_listen_opts(Alpn, Tls, Opts, HandlerOpts) ->
     Timeouts = maps:get(timeouts, Opts, #{}),
     #{

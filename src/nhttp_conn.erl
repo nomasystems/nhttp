@@ -16,7 +16,7 @@
 %%%-----------------------------------------------------------------------------
 -export([
     drain/1,
-    start_link_supervised/3
+    start_link_supervised/4
 ]).
 
 %%%-----------------------------------------------------------------------------
@@ -64,7 +64,18 @@
 %%%-----------------------------------------------------------------------------
 %% TYPES
 %%%-----------------------------------------------------------------------------
--export_type([hibernate_timer/0]).
+-export_type([ctx/0, hibernate_timer/0]).
+
+-doc """
+Per-transport data that the transport supervisor gives to each connection:
+the TLS server options, the versions that the transport serves, and the
+Alt-Svc advertisement of the HTTP/3 endpoint.
+""".
+-type ctx() :: #{
+    ssl_opts := [ssl:tls_server_option()],
+    versions := [nhttp:version()],
+    alt_svc_advertise := nhttp_transport_sup:alt_svc_advertise()
+}.
 
 -type hibernate_timer() :: none | {reference(), reference()}.
 
@@ -94,17 +105,17 @@ Uses `proc_lib:start_link/3` semantics: the caller (the conn supervisor)
 blocks until init_ack is received, so `supervisor:start_child/2` correctly
 reports init failures.
 """.
--spec start_link_supervised(term(), nhttp_sock:t(), nhttp:opts()) ->
+-spec start_link_supervised(term(), nhttp_sock:t(), nhttp:opts(), ctx()) ->
     {ok, pid()} | {error, term()}.
-start_link_supervised(Name, Socket, Opts) ->
-    proc_lib:start_link(?MODULE, init, [{Name, Socket, Opts, self()}]).
+start_link_supervised(Name, Socket, Opts, Ctx) ->
+    proc_lib:start_link(?MODULE, init, [{Name, Socket, Opts, Ctx, self()}]).
 
 %%%-----------------------------------------------------------------------------
 %% PROC_LIB CALLBACKS
 %%%-----------------------------------------------------------------------------
--spec init({term(), nhttp_sock:t(), nhttp:opts(), pid()}) ->
+-spec init({term(), nhttp_sock:t(), nhttp:opts(), ctx(), pid()}) ->
     no_return().
-init({Name, Socket, Opts, Parent}) ->
+init({Name, Socket, Opts, Ctx, Parent}) ->
     process_flag(trap_exit, true),
     Handler = maps:get(handler, Opts),
     HandlerArgs = maps:get(handler_args, Opts, []),
@@ -128,6 +139,7 @@ init({Name, Socket, Opts, Parent}) ->
                 handler = Handler,
                 handler_state = HandlerState,
                 opts = Opts,
+                ctx = Ctx,
                 limits = nhttp_limits:from_opts(Opts),
                 idle_timeout = IdleTimeout,
                 otel_config = OtelConfig,
@@ -168,16 +180,13 @@ system_terminate(Reason, _Parent, _Debug, State) ->
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - ALT-SVC (RFC 7838 §3)
 %%%-----------------------------------------------------------------------------
--spec alt_svc_directive(nhttp:opts()) -> nhttp_alt_svc:directive().
-alt_svc_directive(Opts) ->
-    case maps:get(alt_svc_advertise, Opts, disabled) of
-        disabled ->
-            disabled;
-        #{registry := Tab, ma := Ma} ->
-            case quic_advertise_ready(Tab) of
-                {ready, Port} -> #{port => Port, ma => Ma};
-                cleared -> clear
-            end
+-spec alt_svc_directive(nhttp_transport_sup:alt_svc_advertise()) -> nhttp_alt_svc:directive().
+alt_svc_directive(disabled) ->
+    disabled;
+alt_svc_directive(#{registry := Tab, ma := Ma}) ->
+    case quic_advertise_ready(Tab) of
+        {ready, Port} -> #{port => Port, ma => Ma};
+        cleared -> clear
     end.
 
 -doc """
@@ -191,8 +200,8 @@ Once it drains or goes down, `Alt-Svc: clear` is emitted instead (RFC
 7838 §4).
 """.
 -spec alt_svc_headers(#state{}, nhttp_lib:headers()) -> nhttp_lib:headers().
-alt_svc_headers(#state{opts = Opts}, Headers) ->
-    nhttp_alt_svc:inject(Headers, alt_svc_directive(Opts)).
+alt_svc_headers(#state{ctx = #{alt_svc_advertise := Advertise}}, Headers) ->
+    nhttp_alt_svc:inject(Headers, alt_svc_directive(Advertise)).
 
 -spec quic_advertise_ready(nhttp_registry:tab()) ->
     {ready, inet:port_number()} | cleared.
@@ -386,10 +395,10 @@ transport_to_scheme(ssl) -> https.
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - PROTOCOL DETECTION
 %%%-----------------------------------------------------------------------------
--spec detect_protocol(nhttp_sock:t(), nhttp:opts()) ->
+-spec detect_protocol(nhttp_sock:t(), [nhttp:version()]) ->
     {ok, http1 | http2} | {error, {unsupported_alpn, binary()}}.
-detect_protocol(Socket, Opts) ->
-    AllowedFamilies = [version_to_family(V) || V <- maps:get(versions, Opts, [http1_1, http2])],
+detect_protocol(Socket, Versions) ->
+    AllowedFamilies = [version_to_family(V) || V <- Versions],
     select_family(nhttp_sock:negotiated_protocol(Socket), AllowedFamilies).
 
 -spec select_family({ok, binary()} | {error, no_alpn}, [http1 | http2 | http3]) ->
@@ -515,22 +524,17 @@ apply_proxy_header(Socket, _Header, State) ->
     State#state{peer = get_remote_addr(Socket)}.
 
 -doc "Complete TLS handshake if needed.".
--spec complete_handshake(nhttp_sock:t(), nhttp:opts()) ->
+-spec complete_handshake(nhttp_sock:t(), #state{}) ->
     {ok, nhttp_sock:t()} | {error, term()}.
-complete_handshake(Socket, Opts) ->
-    Transport = maps:get(transport, Opts, tcp),
-    case Transport of
-        tcp ->
-            {ok, Socket};
-        ssl ->
-            SslOpts = maps:get(ssl_opts, Opts, []),
-            nhttp_sock:handshake(Socket, ?DEFAULT_TLS_HANDSHAKE_TIMEOUT, SslOpts)
-    end.
+complete_handshake(Socket, #state{transport = tcp}) ->
+    {ok, Socket};
+complete_handshake(Socket, #state{transport = ssl, ctx = #{ssl_opts := SslOpts}}) ->
+    nhttp_sock:handshake(Socket, ?DEFAULT_TLS_HANDSHAKE_TIMEOUT, SslOpts).
 
--spec complete_handshake_result(nhttp_sock:t(), nhttp:opts()) ->
+-spec complete_handshake_result(nhttp_sock:t(), #state{}) ->
     {ok, nhttp_sock:t()} | {error, {handshake_error, term()}}.
-complete_handshake_result(Socket, Opts) ->
-    case complete_handshake(Socket, Opts) of
+complete_handshake_result(Socket, State) ->
+    case complete_handshake(Socket, State) of
         {ok, ReadySocket} -> {ok, ReadySocket};
         {error, Reason} -> {error, {handshake_error, Reason}}
     end.
@@ -546,7 +550,7 @@ finalize_peer(State) ->
 handshake_after_proxy(Socket, Opts, State) ->
     maybe
         {ok, State1} ?= maybe_read_proxy(Socket, Opts, State),
-        {ok, ReadySocket} ?= complete_handshake_result(Socket, Opts),
+        {ok, ReadySocket} ?= complete_handshake_result(Socket, State1),
         {ok, ReadySocket, State1}
     end.
 
@@ -654,8 +658,8 @@ sock_stop_reason(Reason) ->
     end.
 
 -spec start_protocol(pid(), [sys:debug_option()], #state{}) -> no_return().
-start_protocol(Parent, Debug, #state{socket = Socket, opts = Opts} = State) ->
-    case detect_protocol(Socket, Opts) of
+start_protocol(Parent, Debug, #state{socket = Socket, ctx = #{versions := Versions}} = State) ->
+    case detect_protocol(Socket, Versions) of
         {ok, Family} ->
             State1 = finalize_peer(State#state{family = Family}),
             case init_protocol(State1) of

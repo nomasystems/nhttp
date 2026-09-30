@@ -25,20 +25,20 @@
 %% API
 %%%-----------------------------------------------------------------------------
 -spec start_link(
-    nhttp_registry:tab(), module(), nhttp:opts(), pos_integer()
+    nhttp_registry:tab(), module(), nhttp_acceptor_core:ctx(), pos_integer()
 ) ->
     {ok, pid()} | ignore | {error, term()}.
-start_link(Tab, AcceptorModule, Opts, Count) ->
-    supervisor:start_link(?MODULE, {Tab, AcceptorModule, Opts, Count}).
+start_link(Tab, AcceptorModule, Ctx, Count) ->
+    supervisor:start_link(?MODULE, {Tab, AcceptorModule, Ctx, Count}).
 
 %%%-----------------------------------------------------------------------------
 %% SUPERVISOR CALLBACKS
 %%%-----------------------------------------------------------------------------
 -spec init(
-    {nhttp_registry:tab(), module(), nhttp:opts(), pos_integer()}
+    {nhttp_registry:tab(), module(), nhttp_acceptor_core:ctx(), pos_integer()}
 ) ->
     {ok, {supervisor:sup_flags(), [supervisor:child_spec()]}}.
-init({Tab, AcceptorModule, Opts, Count}) ->
+init({Tab, AcceptorModule, Ctx, Count}) ->
     ok = nhttp_registry:register_acceptor_sup(Tab, self()),
     SupFlags = #{
         strategy => one_for_one,
@@ -48,7 +48,7 @@ init({Tab, AcceptorModule, Opts, Count}) ->
     ChildSpecs = [
         #{
             id => {AcceptorModule, N},
-            start => {AcceptorModule, start_link, [Tab, Opts]},
+            start => {AcceptorModule, start_link, [Tab, Ctx]},
             restart => transient,
             shutdown => ?WORKER_SHUTDOWN_TIMEOUT,
             type => worker,

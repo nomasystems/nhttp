@@ -37,9 +37,9 @@
 get_listen_port(AcceptorPid) ->
     nhttp_acceptor_core:get_listen_port(AcceptorPid).
 
--spec start_link(nhttp_registry:tab(), nhttp:opts()) -> {ok, pid()}.
-start_link(Tab, Opts) ->
-    nhttp_acceptor_core:start_link(?MODULE, Tab, Opts).
+-spec start_link(nhttp_registry:tab(), nhttp_acceptor_core:ctx()) -> {ok, pid()}.
+start_link(Tab, Ctx) ->
+    nhttp_acceptor_core:start_link(?MODULE, Tab, Ctx).
 
 -spec stop_accepting(pid()) -> ok.
 stop_accepting(AcceptorPid) ->
@@ -52,9 +52,9 @@ stop_accepting(AcceptorPid) ->
 do_accept(#sub{listen_socket = ListenSocket}) ->
     nhttp_sock:accept(ListenSocket, 1000).
 
--spec init_sub(nhttp:opts()) -> #sub{}.
-init_sub(Opts) ->
-    #sub{listen_socket = maps:get(listen_socket, Opts)}.
+-spec init_sub(nhttp_sock:t()) -> #sub{}.
+init_sub(ListenSocket) ->
+    #sub{listen_socket = ListenSocket}.
 
 -spec reject(nhttp_sock:t()) -> ok.
 reject(Socket) ->
@@ -64,9 +64,14 @@ reject(Socket) ->
 
 -spec spawn_conn(nhttp_sock:t(), nhttp_acceptor_core:spawn_ctx()) -> ok.
 spawn_conn(Socket, #{
-    name := Name, counter := Counter, opts := Opts, conn_sup := ConnSup, tracker := Tracker
+    name := Name,
+    counter := Counter,
+    opts := Opts,
+    conn := ConnCtx,
+    conn_sup := ConnSup,
+    tracker := Tracker
 }) ->
-    case nhttp_conn_sup:start_conn(ConnSup, Tracker, [Name, Socket, Opts]) of
+    case nhttp_conn_sup:start_conn(ConnSup, Tracker, [Name, Socket, Opts, ConnCtx]) of
         {ok, Pid} ->
             case nhttp_sock:controlling_process(Socket, Pid) of
                 ok ->
