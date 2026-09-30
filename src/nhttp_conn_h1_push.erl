@@ -164,16 +164,16 @@ h1_stream_push_recv(Parent, Debug, #state{idle_timeout = IdleTimeout} = State, C
             end;
         {stream_done, WPid, Ref} ->
             Ctx1 = maybe_emit_h1_stream_start(State, Ctx),
-            nhttp_conn_h1:send_h1_last_chunk(State),
+            ok = nhttp_conn_h1:send_h1_last_chunk(State),
             WPid ! {chunk_ack, Ref, ok},
-            await_h1_worker_exit(State, MRef, WPid),
+            ok = await_h1_worker_exit(State, MRef, WPid),
             FinalState = finalize_h1_stream_push(State, Ctx1, normal),
             continue_after_h1_push(Parent, Debug, FinalState);
         {send_trailers, WPid, Ref, _Trailers} ->
             Ctx1 = maybe_emit_h1_stream_start(State, Ctx),
-            nhttp_conn_h1:send_h1_last_chunk(State),
+            ok = nhttp_conn_h1:send_h1_last_chunk(State),
             WPid ! {chunk_ack, Ref, ok},
-            await_h1_worker_exit(State, MRef, WPid),
+            ok = await_h1_worker_exit(State, MRef, WPid),
             FinalState = finalize_h1_stream_push(State, Ctx1, normal),
             continue_after_h1_push(Parent, Debug, FinalState);
         {'DOWN', MRef, process, WPid, Reason} ->
