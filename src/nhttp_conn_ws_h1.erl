@@ -152,7 +152,7 @@ on. Armed here rather than at session construction because
 `handle_ws_open/2` returns there is no limit to give it.
 """.
 -spec arm_decoder(#state{}) -> #state{}.
-arm_decoder(#state{protocol_state = #h1_state{h1_ws = Ws} = H1} = State) ->
+arm_decoder(#state{protocol_state = #h1_state{h1_ws = #ws_state{} = Ws} = H1} = State) ->
     #{runtime_opts := Opts} = view(Ws),
     State#state{protocol_state = H1#h1_state{ws_decoder = nhttp_ws:decoder_new(server, Opts)}}.
 
@@ -188,7 +188,8 @@ finish_parent(WsReason, Reason, State) ->
 
 -spec finish_state(nhttp_handler:ws_close_reason(), #state{}) -> #state{}.
 finish_state(
-    WsReason, #state{handler = Handler, protocol_state = #h1_state{h1_ws = Ws}} = State
+    WsReason,
+    #state{handler = Handler, protocol_state = #h1_state{h1_ws = #ws_state{} = Ws}} = State
 ) ->
     View = view(Ws),
     Actions = nhttp_conn_ws:close_lifecycle(nhttp_conn:log_ctx(State), WsReason, View, Handler),
@@ -266,7 +267,8 @@ process(
             State0 = State#state{
                 protocol_state = H1#h1_state{ws_buffer = Rest, ws_decoder = NewDec}
             },
-            #state{handler = Handler, protocol_state = #h1_state{h1_ws = Ws}} = State0,
+            #state{handler = Handler, protocol_state = #h1_state{h1_ws = #ws_state{} = Ws}} =
+                State0,
             View = view(Ws),
             Actions = nhttp_conn_ws:dispatch_frame(
                 nhttp_conn:log_ctx(State0), Message, View, Handler
@@ -295,7 +297,7 @@ process(
 dispatch_info_loop(
     Parent,
     Debug,
-    #state{handler = Handler, protocol_state = #h1_state{h1_ws = Ws}} = State,
+    #state{handler = Handler, protocol_state = #h1_state{h1_ws = #ws_state{} = Ws}} = State,
     Msg
 ) ->
     View = view(Ws),
@@ -387,7 +389,8 @@ interpret([{send_close, Code, Reason} | Rest], State) ->
     send_close(State, Code, Reason),
     interpret(Rest, State);
 interpret(
-    [{update_view, View} | Rest], #state{protocol_state = #h1_state{h1_ws = Ws} = H1} = State
+    [{update_view, View} | Rest],
+    #state{protocol_state = #h1_state{h1_ws = #ws_state{} = Ws} = H1} = State
 ) ->
     NewWs = from_view(View, Ws),
     interpret(Rest, State#state{protocol_state = H1#h1_state{h1_ws = NewWs}});

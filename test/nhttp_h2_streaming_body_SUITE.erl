@@ -32,6 +32,7 @@
     trailers_streaming/1,
     trailers_buffered/1,
     bad_handler_return/1,
+    bad_stream_spec/1,
     ws_upgrade_on_h2_rejected/1,
     ws_upgrade_on_h2_session_rejected/1
 ]).
@@ -57,6 +58,8 @@ handle_request(#{path := <<"/trailers-buffered">>}, State) ->
     {accept_body, {trailers, []}, State};
 handle_request(#{path := <<"/bad-return">>}, _State) ->
     not_a_handler_return;
+handle_request(#{path := <<"/bad-stream-spec">>}, State) ->
+    {stream, not_a_stream_spec, State};
 handle_request(#{path := <<"/ws-upgrade">>}, State) ->
     {upgrade, websocket, State};
 handle_request(#{path := <<"/ws-upgrade-session">>}, State) ->
@@ -106,6 +109,7 @@ all() ->
         trailers_streaming,
         trailers_buffered,
         bad_handler_return,
+        bad_stream_spec,
         ws_upgrade_on_h2_rejected,
         ws_upgrade_on_h2_session_rejected
     ].
@@ -264,6 +268,21 @@ bad_handler_return(_Config) ->
         ok = nhttp_test_helpers:h2_send_headers(Sock, 1, <<"/bad-return">>, 0, true),
         Frames = nhttp_test_helpers:h2_recv_stream(Sock, 1, 3000),
         ?assert(has_rst_stream(Frames, 1)),
+        ssl:close(Sock)
+    after
+        nhttp:stop(Pid)
+    end.
+
+bad_stream_spec(_Config) ->
+    {Pid, Port} = nhttp_test_helpers:h2_start_server(?MODULE, #{}),
+    try
+        {ok, Sock} = nhttp_test_helpers:h2_connect(Port),
+        ok = nhttp_test_helpers:h2_send_headers(Sock, 1, <<"/bad-stream-spec">>, 0, true),
+        Frames = nhttp_test_helpers:h2_recv_stream(Sock, 1, 3000),
+        ?assert(has_rst_stream(Frames, 1)),
+        ok = nhttp_test_helpers:h2_send_headers(Sock, 3, <<"/missing">>, 0, true),
+        Frames3 = nhttp_test_helpers:h2_recv_stream(Sock, 3, 3000),
+        ?assertEqual(<<"404">>, nhttp_test_helpers:h2_response_status(Frames3)),
         ssl:close(Sock)
     after
         nhttp:stop(Pid)

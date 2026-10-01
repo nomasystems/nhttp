@@ -11,9 +11,9 @@
     spawn_conn/2
 ]).
 
--spec init_sub(nhttp:opts()) -> ets:tid().
-init_sub(Opts) ->
-    maps:get(mock_tab, Opts).
+-spec init_sub(ets:tid()) -> ets:tid().
+init_sub(Tab) ->
+    Tab.
 
 -spec do_accept(ets:tid()) -> {ok, mock_accepted} | {error, enobufs}.
 do_accept(Tab) ->

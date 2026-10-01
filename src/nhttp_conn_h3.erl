@@ -50,8 +50,16 @@
 ]).
 
 %%%-----------------------------------------------------------------------------
-%% LOCAL TYPES
+%% TYPES
 %%%-----------------------------------------------------------------------------
+-export_type([handler_opts/0]).
+
+-type handler_opts() :: #{
+    opts := nhttp:opts(),
+    name := term(),
+    registry := nhttp_registry:tab()
+}.
+
 -type h3_init_args() :: #{
     name := term(),
     opts := nhttp:opts(),
@@ -97,16 +105,16 @@ start_link(NquicOpts) ->
 -spec init_handler(map()) -> no_return().
 init_handler(NquicOpts) ->
     process_flag(trap_exit, true),
-    HandlerOpts = maps:get(conn_handler_opts, NquicOpts),
+    #{opts := Opts, name := Name, registry := Tab} = maps:get(conn_handler_opts, NquicOpts),
     {ok, Ctx} = nquic_lib:server_accept_init(NquicOpts),
     proc_lib:init_ack({ok, self()}),
-    ok = maybe_track(HandlerOpts),
+    ok = track(Tab),
     InitArgs = #{
-        name => maps:get(name, HandlerOpts, undefined),
-        opts => HandlerOpts,
+        name => Name,
+        opts => Opts,
         parent => proc_lib_parent(),
-        handler => maps:get(handler, HandlerOpts),
-        handler_args => maps:get(handler_args, HandlerOpts, [])
+        handler => maps:get(handler, Opts),
+        handler_args => maps:get(handler_args, Opts, [])
     },
     handshake_loop(InitArgs, Ctx, initial).
 
@@ -194,15 +202,6 @@ hs_timeout(InitArgs, {ok, Events, Ctx1}, Phase) ->
 hs_timeout(_InitArgs, {error, Reason, Ctx1}, _Phase) ->
     close_and_exit(Ctx1, nquic_protocol:error_code(Reason)).
 
--spec maybe_track(map()) -> ok.
-maybe_track(#{registry := Tab}) ->
-    case nhttp_registry:lookup_conn_tracker(Tab) of
-        undefined -> ok;
-        TrackerPid -> nhttp_conn_tracker:track(TrackerPid, self())
-    end;
-maybe_track(_HandlerOpts) ->
-    ok.
-
 -spec next_phase([nquic_protocol:event()], initial | handshake) -> initial | handshake.
 next_phase(Events, Phase) ->
     case lists:keyfind(state_transition, 1, Events) of
@@ -214,6 +213,13 @@ next_phase(Events, Phase) ->
 proc_lib_parent() ->
     case get('$ancestors') of
         [Parent | _] when is_pid(Parent) -> Parent
+    end.
+
+-spec track(nhttp_registry:tab()) -> ok.
+track(Tab) ->
+    case nhttp_registry:lookup_conn_tracker(Tab) of
+        undefined -> ok;
+        TrackerPid -> nhttp_conn_tracker:track(TrackerPid, self())
     end.
 
 %%%-----------------------------------------------------------------------------
@@ -700,7 +706,9 @@ maybe_remove_stream_after_terminal(#state{h3_streams = Streams} = State, StreamI
             State#state{h3_streams = maps:remove(StreamId, Streams)}
     end.
 
--spec reset_stream_with_handler(#state{}, nhttp_lib:stream_id(), term(), atom()) ->
+-spec reset_stream_with_handler(
+    #state{}, nhttp_lib:stream_id(), term(), nhttp_h3:h3_error_code()
+) ->
     #state{}.
 reset_stream_with_handler(#state{h3_streams = Streams} = State, StreamId, NewHState, ErrorAtom) ->
     State1 = reset_stream(State, StreamId, h3_error_to_code(ErrorAtom)),

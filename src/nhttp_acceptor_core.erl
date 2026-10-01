@@ -29,12 +29,20 @@
 %%%-----------------------------------------------------------------------------
 %% TYPES
 %%%-----------------------------------------------------------------------------
--export_type([spawn_ctx/0]).
+-export_type([ctx/0, spawn_ctx/0]).
+
+-type ctx() :: #{
+    opts := nhttp:opts(),
+    port := inet:port_number(),
+    conn := nhttp_conn:ctx(),
+    sub := term()
+}.
 
 -type spawn_ctx() :: #{
     name := term(),
     counter := nhttp_listener_counter:counter(),
     opts := nhttp:opts(),
+    conn := nhttp_conn:ctx(),
     conn_sup := pid(),
     tracker := pid()
 }.
@@ -51,11 +59,11 @@
 %% BEHAVIOUR CALLBACKS
 %%%-----------------------------------------------------------------------------
 -doc """
-Build per-transport state from the listener Opts (e.g. the listen
-socket for TCP/TLS, the QUIC listener handle for HTTP/3). Returned
-value is stored opaquely by the core and threaded through `do_accept/1`.
+Build per-transport state from the `sub` field of the acceptor context
+(the listen socket for TCP/TLS). The returned value is stored opaquely
+by the core and threaded through `do_accept/1`.
 """.
--callback init_sub(nhttp:opts()) -> term().
+-callback init_sub(Sub :: term()) -> term().
 
 -doc """
 Block on the transport-specific accept primitive. The 1000 ms timeout
@@ -90,6 +98,7 @@ work is done.
     name :: term(),
     counter :: nhttp_listener_counter:counter(),
     opts :: nhttp:opts(),
+    conn :: nhttp_conn:ctx(),
     port :: inet:port_number(),
     parent :: pid(),
     debug :: [sys:debug_option()],
@@ -113,9 +122,9 @@ get_listen_port(AcceptorPid) ->
         nhttp_error:accept_timeout()
     end.
 
--spec start_link(module(), nhttp_registry:tab(), nhttp:opts()) -> {ok, pid()}.
-start_link(Mod, Tab, Opts) ->
-    Args = {Mod, Tab, Opts, self()},
+-spec start_link(module(), nhttp_registry:tab(), ctx()) -> {ok, pid()}.
+start_link(Mod, Tab, Ctx) ->
+    Args = {Mod, Tab, Ctx, self()},
     proc_lib:start_link(?MODULE, init, [Args]).
 
 -doc """
@@ -130,9 +139,8 @@ stop_accepting(AcceptorPid) ->
 %%%-----------------------------------------------------------------------------
 %% PROC_LIB CALLBACKS
 %%%-----------------------------------------------------------------------------
--spec init({module(), nhttp_registry:tab(), nhttp:opts(), pid()}) -> no_return().
-init({Mod, Tab, Opts, Parent}) ->
-    Port = maps:get(actual_port, Opts),
+-spec init({module(), nhttp_registry:tab(), ctx(), pid()}) -> no_return().
+init({Mod, Tab, #{opts := Opts, port := Port, conn := ConnCtx, sub := Sub}, Parent}) ->
     Debug = sys:debug_options([]),
     ConnSupPid = nhttp_registry:lookup_conn_sup(Tab),
     TrackerPid = nhttp_registry:lookup_conn_tracker(Tab),
@@ -141,7 +149,7 @@ init({Mod, Tab, Opts, Parent}) ->
     true = is_pid(ConnSupPid),
     true = is_pid(TrackerPid),
     true = Counter =/= undefined,
-    SubState = Mod:init_sub(Opts),
+    SubState = Mod:init_sub(Sub),
     proc_lib:init_ack(Parent, {ok, self()}),
     State = #state{
         module = Mod,
@@ -149,6 +157,7 @@ init({Mod, Tab, Opts, Parent}) ->
         name = Name,
         counter = Counter,
         opts = Opts,
+        conn = ConnCtx,
         port = Port,
         parent = Parent,
         debug = Debug,
@@ -259,12 +268,18 @@ receive_system_msg(Parent, Debug, State, Timeout) ->
 
 -spec spawn_ctx(#state{}) -> spawn_ctx().
 spawn_ctx(#state{
-    name = Name, counter = Counter, opts = Opts, conn_sup = ConnSup, tracker = Tracker
+    name = Name,
+    counter = Counter,
+    opts = Opts,
+    conn = ConnCtx,
+    conn_sup = ConnSup,
+    tracker = Tracker
 }) ->
     #{
         name => Name,
         counter => Counter,
         opts => Opts,
+        conn => ConnCtx,
         conn_sup => ConnSup,
         tracker => Tracker
     }.

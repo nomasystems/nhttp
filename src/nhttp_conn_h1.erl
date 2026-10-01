@@ -48,6 +48,16 @@
 -define(H1_REQUEST_LINE_ALLOWANCE, 8192).
 
 %%%-----------------------------------------------------------------------------
+%% TYPES
+%%%-----------------------------------------------------------------------------
+-type h1_dispatch() ::
+    #state{}
+    | {upgrade, websocket, #state{}, nhttp_lib:request()}
+    | {upgrade, websocket, #state{}, nhttp_lib:request(), nhttp_ws:ws_session_opts()}
+    | {stream_push, #state{}, nhttp_conn_h1_push:h1_push_ctx()}
+    | {accept_body, #state{}, term(), {nhttp_otel:span_ctx(), integer()}}.
+
+%%%-----------------------------------------------------------------------------
 %% API
 %%%-----------------------------------------------------------------------------
 -doc """
@@ -346,12 +356,7 @@ apply_h1_body_chunks(Parent, Debug, State, Request, BodyState, ReqSpan, [Event |
 
 -spec apply_h1_request_result(
     #state{}, nhttp_lib:request(), {nhttp_otel:span_ctx(), integer()}, term()
-) ->
-    #state{}
-    | {upgrade, websocket, #state{}, nhttp_lib:request()}
-    | {upgrade, websocket, #state{}, nhttp_lib:request(), nhttp_ws:ws_session_opts()}
-    | {stream_push, #state{}, nhttp_conn_h1_push:h1_push_ctx()}
-    | {accept_body, #state{}, term(), term()}.
+) -> h1_dispatch().
 apply_h1_request_result(
     #state{protocol_state = #h1_state{} = H1} = State,
     Request,
@@ -544,12 +549,7 @@ count_host_headers([], 0) -> {error, bad_host}.
 deliver_h1_body_abort(Parent, Debug, State, Request, BodyState, ReqSpan, Reason) ->
     apply_h1_body_chunks(Parent, Debug, State, Request, BodyState, ReqSpan, [{abort, Reason}]).
 
--spec dispatch_h1_request(#state{}, nhttp_lib:request()) ->
-    #state{}
-    | {upgrade, websocket, #state{}, nhttp_lib:request()}
-    | {upgrade, websocket, #state{}, nhttp_lib:request(), nhttp_ws:ws_session_opts()}
-    | {stream_push, #state{}, nhttp_conn_h1_push:h1_push_ctx()}
-    | {accept_body, #state{}, term(), term()}.
+-spec dispatch_h1_request(#state{}, nhttp_lib:request()) -> h1_dispatch().
 dispatch_h1_request(
     #state{limits = Limits, protocol_state = #h1_state{} = H1} = State, Request
 ) ->
@@ -566,12 +566,7 @@ dispatch_h1_request(
             State#state{protocol_state = H1#h1_state{keep_alive = false}}
     end.
 
--spec dispatch_h1_request_validated(#state{}, nhttp_lib:request()) ->
-    #state{}
-    | {upgrade, websocket, #state{}, nhttp_lib:request()}
-    | {upgrade, websocket, #state{}, nhttp_lib:request(), nhttp_ws:ws_session_opts()}
-    | {stream_push, #state{}, nhttp_conn_h1_push:h1_push_ctx()}
-    | {accept_body, #state{}, term(), term()}.
+-spec dispatch_h1_request_validated(#state{}, nhttp_lib:request()) -> h1_dispatch().
 dispatch_h1_request_validated(#state{handler = Handler, handler_state = HState} = State, Request) ->
     ReqSpan = nhttp_conn:emit_request_start(State, 0, Request),
     Result = nhttp_handler:safe_handle_request(Handler, Request, HState),
@@ -689,7 +684,7 @@ finish_h1_request(
     {nhttp_otel:span_ctx(), integer()},
     nhttp_handler:body_event(),
     [nhttp_handler:body_event()],
-    term()
+    h1_dispatch()
 ) -> no_return().
 handle_h1_body_event_result(
     Parent,

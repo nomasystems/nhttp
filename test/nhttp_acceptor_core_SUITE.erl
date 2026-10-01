@@ -133,8 +133,13 @@ start_acceptor(Config, Script) ->
     RegTab = ?config(reg_tab, Config),
     MockTab = ?config(mock_tab, Config),
     true = ets:insert(MockTab, {script, Script}),
-    Opts = #{actual_port => 0, mock_tab => MockTab},
-    {ok, Pid} = nhttp_acceptor_core:start_link(nhttp_acceptor_core_mock, RegTab, Opts),
+    Ctx = #{
+        opts => #{},
+        port => 0,
+        conn => #{ssl_opts => [], versions => [http1_1], alt_svc_advertise => disabled},
+        sub => MockTab
+    },
+    {ok, Pid} = nhttp_acceptor_core:start_link(nhttp_acceptor_core_mock, RegTab, Ctx),
     Pid.
 
 stop_acceptor(Pid) ->

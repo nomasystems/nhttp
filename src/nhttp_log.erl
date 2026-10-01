@@ -106,21 +106,11 @@ request can be joined across modules.
 """.
 -spec request_ctx(ctx(), nhttp_lib:request(), nhttp_lib:stream_id() | undefined) ->
     ctx().
-request_ctx(Ctx, Request, StreamId) ->
-    Base = Ctx#{request_id => request_id()},
-    Base1 =
-        case Request of
-            #{method := M} -> Base#{method => M};
-            _ -> Base
-        end,
-    Base2 =
-        case Request of
-            #{path := P} -> Base1#{path => P};
-            _ -> Base1
-        end,
+request_ctx(Ctx, #{method := Method, path := Path}, StreamId) ->
+    Base = Ctx#{request_id => request_id(), method => Method, path => Path},
     case StreamId of
-        undefined -> Base2;
-        _ -> Base2#{stream_id => StreamId}
+        undefined -> Base;
+        _ -> Base#{stream_id => StreamId}
     end.
 
 -doc """
