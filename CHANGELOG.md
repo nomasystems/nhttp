@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- The `opts()` type declares the request limit options (`max_body_size`, `max_headers`, `max_header_size`, `max_header_name_length`, `max_header_value_length`, `max_uri_length`). The listener already read them, but a caller that set one failed dialyzer
+
 ## [1.2.1] - 2026-09-30
 
 ### Changed
