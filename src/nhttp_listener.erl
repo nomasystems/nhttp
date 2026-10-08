@@ -278,28 +278,17 @@ effective_versions(Opts) ->
             end
     end.
 
--spec find_acceptor_in_sup([{term(), pid() | restarting | undefined, term(), term()}]) ->
-    {nhttp_acceptor, pid()} | none.
-find_acceptor_in_sup([]) ->
-    none;
-find_acceptor_in_sup([{{nhttp_acceptor, _}, Pid, worker, _} | _]) when is_pid(Pid) ->
-    {nhttp_acceptor, Pid};
-find_acceptor_in_sup([_ | Rest]) ->
-    find_acceptor_in_sup(Rest).
-
--spec find_acceptor_in_transports([pid()]) ->
-    {nhttp_acceptor, pid()} | none.
-find_acceptor_in_transports([]) ->
-    none;
-find_acceptor_in_transports([TransportSup | Rest]) ->
+-spec has_live_acceptor(pid()) -> boolean().
+has_live_acceptor(TransportSup) ->
     case lists:keyfind(nhttp_acceptor_sup, 1, supervisor:which_children(TransportSup)) of
         {_, AccSupPid, _, _} when is_pid(AccSupPid) ->
-            case find_acceptor_in_sup(supervisor:which_children(AccSupPid)) of
-                {nhttp_acceptor, _} = Found -> Found;
-                none -> find_acceptor_in_transports(Rest)
-            end;
-        _ ->
-            find_acceptor_in_transports(Rest)
+            [Pid || {_, Pid, _, _} <- supervisor:which_children(AccSupPid), is_pid(Pid)] =/= [];
+        {_, undefined, _, _} ->
+            false;
+        {_, restarting, _, _} ->
+            false;
+        false ->
+            false
     end.
 
 -spec has_tls(map()) -> boolean().
@@ -342,9 +331,9 @@ partition_versions(Versions) ->
 
 -spec port_of_transport_sup(pid(), tcp | quic) -> {ok, inet:port_number()} | {error, term()}.
 port_of_transport_sup(TransportSup, tcp) ->
-    case find_acceptor_in_transports([TransportSup]) of
-        {nhttp_acceptor, Pid} -> nhttp_acceptor:get_listen_port(Pid);
-        none -> tracker_port_in_transports([TransportSup])
+    case has_live_acceptor(TransportSup) of
+        true -> tracker_port_in_transports([TransportSup]);
+        false -> {error, {server, no_acceptors}}
     end;
 port_of_transport_sup(TransportSup, quic) ->
     tracker_port_in_transports([TransportSup]).
