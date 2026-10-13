@@ -27,6 +27,7 @@
     child_spec_unnamed/1,
     child_spec_named/1,
     drain_default_timeout/1,
+    get_port_without_acceptor_reply/1,
     header_lookup/1,
     header_lookup_with_default/1,
     start_link_named_local/1,
@@ -58,6 +59,7 @@ all() ->
         {group, child_spec},
         {group, drain},
         {group, header},
+        {group, port},
         {group, start_link_named}
     ].
 
@@ -78,6 +80,9 @@ groups() ->
         {header, [sequence], [
             header_lookup,
             header_lookup_with_default
+        ]},
+        {port, [sequence], [
+            get_port_without_acceptor_reply
         ]},
         {start_link_named, [sequence], [
             start_link_named_local,
@@ -199,6 +204,24 @@ header_lookup_with_default(_Config) ->
     ok.
 
 %%%-----------------------------------------------------------------------------
+%%%-----------------------------------------------------------------------------
+%%% PORT
+%%%-----------------------------------------------------------------------------
+
+get_port_without_acceptor_reply(_Config) ->
+    {ok, Pid} = nhttp:start_link(#{
+        port => 0,
+        handler => ?MODULE,
+        versions => [http1_1]
+    }),
+    Acceptors = acceptor_pids(Pid),
+    ok = lists:foreach(fun sys:suspend/1, Acceptors),
+    Result = nhttp:get_port(Pid),
+    ok = lists:foreach(fun sys:resume/1, Acceptors),
+    ?assertMatch({ok, Port} when is_integer(Port) andalso Port > 0, Result),
+    nhttp:stop(Pid),
+    ok.
+
 %%% start_link/2 NAMED FORMS
 %%%-----------------------------------------------------------------------------
 
@@ -229,3 +252,16 @@ start_link_named_atom(_Config) ->
     ?assertEqual(Pid, whereis(nhttp_api_atom)),
     nhttp:stop(Pid),
     ok.
+
+%%%-----------------------------------------------------------------------------
+%%% INTERNAL FUNCTIONS
+%%%-----------------------------------------------------------------------------
+
+acceptor_pids(ListenerPid) ->
+    [
+        AccPid
+     || {{nhttp_transport_sup, tcp}, TransportSup, _, _} <- supervisor:which_children(ListenerPid),
+        {nhttp_acceptor_sup, AccSup, _, _} <- supervisor:which_children(TransportSup),
+        {{nhttp_acceptor, _}, AccPid, _, _} <- supervisor:which_children(AccSup),
+        is_pid(AccPid)
+    ].

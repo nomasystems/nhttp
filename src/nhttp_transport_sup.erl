@@ -190,6 +190,7 @@ init_tcp_listener(Tab, Opts, Versions, Transport, Advertise) ->
     case nhttp_sock:listen(ListenOpts) of
         {ok, ListenSocket} ->
             {ok, {_, Port}} = nhttp_sock:sockname(ListenSocket),
+            ok = nhttp_registry:register_port(Tab, Port),
             MaxConns = maps:get(max_connections, Opts, ?DEFAULT_MAX_CONNECTIONS),
             Counter = nhttp_listener_counter:new(MaxConns),
             ok = nhttp_registry:register_counter(Tab, Counter),
