@@ -137,8 +137,8 @@ by the zero-timeout receive).
 -spec h3_wake(#state{}, nhttp_conn:hibernate_timer()) -> no_return().
 h3_wake(State, Timer) ->
     case nhttp_conn:cancel_hibernate_timer(Timer) of
-        ok -> h3_receive(State, State#state.idle_timeout);
-        expired -> h3_receive(State, 0)
+        ok -> connection_loop_receive(State);
+        expired -> h3_receive(State, nhttp_conn:idle_deadline(0))
     end.
 
 -spec system_code_change(#state{}, module(), term(), term()) -> {ok, #state{}}.
@@ -314,34 +314,51 @@ connection_loop_connected(State) ->
     end.
 
 -doc """
-Event-wait block point. A quiescent connection (no streams, no push
-workers, not closing, empty mailbox) hibernates here. nquic arms its
-protocol timers via `erlang:send_after` to this process, so QUIC timer
-messages wake a hibernated connection like any packet. The idle deadline
-is carried across hibernation by the timer from
-`nhttp_conn:start_hibernate_timer/1`.
+Event-wait block point. A connection with no streams, no push workers
+and not closing waits the `hibernate` timeout, capped by the idle
+deadline, and hibernates for the rest of the idle budget when that
+elapses with an empty mailbox. The timer from
+`nhttp_conn:start_hibernate_timer/1` carries the idle deadline across the
+hibernation. nquic arms its protocol timers via `erlang:send_after` to
+this process, so QUIC timer messages wake a hibernated connection like
+any packet.
 """.
 -spec connection_loop_receive(#state{}) -> no_return().
-connection_loop_receive(State) ->
-    case hibernate_eligible(State) of
-        true -> hibernate(State);
-        false -> h3_receive(State, State#state.idle_timeout)
-    end.
+connection_loop_receive(#state{idle_timeout = IdleTimeout} = State) ->
+    h3_receive(State, nhttp_conn:idle_deadline(IdleTimeout)).
 
--spec hibernate_eligible(#state{}) -> boolean().
-hibernate_eligible(#state{closing = false, h3_streams = Streams, h3_push_workers = Workers}) ->
-    map_size(Streams) =:= 0 andalso map_size(Workers) =:= 0 andalso
-        nhttp_conn:mailbox_empty();
-hibernate_eligible(#state{}) ->
+-spec stream_idle(#state{}) -> boolean().
+stream_idle(#state{closing = false, h3_streams = Streams, h3_push_workers = Workers}) ->
+    map_size(Streams) =:= 0 andalso map_size(Workers) =:= 0;
+stream_idle(#state{}) ->
     false.
 
--spec hibernate(#state{}) -> no_return().
-hibernate(#state{idle_timeout = IdleTimeout} = State) ->
-    Timer = nhttp_conn:start_hibernate_timer(IdleTimeout),
+-spec receive_timeout(#state{}, nhttp_conn:deadline()) -> timeout().
+receive_timeout(#state{hibernate_after = HibernateAfter} = State, IdleDeadline) ->
+    case stream_idle(State) of
+        true -> nhttp_conn:quiescence_wait(HibernateAfter, IdleDeadline);
+        false -> nhttp_conn:deadline_remaining(IdleDeadline)
+    end.
+
+-spec handle_h3_timeout(#state{}, nhttp_conn:deadline()) -> no_return().
+handle_h3_timeout(State, IdleDeadline) ->
+    case nhttp_conn:deadline_remaining(IdleDeadline) of
+        0 ->
+            terminate(idle_timeout, State);
+        IdleRemaining ->
+            case stream_idle(State) andalso nhttp_conn:mailbox_empty() of
+                true -> hibernate(State, IdleRemaining);
+                false -> h3_receive(State, IdleDeadline)
+            end
+    end.
+
+-spec hibernate(#state{}, timeout()) -> no_return().
+hibernate(State, IdleRemaining) ->
+    Timer = nhttp_conn:start_hibernate_timer(IdleRemaining),
     proc_lib:hibernate(?MODULE, h3_wake, [State, Timer]).
 
--spec h3_receive(#state{}, timeout()) -> no_return().
-h3_receive(#state{parent = Parent} = State, IdleTimeout) ->
+-spec h3_receive(#state{}, nhttp_conn:deadline()) -> no_return().
+h3_receive(#state{parent = Parent} = State, IdleDeadline) ->
     receive
         {packet, Source, Bin} ->
             handle_packet_and_drain(State, Source, Bin);
@@ -392,8 +409,8 @@ h3_receive(#state{parent = Parent} = State, IdleTimeout) ->
             State1 = nhttp_conn_ws_h3:handle_info(State, Info),
             State2 = flush_ctx_state(State1),
             connection_loop(State2)
-    after IdleTimeout ->
-        terminate(idle_timeout, State)
+    after receive_timeout(State, IdleDeadline) ->
+        handle_h3_timeout(State, IdleDeadline)
     end.
 
 -spec drain_connected_socket(#state{}, non_neg_integer()) -> #state{}.
@@ -1064,6 +1081,7 @@ build_state(InitArgs, HandlerState, Peer, Ctx, H3Conn) ->
         opts = Opts,
         limits = nhttp_limits:from_opts(Opts),
         idle_timeout = maps:get(idle, Timeouts, ?DEFAULT_IDLE_TIMEOUT),
+        hibernate_after = maps:get(hibernate, Timeouts, ?DEFAULT_HIBERNATE_AFTER),
         otel_config = nhttp_otel:config(Opts),
         conn_span = undefined,
         compression_enabled = maps:get(compression, Opts, true),

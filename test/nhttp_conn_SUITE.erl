@@ -150,7 +150,8 @@
     h1_hibernate_keepalive/1,
     h1_hibernate_idle_timeout/1,
     h2_hibernate_ping/1,
-    h1_websocket_hibernate_ping/1
+    h1_websocket_hibernate_ping/1,
+    h1_websocket_hibernate_quiescence/1
 ]).
 
 -behaviour(nhttp_handler).
@@ -424,7 +425,8 @@ groups() ->
             h1_hibernate_keepalive,
             h1_hibernate_idle_timeout,
             h2_hibernate_ping,
-            h1_websocket_hibernate_ping
+            h1_websocket_hibernate_ping,
+            h1_websocket_hibernate_quiescence
         ]},
         {protocol_detection, [sequence], [
             alpn_http1_1,
@@ -3343,7 +3345,7 @@ h1_hibernate_keepalive(_Config) ->
         port => 0,
         handler => ?MODULE,
         versions => [http1_1],
-        timeouts => #{idle => 30000}
+        timeouts => #{idle => 30000, hibernate => 0}
     }),
     {ok, Port} = nhttp:get_port(Pid),
 
@@ -3377,7 +3379,7 @@ h1_hibernate_idle_timeout(_Config) ->
         port => 0,
         handler => ?MODULE,
         versions => [http1_1],
-        timeouts => #{idle => 300}
+        timeouts => #{idle => 300, hibernate => 0}
     }),
     {ok, Port} = nhttp:get_port(Pid),
 
@@ -3425,7 +3427,7 @@ h2_hibernate_ping(Config) ->
         tls => #{certfile => CertFile, keyfile => KeyFile},
         handler => ?MODULE,
         versions => [http2],
-        timeouts => #{idle => 30000}
+        timeouts => #{idle => 30000, hibernate => 0}
     }),
     {ok, Port} = nhttp:get_port(Pid),
 
@@ -3470,7 +3472,7 @@ h1_websocket_hibernate_ping(_Config) ->
         port => 0,
         handler => ?MODULE,
         versions => [http1_1],
-        timeouts => #{idle => 30000},
+        timeouts => #{idle => 30000, hibernate => 0},
         telemetry => false
     }),
     {ok, Port} = nhttp:get_port(Pid),
@@ -3502,6 +3504,70 @@ h1_websocket_hibernate_ping(_Config) ->
     gen_tcp:close(Sock),
     nhttp:stop(Pid),
     ok.
+
+h1_websocket_hibernate_quiescence(_Config) ->
+    reregister(conn_pid_receiver),
+
+    {ok, Pid} = nhttp:start_link(#{
+        port => 0,
+        handler => ?MODULE,
+        versions => [http1_1],
+        timeouts => #{idle => 1000, hibernate => 600},
+        telemetry => false
+    }),
+    {ok, Port} = nhttp:get_port(Pid),
+
+    {ok, Sock} = gen_tcp:connect("127.0.0.1", Port, [binary, {active, false}]),
+    ok = gen_tcp:send(Sock, <<"GET /conn-pid HTTP/1.1\r\nHost: localhost\r\n\r\n">>),
+    {ok, _} = gen_tcp:recv(Sock, 0, 5000),
+
+    ConnPid =
+        receive
+            {conn_pid, P} -> P
+        after 5000 ->
+            error(conn_pid_timeout)
+        end,
+
+    ok = gen_tcp:send(Sock, ws_upgrade_request()),
+    {ok, <<"HTTP/1.1 101", _/binary>>} = gen_tcp:recv(Sock, 0, 5000),
+
+    Session = trace:session_create(?MODULE, self(), []),
+    1 = trace:process(Session, ConnPid, true, [call]),
+    1 = trace:function(Session, {proc_lib, hibernate, 3}, true, [global]),
+
+    ok = ping_pong_paced(Sock, ConnPid, 10, 100),
+    LastFrameAt = erlang:monotonic_time(millisecond),
+
+    receive
+        {trace, ConnPid, call, {proc_lib, hibernate, [_, _, _]}} -> ok
+    after 2000 ->
+        error(no_hibernation_after_quiescence)
+    end,
+    {ok, <<16#88, _/binary>>} = gen_tcp:recv(Sock, 0, 5000),
+    IdleElapsed = erlang:monotonic_time(millisecond) - LastFrameAt,
+    ?assert(IdleElapsed >= 950, {idle_fired_early, IdleElapsed}),
+    ?assert(IdleElapsed =< 1400, {idle_drifted, IdleElapsed}),
+
+    true = trace:session_destroy(Session),
+    unregister(conn_pid_receiver),
+    gen_tcp:close(Sock),
+    nhttp:stop(Pid),
+    ok.
+
+ping_pong_paced(_Sock, _ConnPid, 0, _GapMs) ->
+    ok;
+ping_pong_paced(Sock, ConnPid, N, GapMs) ->
+    timer:sleep(GapMs),
+    receive
+        {trace, ConnPid, call, {proc_lib, hibernate, [_, _, _]}} ->
+            error({hibernated_between_frames, N})
+    after 0 ->
+        ok
+    end,
+    MaskKey = <<1, 2, 3, 4>>,
+    ok = gen_tcp:send(Sock, <<16#89, 16#80, MaskKey/binary>>),
+    {ok, <<16#8A, 0>>} = gen_tcp:recv(Sock, 0, 5000),
+    ping_pong_paced(Sock, ConnPid, N - 1, GapMs).
 
 wait_until_hibernating(Pid) ->
     nhttp_test_helpers:wait_until(

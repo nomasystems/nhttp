@@ -264,13 +264,18 @@ Connection timeouts (milliseconds, or `infinity`).
   received body (HTTP/1.1). Default `infinity` (opt-in) so legitimate
   large or slow uploads are not aborted.
 - `send`: socket send timeout. Default 30000.
+- `hibernate`: quiet time after which a connection with nothing in
+  flight hibernates. The wait consumes part of the idle budget, so the
+  idle timeout still fires on time. `0` hibernates on every quiet
+  moment, `infinity` never. Default 1000.
 """.
 -type timeouts() :: #{
     idle => timeout(),
     request => timeout(),
     body => timeout(),
     body_deadline => timeout(),
-    send => timeout()
+    send => timeout(),
+    hibernate => timeout()
 }.
 
 -type tls() :: #{

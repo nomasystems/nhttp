@@ -93,8 +93,8 @@ by the zero-timeout receive).
     no_return().
 h2_wake(Parent, Debug, State, Timer) ->
     case nhttp_conn:cancel_hibernate_timer(Timer) of
-        ok -> h2_receive(Parent, Debug, State, receive_timeout(State));
-        expired -> h2_receive(Parent, Debug, State, 0)
+        ok -> h2_loop(Parent, Debug, State);
+        expired -> h2_receive(Parent, Debug, State, nhttp_conn:idle_deadline(0))
     end.
 
 -spec system_code_change(#state{}, module(), term(), term()) -> {ok, #state{}}.
@@ -122,33 +122,26 @@ finalize_goaway(#state{protocol_state = #h2_state{h2_conn = H2Conn} = H2} = Stat
     State1.
 
 -doc """
-Frame-wait block point. A quiescent connection (no streams, no workers,
-not draining, empty mailbox) hibernates here. With active streams the
-loop never hibernates: frames arrive at data rate and a full-sweep GC
-per frame is a performance hazard. Protocol PINGs wake the process like
-any other socket data. The `after` deadline is carried across
-hibernation by the timer from `nhttp_conn:start_hibernate_timer/1`.
+Frame-wait block point. A connection with no streams, no workers and no
+drain in progress waits the `hibernate` timeout, capped by the idle
+deadline, and hibernates for the rest of the idle budget when that
+elapses with an empty mailbox. The timer from
+`nhttp_conn:start_hibernate_timer/1` carries the idle deadline across the
+hibernation. With active streams the loop never hibernates: frames
+arrive at data rate and a full-sweep GC per frame is a performance
+hazard. Protocol PINGs wake the process like any other socket data.
 """.
 -spec h2_loop(pid(), [sys:debug_option()], #state{}) -> no_return().
-h2_loop(Parent, Debug, State) ->
-    case hibernate_eligible(State) of
-        true -> hibernate(Parent, Debug, State);
-        false -> h2_receive(Parent, Debug, State, receive_timeout(State))
-    end.
+h2_loop(Parent, Debug, #state{idle_timeout = IdleTimeout} = State) ->
+    h2_receive(Parent, Debug, State, nhttp_conn:idle_deadline(IdleTimeout)).
 
--spec hibernate_eligible(#state{}) -> boolean().
-hibernate_eligible(#state{protocol_state = #h2_state{drain_deadline = undefined}} = State) ->
-    drain_idle(State) andalso nhttp_conn:mailbox_empty();
-hibernate_eligible(#state{}) ->
-    false.
-
--spec hibernate(pid(), [sys:debug_option()], #state{}) -> no_return().
-hibernate(Parent, Debug, #state{idle_timeout = IdleTimeout} = State) ->
-    Timer = nhttp_conn:start_hibernate_timer(IdleTimeout),
+-spec hibernate(pid(), [sys:debug_option()], #state{}, timeout()) -> no_return().
+hibernate(Parent, Debug, State, IdleRemaining) ->
+    Timer = nhttp_conn:start_hibernate_timer(IdleRemaining),
     proc_lib:hibernate(?MODULE, h2_wake, [Parent, Debug, State, Timer]).
 
--spec h2_receive(pid(), [sys:debug_option()], #state{}, timeout()) -> no_return().
-h2_receive(Parent, Debug, State, Timeout) ->
+-spec h2_receive(pid(), [sys:debug_option()], #state{}, nhttp_conn:deadline()) -> no_return().
+h2_receive(Parent, Debug, State, IdleDeadline) ->
     receive
         {tcp, _Socket, Data} ->
             handle_h2_data(Parent, Debug, State, Data);
@@ -200,8 +193,8 @@ h2_receive(Parent, Debug, State, Timeout) ->
             h2_loop(Parent, Debug, NewState);
         Info ->
             h2_loop(Parent, Debug, nhttp_conn_ws_h2:handle_info(State, Info))
-    after Timeout ->
-        handle_h2_timeout(State)
+    after receive_timeout(State, IdleDeadline) ->
+        handle_h2_timeout(Parent, Debug, State, IdleDeadline)
     end.
 
 -spec handle_h2_data(pid(), [sys:debug_option()], #state{}, binary()) -> no_return().
@@ -245,20 +238,42 @@ handle_h2_data(
             nhttp_conn:stop({h2_error, Reason}, State)
     end.
 
--spec handle_h2_timeout(#state{}) -> no_return().
-handle_h2_timeout(#state{protocol_state = #h2_state{drain_deadline = undefined}} = State) ->
-    nhttp_conn:stop(idle_timeout, State);
-handle_h2_timeout(#state{} = State) ->
+-spec handle_h2_timeout(pid(), [sys:debug_option()], #state{}, nhttp_conn:deadline()) ->
+    no_return().
+handle_h2_timeout(
+    Parent,
+    Debug,
+    #state{protocol_state = #h2_state{drain_deadline = undefined}} = State,
+    IdleDeadline
+) ->
+    case nhttp_conn:deadline_remaining(IdleDeadline) of
+        0 ->
+            nhttp_conn:stop(idle_timeout, State);
+        IdleRemaining ->
+            case drain_idle(State) andalso nhttp_conn:mailbox_empty() of
+                true -> hibernate(Parent, Debug, State, IdleRemaining);
+                false -> h2_receive(Parent, Debug, State, IdleDeadline)
+            end
+    end;
+handle_h2_timeout(_Parent, _Debug, #state{} = State, _IdleDeadline) ->
     nhttp_conn:stop(normal, finalize_goaway(State)).
 
--spec receive_timeout(#state{}) -> timeout().
-receive_timeout(#state{
-    protocol_state = #h2_state{drain_deadline = undefined}, idle_timeout = IdleTimeout
-}) ->
-    IdleTimeout;
-receive_timeout(#state{protocol_state = #h2_state{drain_deadline = Deadline}} = State) ->
-    Now = erlang:monotonic_time(millisecond),
-    Remaining = max(0, Deadline - Now),
+-spec receive_timeout(#state{}, nhttp_conn:deadline()) -> timeout().
+receive_timeout(
+    #state{
+        protocol_state = #h2_state{drain_deadline = undefined},
+        hibernate_after = HibernateAfter
+    } = State,
+    IdleDeadline
+) ->
+    case drain_idle(State) of
+        true -> nhttp_conn:quiescence_wait(HibernateAfter, IdleDeadline);
+        false -> nhttp_conn:deadline_remaining(IdleDeadline)
+    end;
+receive_timeout(
+    #state{protocol_state = #h2_state{drain_deadline = Deadline}} = State, _IdleDeadline
+) ->
+    Remaining = nhttp_conn:deadline_remaining(Deadline),
     case drain_idle(State) of
         true -> min(?DRAIN_IDLE_WAKE_MS, Remaining);
         false -> Remaining
@@ -1900,9 +1915,8 @@ send_with_credit(State, Credit, Frames) ->
 
 -doc """
 The codec holds octets of `StreamId` in its send queue. A `#h2_stream{}`
-stays in `h2_streams` while this holds, so that `drain_idle/1` and
-`hibernate_eligible/1` see the stream, and it leaves on the `data_sent`
-event that carries END_STREAM.
+stays in `h2_streams` while this holds, so that `drain_idle/1` sees the
+stream, and it leaves on the `data_sent` event that carries END_STREAM.
 """.
 -spec stream_send_pending(#state{}, nhttp_lib:stream_id()) -> boolean().
 stream_send_pending(#state{protocol_state = #h2_state{h2_conn = H2Conn}}, StreamId) ->

@@ -78,37 +78,45 @@ by the zero-timeout receive).
     no_return().
 ws_wake(Parent, Debug, State, Timer) ->
     case nhttp_conn:cancel_hibernate_timer(Timer) of
-        ok -> ws_receive(Parent, Debug, State, State#state.idle_timeout);
-        expired -> ws_receive(Parent, Debug, State, 0)
+        ok -> loop(Parent, Debug, State);
+        expired -> ws_receive(Parent, Debug, State, nhttp_conn:idle_deadline(0))
     end.
 
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - WEBSOCKET LOOP
 %%%-----------------------------------------------------------------------------
 -doc """
-Frame-wait block point. A session with no partial frame buffered and an
-empty mailbox hibernates here; incoming frames (including ping/pong) and
-async-API casts wake the process. The idle deadline is carried across
+Frame-wait block point. The receive waits the `hibernate` timeout, capped
+by the idle deadline. A session that is exchanging frames re-enters here
+per frame and never hibernates. One that saw no traffic for that long
+hibernates for the rest of the idle budget, carried across the
 hibernation by the timer from `nhttp_conn:start_hibernate_timer/1`.
+Incoming frames (including ping/pong) and async-API casts wake it.
 """.
 -spec loop(pid(), [sys:debug_option()], #state{}) -> no_return().
-loop(Parent, Debug, State) ->
-    case hibernate_eligible(State) of
-        true -> hibernate(Parent, Debug, State);
-        false -> ws_receive(Parent, Debug, State, State#state.idle_timeout)
-    end.
+loop(Parent, Debug, #state{idle_timeout = IdleTimeout} = State) ->
+    ws_receive(Parent, Debug, State, nhttp_conn:idle_deadline(IdleTimeout)).
 
--spec hibernate_eligible(#state{}) -> boolean().
-hibernate_eligible(#state{protocol_state = #h1_state{ws_decoder = Dec}}) ->
-    not nhttp_ws:frame_pending(Dec) andalso nhttp_conn:mailbox_empty().
-
--spec hibernate(pid(), [sys:debug_option()], #state{}) -> no_return().
-hibernate(Parent, Debug, #state{idle_timeout = IdleTimeout} = State) ->
-    Timer = nhttp_conn:start_hibernate_timer(IdleTimeout),
+-spec hibernate(pid(), [sys:debug_option()], #state{}, timeout()) -> no_return().
+hibernate(Parent, Debug, State, IdleRemaining) ->
+    Timer = nhttp_conn:start_hibernate_timer(IdleRemaining),
     proc_lib:hibernate(?MODULE, ws_wake, [Parent, Debug, State, Timer]).
 
--spec ws_receive(pid(), [sys:debug_option()], #state{}, timeout()) -> no_return().
-ws_receive(Parent, Debug, State, IdleTimeout) ->
+-spec quiescent(pid(), [sys:debug_option()], #state{}, nhttp_conn:deadline()) -> no_return().
+quiescent(Parent, Debug, State, IdleDeadline) ->
+    case nhttp_conn:deadline_remaining(IdleDeadline) of
+        0 ->
+            send_close(State, ?WS_CLOSE_GOING_AWAY, <<"Idle timeout">>),
+            finish(timeout, idle_timeout, State);
+        IdleRemaining ->
+            case nhttp_conn:mailbox_empty() of
+                true -> hibernate(Parent, Debug, State, IdleRemaining);
+                false -> ws_receive(Parent, Debug, State, IdleDeadline)
+            end
+    end.
+
+-spec ws_receive(pid(), [sys:debug_option()], #state{}, nhttp_conn:deadline()) -> no_return().
+ws_receive(Parent, Debug, #state{hibernate_after = HibernateAfter} = State, IdleDeadline) ->
     receive
         {tcp, _Socket, Data} ->
             handle_data(Parent, Debug, State, Data);
@@ -135,9 +143,8 @@ ws_receive(Parent, Debug, State, IdleTimeout) ->
             finish_parent({transport, Reason}, Reason, State);
         Info ->
             handle_info_loop(Parent, Debug, State, Info)
-    after IdleTimeout ->
-        send_close(State, ?WS_CLOSE_GOING_AWAY, <<"Idle timeout">>),
-        finish(timeout, idle_timeout, State)
+    after nhttp_conn:quiescence_wait(HibernateAfter, IdleDeadline) ->
+        quiescent(Parent, Debug, State, IdleDeadline)
     end.
 
 %%%-----------------------------------------------------------------------------
