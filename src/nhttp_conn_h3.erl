@@ -769,7 +769,7 @@ handle_h3_event(#state{h3_streams = Streams, limits = Limits} = State, {data, St
         undefined ->
             State;
         #h3_stream{type = websocket} ->
-            nhttp_conn_ws_h3:handle_data(State, StreamId, Data, Fin);
+            nhttp_conn_ws_h3:handle_data(State, StreamId, Data);
         #h3_stream{accept_body = true, body_size = Size} = Stream ->
             NewSize = Size + byte_size(Data),
             case nhttp_limits:check_body_size(NewSize, Limits) of

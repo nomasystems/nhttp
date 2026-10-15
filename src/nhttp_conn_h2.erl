@@ -1415,7 +1415,7 @@ handle_h2_event(
         undefined ->
             State;
         #h2_stream{type = websocket} ->
-            nhttp_conn_ws_h2:handle_data(State, StreamId, Data, Fin);
+            nhttp_conn_ws_h2:handle_data(State, StreamId, Data);
         #h2_stream{type = request, held_response = {_, _}} = Stream ->
             track_stream_end(State, StreamId, Stream, Fin);
         #h2_stream{type = request} = Stream ->

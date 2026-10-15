@@ -17,7 +17,7 @@
     connect/3,
     handle_call/3,
     handle_cast/2,
-    handle_data/4,
+    handle_data/3,
     handle_info/2,
     handle_stream_reset/3,
     notify_connection_close/2
@@ -95,16 +95,14 @@ handle_cast(State, _Other) ->
     State.
 
 -doc """
-Process incoming WebSocket frame data for a stream. Decodes complete
-frames out of the per-stream buffer and dispatches each through
-`nhttp_conn_ws`.
+Process incoming WebSocket frame data for a stream. Feeds it to the
+stream decoder and dispatches each complete message through `nhttp_conn_ws`.
 """.
--spec handle_data(#state{}, nhttp_lib:stream_id(), binary(), nhttp_h3:fin()) -> #state{}.
-handle_data(#state{h3_streams = Streams} = State, StreamId, Data, Fin) ->
+-spec handle_data(#state{}, nhttp_lib:stream_id(), binary()) -> #state{}.
+handle_data(#state{h3_streams = Streams} = State, StreamId, Data) ->
     case maps:get(StreamId, Streams, undefined) of
-        #h3_stream{type = websocket, ws_buffer = Buffer, ws_decoder = Dec} = WsStream ->
-            Combined = <<Buffer/binary, Data/binary>>,
-            process_frames(State, StreamId, WsStream, Combined, Dec, Fin);
+        #h3_stream{type = websocket, ws_decoder = Dec} ->
+            feed(State, StreamId, Data, Dec);
         _ ->
             State
     end.
@@ -160,7 +158,7 @@ arm_decoder(State, StreamId) ->
         undefined ->
             State;
         #{runtime_opts := Opts} ->
-            buffer(State, StreamId, <<>>, nhttp_ws:decoder_new(server, Opts))
+            set_decoder(State, StreamId, nhttp_ws:decoder_new(server, Opts))
     end.
 
 -spec call_send(
@@ -248,7 +246,6 @@ open(
     Stream0 = #h3_stream{
         type = websocket,
         ws_decoder = nhttp_ws:decoder_new(server),
-        ws_buffer = <<>>,
         ws = Ws0
     },
     State2 = State1#state{
@@ -267,44 +264,43 @@ open(
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - FRAME PROCESSING
 %%%-----------------------------------------------------------------------------
--spec buffer(#state{}, nhttp_lib:stream_id(), binary(), nhttp_ws:ws_decoder()) -> #state{}.
-buffer(State, StreamId, Buffer, Dec) ->
+-spec dispatch_frames(#state{}, nhttp_lib:stream_id(), [nhttp_ws:ws_message()]) -> #state{}.
+dispatch_frames(State, _StreamId, []) ->
+    State;
+dispatch_frames(State, StreamId, [Message | Rest]) ->
+    dispatch_frames(dispatch_frame(State, StreamId, Message), StreamId, Rest).
+
+-spec fail(#state{}, nhttp_lib:stream_id(), nhttp_ws:decode_error()) -> #state{}.
+fail(State, StreamId, Reason) ->
+    case get_ws(State, StreamId) of
+        undefined ->
+            State;
+        #ws_state{} ->
+            {Code, ReasonBin} = nhttp_conn_ws:decode_error_close(Reason),
+            State1 = send_close(State, StreamId, Code, ReasonBin),
+            finish(State1, StreamId, {fail, Code, ReasonBin})
+    end.
+
+-spec feed(#state{}, nhttp_lib:stream_id(), binary(), nhttp_ws:ws_decoder()) -> #state{}.
+feed(State, StreamId, Data, Dec) ->
+    case nhttp_ws:feed(Data, Dec) of
+        {ok, Messages, NewDec} ->
+            dispatch_frames(set_decoder(State, StreamId, NewDec), StreamId, Messages);
+        {error, Reason, Messages} ->
+            fail(dispatch_frames(State, StreamId, Messages), StreamId, Reason)
+    end.
+
+-spec set_decoder(#state{}, nhttp_lib:stream_id(), nhttp_ws:ws_decoder()) -> #state{}.
+set_decoder(State, StreamId, Dec) ->
     case maps:get(StreamId, State#state.h3_streams, undefined) of
         #h3_stream{} = LiveStream ->
             State#state{
                 h3_streams = (State#state.h3_streams)#{
-                    StreamId => LiveStream#h3_stream{ws_buffer = Buffer, ws_decoder = Dec}
+                    StreamId => LiveStream#h3_stream{ws_decoder = Dec}
                 }
             };
         undefined ->
             State
-    end.
-
--spec process_frames(
-    #state{}, nhttp_lib:stream_id(), #h3_stream{}, binary(), nhttp_ws:ws_decoder(), nhttp_h3:fin()
-) -> #state{}.
-process_frames(State, StreamId, WsStream, Buffer, Dec, Fin) ->
-    case nhttp_ws:decode_with_state(Buffer, Dec) of
-        {ok, Message, Rest, NewDec} ->
-            State1 = dispatch_frame(State, StreamId, Message),
-            case maps:get(StreamId, State1#state.h3_streams, undefined) of
-                #h3_stream{} when Rest =/= <<>> ->
-                    process_frames(State1, StreamId, WsStream, Rest, NewDec, Fin);
-                #h3_stream{} ->
-                    buffer(State1, StreamId, <<>>, NewDec);
-                undefined ->
-                    State1
-            end;
-        {continue, Rest, NewDec} when Rest =/= <<>> ->
-            process_frames(State, StreamId, WsStream, Rest, NewDec, Fin);
-        {continue, <<>>, NewDec} ->
-            buffer(State, StreamId, <<>>, NewDec);
-        {more, _Needed, NewDec} ->
-            buffer(State, StreamId, Buffer, NewDec);
-        {error, Reason} ->
-            {Code, ReasonBin} = nhttp_conn_ws:decode_error_close(Reason),
-            State1 = send_close(State, StreamId, Code, ReasonBin),
-            finish(State1, StreamId, {fail, Code, ReasonBin})
     end.
 
 %%%-----------------------------------------------------------------------------
