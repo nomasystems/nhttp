@@ -99,10 +99,8 @@ loop(Parent, Debug, State) ->
     end.
 
 -spec hibernate_eligible(#state{}) -> boolean().
-hibernate_eligible(#state{protocol_state = #h1_state{ws_buffer = <<>>}}) ->
-    nhttp_conn:mailbox_empty();
-hibernate_eligible(#state{}) ->
-    false.
+hibernate_eligible(#state{protocol_state = #h1_state{ws_decoder = Dec}}) ->
+    not nhttp_ws:frame_pending(Dec) andalso nhttp_conn:mailbox_empty().
 
 -spec hibernate(pid(), [sys:debug_option()], #state{}) -> no_return().
 hibernate(Parent, Debug, #state{idle_timeout = IdleTimeout} = State) ->
@@ -240,54 +238,33 @@ activate(Parent, Debug, State) ->
         {stop, Reason} -> finish({transport, closed}, Reason, State)
     end.
 
--spec drain(pid(), [sys:debug_option()], #state{}, binary()) -> no_return().
-drain(Parent, Debug, State, <<>>) ->
-    activate(Parent, Debug, State);
-drain(Parent, Debug, State, _Rest) ->
-    process(Parent, Debug, State).
+-spec dispatch_frame(#state{}, nhttp_ws:ws_message()) -> #state{}.
+dispatch_frame(
+    #state{handler = Handler, protocol_state = #h1_state{h1_ws = #ws_state{} = Ws}} = State,
+    Message
+) ->
+    Actions = nhttp_conn_ws:dispatch_frame(nhttp_conn:log_ctx(State), Message, view(Ws), Handler),
+    apply_actions(State, Actions).
+
+-spec dispatch_frames(#state{}, [nhttp_ws:ws_message()]) -> #state{}.
+dispatch_frames(State, []) ->
+    State;
+dispatch_frames(State, [Message | Rest]) ->
+    dispatch_frames(dispatch_frame(State, Message), Rest).
 
 -spec handle_data(pid(), [sys:debug_option()], #state{}, binary()) -> no_return().
 handle_data(
-    Parent, Debug, #state{protocol_state = #h1_state{ws_buffer = Buffer} = H1} = State, Data
+    Parent, Debug, #state{protocol_state = #h1_state{ws_decoder = Dec} = H1} = State, Data
 ) ->
-    process(
-        Parent,
-        Debug,
-        State#state{protocol_state = H1#h1_state{ws_buffer = <<Buffer/binary, Data/binary>>}}
-    ).
-
--spec process(pid(), [sys:debug_option()], #state{}) -> no_return().
-process(
-    Parent,
-    Debug,
-    #state{protocol_state = #h1_state{ws_buffer = Buffer, ws_decoder = Dec} = H1} = State
-) ->
-    case nhttp_ws:decode_with_state(Buffer, Dec) of
-        {ok, Message, Rest, NewDec} ->
-            State0 = State#state{
-                protocol_state = H1#h1_state{ws_buffer = Rest, ws_decoder = NewDec}
-            },
-            #state{handler = Handler, protocol_state = #h1_state{h1_ws = #ws_state{} = Ws}} =
-                State0,
-            View = view(Ws),
-            Actions = nhttp_conn_ws:dispatch_frame(
-                nhttp_conn:log_ctx(State0), Message, View, Handler
-            ),
-            State1 = apply_actions(State0, Actions),
-            drain(Parent, Debug, State1, Rest);
-        {continue, Rest, NewDec} ->
-            State1 = State#state{
-                protocol_state = H1#h1_state{ws_buffer = Rest, ws_decoder = NewDec}
-            },
-            drain(Parent, Debug, State1, Rest);
-        {more, _Needed, NewDec} ->
-            activate(Parent, Debug, State#state{
-                protocol_state = H1#h1_state{ws_decoder = NewDec}
-            });
-        {error, Reason} ->
+    case nhttp_ws:feed(Data, Dec) of
+        {ok, Messages, NewDec} ->
+            State1 = State#state{protocol_state = H1#h1_state{ws_decoder = NewDec}},
+            activate(Parent, Debug, dispatch_frames(State1, Messages));
+        {error, Reason, Messages} ->
+            State1 = dispatch_frames(State, Messages),
             {Code, ReasonBin} = nhttp_conn_ws:decode_error_close(Reason),
-            send_close(State, Code, ReasonBin),
-            finish({fail, Code, ReasonBin}, {ws_error, Reason}, State)
+            send_close(State1, Code, ReasonBin),
+            finish({fail, Code, ReasonBin}, {ws_error, Reason}, State1)
     end.
 
 %%%-----------------------------------------------------------------------------

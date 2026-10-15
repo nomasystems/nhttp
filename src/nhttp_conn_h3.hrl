@@ -38,7 +38,6 @@
     request = undefined :: nhttp_lib:request() | undefined,
     body_size = 0 :: non_neg_integer(),
     type = http :: http | websocket | push,
-    ws_buffer = <<>> :: binary(),
     ws_decoder :: nhttp_ws:ws_decoder() | undefined,
     ws :: undefined | #ws_state{},
     accept_body = false :: boolean(),

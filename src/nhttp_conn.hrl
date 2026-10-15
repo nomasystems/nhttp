@@ -28,7 +28,6 @@
     body_size = 0 :: non_neg_integer(),
     end_stream = false :: boolean(),
     type = http :: http | request | stream | websocket,
-    ws_buffer = <<>> :: binary(),
     ws_decoder :: nhttp_ws:ws_decoder() | undefined,
     ws :: undefined | #ws_state{},
     worker :: pid() | undefined,
@@ -61,7 +60,6 @@
 -record(h1_state, {
     buffer = <<>> :: binary(),
     body_stream :: nhttp_h1:body_stream() | undefined,
-    ws_buffer = <<>> :: binary(),
     ws_decoder :: nhttp_ws:ws_decoder() | undefined,
     h1_ws :: undefined | #ws_state{},
     keep_alive = true :: boolean(),
