@@ -39,6 +39,7 @@
     alt_svc_headers/2,
     cancel_hibernate_timer/1,
     compress_config/1,
+    deadline_remaining/1,
     emit_handler_exception/3,
     emit_request_start/3,
     emit_request_stop/3,
@@ -47,9 +48,11 @@
     exit_reason/1,
     family_to_version/1,
     graceful_shutdown/1,
+    idle_deadline/1,
     init_exit_reason/1,
     log_ctx/1,
     mailbox_empty/0,
+    quiescence_wait/2,
     select_family/2,
     sock_send/2,
     sock_stop_reason/1,
@@ -64,7 +67,7 @@
 %%%-----------------------------------------------------------------------------
 %% TYPES
 %%%-----------------------------------------------------------------------------
--export_type([ctx/0, hibernate_timer/0]).
+-export_type([ctx/0, deadline/0, hibernate_timer/0]).
 
 -doc """
 Per-transport data that the transport supervisor gives to each connection:
@@ -76,6 +79,9 @@ Alt-Svc advertisement of the HTTP/3 endpoint.
     versions := [nhttp:version()],
     alt_svc_advertise := nhttp_transport_sup:alt_svc_advertise()
 }.
+
+-doc "A point in `erlang:monotonic_time(millisecond)` units, or no deadline.".
+-type deadline() :: integer() | infinity.
 
 -type hibernate_timer() :: none | {reference(), reference()}.
 
@@ -123,6 +129,7 @@ init({Name, Socket, Opts, Ctx, Parent}) ->
     OtelConfig = nhttp_otel:config(Opts),
     Timeouts = maps:get(timeouts, Opts, #{}),
     IdleTimeout = maps:get(idle, Timeouts, ?DEFAULT_IDLE_TIMEOUT),
+    HibernateAfter = maps:get(hibernate, Timeouts, ?DEFAULT_HIBERNATE_AFTER),
     CompressionEnabled = maps:get(compression, Opts, true),
     CompressionLevel = maps:get(compression_level, Opts, ?DEFAULT_COMPRESSION_LEVEL),
     CompressionThreshold = maps:get(compression_threshold, Opts, ?DEFAULT_COMPRESSION_THRESHOLD),
@@ -142,6 +149,7 @@ init({Name, Socket, Opts, Ctx, Parent}) ->
                 ctx = Ctx,
                 limits = nhttp_limits:from_opts(Opts),
                 idle_timeout = IdleTimeout,
+                hibernate_after = HibernateAfter,
                 otel_config = OtelConfig,
                 conn_span = undefined,
                 compression_enabled = CompressionEnabled,
@@ -318,6 +326,36 @@ start_hibernate_timer(infinity) ->
 start_hibernate_timer(IdleTimeout) ->
     Ref = make_ref(),
     {erlang:send_after(IdleTimeout, self(), {conn_hibernate_timeout, Ref}), Ref}.
+
+-doc "Milliseconds left to `Deadline`, `0` once it passed.".
+-spec deadline_remaining(deadline()) -> timeout().
+deadline_remaining(infinity) ->
+    infinity;
+deadline_remaining(Deadline) when is_integer(Deadline) ->
+    max(0, Deadline - erlang:monotonic_time(millisecond)).
+
+-doc """
+Deadline of an idle wait that starts now. A protocol loop computes it on
+every entry, so each message re-arms the idle timeout, and reads the time
+left with `deadline_remaining/1` when it hibernates: the quiescence wait
+consumed part of the idle budget, and the timer that spans the
+hibernation gets the rest.
+""".
+-spec idle_deadline(timeout()) -> deadline().
+idle_deadline(infinity) ->
+    infinity;
+idle_deadline(IdleTimeout) when is_integer(IdleTimeout) ->
+    erlang:monotonic_time(millisecond) + IdleTimeout.
+
+-doc """
+Receive wait of a protocol loop with nothing in flight: the `hibernate`
+timeout, capped by the time left to the idle deadline. When it elapses
+the loop hibernates for the rest of the idle budget, or stops on idle
+timeout when none is left.
+""".
+-spec quiescence_wait(timeout(), deadline()) -> timeout().
+quiescence_wait(HibernateAfter, IdleDeadline) ->
+    min(HibernateAfter, deadline_remaining(IdleDeadline)).
 
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - HANDLER SAFETY

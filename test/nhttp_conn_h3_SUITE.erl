@@ -545,7 +545,7 @@ h3_idle_timeout(Config) ->
     end.
 
 h3_hibernate(Config) ->
-    {_, _, Port} = start_h3_server(Config, #{}),
+    {_, _, Port} = start_h3_server(Config, #{timeouts => #{hibernate => 0}}),
 
     reregister(h3_conn_pid_receiver),
 

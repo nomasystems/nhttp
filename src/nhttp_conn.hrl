@@ -109,6 +109,7 @@
     ctx :: nhttp_conn:ctx(),
     limits = #{} :: nhttp_limits:t(),
     idle_timeout = ?DEFAULT_IDLE_TIMEOUT :: timeout(),
+    hibernate_after = ?DEFAULT_HIBERNATE_AFTER :: timeout(),
     requests_count = 0 :: non_neg_integer(),
     otel_config = false :: nhttp_otel:config(),
     conn_span :: nhttp_otel:span_ctx(),

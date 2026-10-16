@@ -19,6 +19,7 @@
 %%%-----------------------------------------------------------------------------
 -define(DEFAULT_BODY_TIMEOUT, 60000).
 -define(DEFAULT_IDLE_TIMEOUT, 60000).
+-define(DEFAULT_HIBERNATE_AFTER, 1000).
 -define(DEFAULT_REQUEST_TIMEOUT, 30000).
 -define(DEFAULT_DRAIN_TIMEOUT, 10000).
 -define(DEFAULT_DRAIN_GOAWAY_DELAY, 5000).

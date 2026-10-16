@@ -85,8 +85,8 @@ by the zero-timeout receive).
     no_return().
 h1_wake(Parent, Debug, State, Timer) ->
     case nhttp_conn:cancel_hibernate_timer(Timer) of
-        ok -> h1_receive(Parent, Debug, State, h1_head_timeout(State));
-        expired -> h1_receive(Parent, Debug, State, 0)
+        ok -> h1_loop(Parent, Debug, State);
+        expired -> h1_receive(Parent, Debug, State, nhttp_conn:idle_deadline(0))
     end.
 
 -spec system_code_change(#state{}, module(), term(), term()) -> {ok, #state{}}.
@@ -103,35 +103,27 @@ system_terminate(Reason, _Parent, _Debug, State) ->
 %% INTERNAL FUNCTIONS - HTTP/1.1 LOOP
 %%%-----------------------------------------------------------------------------
 -doc """
-Head-wait block point. A quiescent connection (empty buffer, no head in
-flight, empty mailbox) hibernates here: this is the canonical idle
-keep-alive connection, and the full-sweep GC releases the heap and any
-refc binary holds for the price of one wake-up GC amortized by network
-latency. The `after` deadline is carried across hibernation by the timer
-from `nhttp_conn:start_hibernate_timer/1`.
+Head-wait block point. With no head in flight the receive waits the
+`hibernate` timeout, capped by the idle deadline. A keep-alive connection
+that is serving requests re-enters here per request and never
+hibernates. One that saw no traffic for that long is the canonical idle
+keep-alive connection: it hibernates for the rest of the idle budget,
+carried across the hibernation by the timer from
+`nhttp_conn:start_hibernate_timer/1`, and the full-sweep GC releases the
+heap and any refc binary holds. With a head partially buffered the
+absolute `request_timeout` deadline caps the wait instead.
 """.
 -spec h1_loop(pid(), [sys:debug_option()], #state{}) -> no_return().
-h1_loop(Parent, Debug, State) ->
-    case hibernate_eligible(State) of
-        true -> hibernate(Parent, Debug, State);
-        false -> h1_receive(Parent, Debug, State, h1_head_timeout(State))
-    end.
+h1_loop(Parent, Debug, #state{idle_timeout = IdleTimeout} = State) ->
+    h1_receive(Parent, Debug, State, nhttp_conn:idle_deadline(IdleTimeout)).
 
--spec hibernate_eligible(#state{}) -> boolean().
-hibernate_eligible(#state{
-    protocol_state = #h1_state{buffer = <<>>, head_deadline_at = undefined}
-}) ->
-    nhttp_conn:mailbox_empty();
-hibernate_eligible(#state{}) ->
-    false.
-
--spec hibernate(pid(), [sys:debug_option()], #state{}) -> no_return().
-hibernate(Parent, Debug, #state{idle_timeout = IdleTimeout} = State) ->
-    Timer = nhttp_conn:start_hibernate_timer(IdleTimeout),
+-spec hibernate(pid(), [sys:debug_option()], #state{}, timeout()) -> no_return().
+hibernate(Parent, Debug, State, IdleRemaining) ->
+    Timer = nhttp_conn:start_hibernate_timer(IdleRemaining),
     proc_lib:hibernate(?MODULE, h1_wake, [Parent, Debug, State, Timer]).
 
--spec h1_receive(pid(), [sys:debug_option()], #state{}, timeout()) -> no_return().
-h1_receive(Parent, Debug, State, HeadTimeout) ->
+-spec h1_receive(pid(), [sys:debug_option()], #state{}, nhttp_conn:deadline()) -> no_return().
+h1_receive(Parent, Debug, State, IdleDeadline) ->
     receive
         {tcp, _Socket, Data} ->
             handle_h1_data(Parent, Debug, State, Data);
@@ -151,34 +143,50 @@ h1_receive(Parent, Debug, State, HeadTimeout) ->
             nhttp_conn:stop(normal, State);
         {'EXIT', Parent, Reason} ->
             nhttp_conn:stop_parent(Reason, State)
-    after HeadTimeout ->
-        handle_h1_head_timeout(State)
+    after h1_head_timeout(State, IdleDeadline) ->
+        handle_h1_head_timeout(Parent, Debug, State, IdleDeadline)
     end.
 
 -doc """
 Effective wait while receiving a request head. With no head in flight the
-keep-alive `idle_timeout` governs; once a head is partially buffered the
-absolute `request_timeout` deadline caps total receive time, so a
+quiescence wait governs; once a head is partially buffered the absolute
+`request_timeout` deadline caps the time left to the idle deadline, so a
 per-packet drip (slowloris) cannot re-arm the wait forever.
 """.
--spec h1_head_timeout(#state{}) -> timeout().
-h1_head_timeout(#state{
-    protocol_state = #h1_state{head_deadline_at = undefined}, idle_timeout = IdleTimeout
-}) ->
-    IdleTimeout;
-h1_head_timeout(#state{
-    protocol_state = #h1_state{head_deadline_at = Deadline}, idle_timeout = IdleTimeout
-}) ->
-    Now = erlang:monotonic_time(millisecond),
-    min(IdleTimeout, max(0, Deadline - Now)).
-
--spec handle_h1_head_timeout(#state{}) -> no_return().
-handle_h1_head_timeout(
-    #state{protocol_state = #h1_state{head_deadline_at = undefined}} = State
+-spec h1_head_timeout(#state{}, nhttp_conn:deadline()) -> timeout().
+h1_head_timeout(
+    #state{
+        protocol_state = #h1_state{head_deadline_at = undefined},
+        hibernate_after = HibernateAfter
+    },
+    IdleDeadline
 ) ->
-    nhttp_conn:stop(idle_timeout, State);
+    nhttp_conn:quiescence_wait(HibernateAfter, IdleDeadline);
+h1_head_timeout(#state{protocol_state = #h1_state{head_deadline_at = Deadline}}, IdleDeadline) ->
+    min(nhttp_conn:deadline_remaining(IdleDeadline), nhttp_conn:deadline_remaining(Deadline)).
+
+-spec handle_h1_head_timeout(pid(), [sys:debug_option()], #state{}, nhttp_conn:deadline()) ->
+    no_return().
 handle_h1_head_timeout(
-    #state{protocol_state = #h1_state{head_deadline_at = Deadline} = H1} = State
+    Parent,
+    Debug,
+    #state{protocol_state = #h1_state{head_deadline_at = undefined}} = State,
+    IdleDeadline
+) ->
+    case nhttp_conn:deadline_remaining(IdleDeadline) of
+        0 ->
+            nhttp_conn:stop(idle_timeout, State);
+        IdleRemaining ->
+            case nhttp_conn:mailbox_empty() of
+                true -> hibernate(Parent, Debug, State, IdleRemaining);
+                false -> h1_receive(Parent, Debug, State, IdleDeadline)
+            end
+    end;
+handle_h1_head_timeout(
+    _Parent,
+    _Debug,
+    #state{protocol_state = #h1_state{head_deadline_at = Deadline} = H1} = State,
+    _IdleDeadline
 ) ->
     Now = erlang:monotonic_time(millisecond),
     case Now >= Deadline of

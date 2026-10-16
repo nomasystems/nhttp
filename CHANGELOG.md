@@ -7,8 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `timeouts => #{hibernate => timeout()}`: the quiet time after which a connection with nothing in flight hibernates. Default 1000 ms. `0` hibernates on every quiet moment, `infinity` never
+
 ### Changed
 
+- A connection hibernates after the `hibernate` timeout of quiet, not after every request or WebSocket frame. The idle timeout still fires on time: the quiet wait consumes part of the idle budget and the hibernation timer gets the rest
 - Requires `nhttp_lib` 1.3.0
 - WebSocket frames on HTTP/1.1, HTTP/2 and HTTP/3 are decoded with `nhttp_ws:feed/2`. The decoder keeps the partial frame, so the server holds no WebSocket buffer of its own
 
