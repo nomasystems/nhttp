@@ -154,11 +154,12 @@ on. Armed here rather than at stream construction because
 """.
 -spec arm_decoder(#state{}, nhttp_lib:stream_id()) -> #state{}.
 arm_decoder(State, StreamId) ->
-    case view(State, StreamId) of
+    case get_ws(State, StreamId) of
         undefined ->
             State;
-        #{runtime_opts := Opts} ->
-            set_decoder(State, StreamId, nhttp_ws:decoder_new(server, Opts))
+        #ws_state{} = Ws ->
+            Dec = nhttp_ws:decoder_new(server, nhttp_conn_ws:runtime_opts(Ws)),
+            set_decoder(State, StreamId, Dec)
     end.
 
 -spec call_send(
@@ -180,39 +181,38 @@ call_send(State, From, Ref, StreamId, Frame) ->
 
 -spec dispatch_frame(#state{}, nhttp_lib:stream_id(), nhttp_ws:ws_message()) -> #state{}.
 dispatch_frame(#state{handler = Handler} = State, StreamId, Message) ->
-    case view(State, StreamId) of
+    case get_ws(State, StreamId) of
         undefined ->
             State;
-        View ->
-            Actions = nhttp_conn_ws:dispatch_frame(
-                nhttp_conn_h3:log_ctx(State), Message, View, Handler
+        #ws_state{} = Ws ->
+            {Ws1, Actions} = nhttp_conn_ws:dispatch_frame(
+                nhttp_conn_h3:log_ctx(State), Message, Ws, Handler
             ),
-            interpret(State, StreamId, Actions)
+            interpret(put_ws(State, StreamId, Ws1), StreamId, Actions)
     end.
 
 -spec dispatch_info(#state{}, nhttp_lib:stream_id(), term()) -> #state{}.
 dispatch_info(#state{handler = Handler} = State, StreamId, Msg) ->
-    case view(State, StreamId) of
+    case get_ws(State, StreamId) of
         undefined ->
             State;
-        View ->
-            Actions = nhttp_conn_ws:dispatch_info(
-                nhttp_conn_h3:log_ctx(State), Msg, View, Handler
+        #ws_state{} = Ws ->
+            {Ws1, Actions} = nhttp_conn_ws:dispatch_info(
+                nhttp_conn_h3:log_ctx(State), Msg, Ws, Handler
             ),
-            interpret(State, StreamId, Actions)
+            interpret(put_ws(State, StreamId, Ws1), StreamId, Actions)
     end.
 
 -spec finish(#state{}, nhttp_lib:stream_id(), nhttp_handler:ws_close_reason()) -> #state{}.
 finish(#state{handler = Handler} = State, StreamId, WsReason) ->
-    case view(State, StreamId) of
+    case get_ws(State, StreamId) of
         undefined ->
             drop_stream(State, StreamId);
-        View ->
-            Actions = nhttp_conn_ws:close_lifecycle(
-                nhttp_conn_h3:log_ctx(State), WsReason, View, Handler
+        #ws_state{} = Ws ->
+            #ws_state{} = nhttp_conn_ws:close_lifecycle(
+                nhttp_conn_h3:log_ctx(State), WsReason, Ws, Handler
             ),
-            State1 = interpret_no_close(State, StreamId, Actions),
-            drop_stream(State1, StreamId)
+            drop_stream(State, StreamId)
     end.
 
 -spec open(#state{}, nhttp_lib:stream_id(), nhttp_ws:ws_session_opts()) -> #state{}.
@@ -253,13 +253,8 @@ open(
         requests_count = State#state.requests_count + 1
     },
     ok = nhttp_stats:incr_ws_session(),
-    case view(State2, StreamId) of
-        undefined ->
-            State2;
-        View ->
-            Actions = nhttp_conn_ws:open(nhttp_conn_h3:log_ctx(State2), View, Handler),
-            arm_decoder(interpret(State2, StreamId, Actions), StreamId)
-    end.
+    {Ws1, Actions} = nhttp_conn_ws:open(nhttp_conn_h3:log_ctx(State2), Ws0, Handler),
+    arm_decoder(interpret(put_ws(State2, StreamId, Ws1), StreamId, Actions), StreamId).
 
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - FRAME PROCESSING
@@ -304,21 +299,8 @@ set_decoder(State, StreamId, Dec) ->
     end.
 
 %%%-----------------------------------------------------------------------------
-%% INTERNAL FUNCTIONS - VIEW + ACTION INTERPRETER
+%% INTERNAL FUNCTIONS - ACTION INTERPRETER
 %%%-----------------------------------------------------------------------------
--spec apply_view(#state{}, nhttp_lib:stream_id(), nhttp_conn_ws:session_view()) -> #state{}.
-apply_view(State, StreamId, View) ->
-    #{handler_state := SState, runtime_opts := Opts} = View,
-    #{deliver_ping := DP, deliver_pong := DG, max_message_size := MS} = Opts,
-    update(State, StreamId, fun(Ws) ->
-        Ws#ws_state{
-            handler_state = SState,
-            deliver_ping = DP,
-            deliver_pong = DG,
-            max_message_size = MS
-        }
-    end).
-
 -spec interpret(#state{}, nhttp_lib:stream_id(), nhttp_conn_ws:actions()) -> #state{}.
 interpret(State, _StreamId, []) ->
     State;
@@ -328,41 +310,8 @@ interpret(State, StreamId, [{send_frame, Msg} | Rest]) ->
 interpret(State, StreamId, [{send_close, Code, Reason} | Rest]) ->
     State1 = send_close(State, StreamId, Code, Reason),
     interpret(State1, StreamId, Rest);
-interpret(State, StreamId, [{update_view, View} | Rest]) ->
-    State1 = apply_view(State, StreamId, View),
-    interpret(State1, StreamId, Rest);
 interpret(State, StreamId, [{close_session, WsReason} | _Rest]) ->
     finish(State, StreamId, WsReason).
-
--spec interpret_no_close(#state{}, nhttp_lib:stream_id(), nhttp_conn_ws:actions()) -> #state{}.
-interpret_no_close(State, _StreamId, []) ->
-    State;
-interpret_no_close(State, StreamId, [{update_view, View} | Rest]) ->
-    State1 = apply_view(State, StreamId, View),
-    interpret_no_close(State1, StreamId, Rest).
-
--spec view(#state{}, nhttp_lib:stream_id()) -> nhttp_conn_ws:session_view() | undefined.
-view(State, StreamId) ->
-    case get_ws(State, StreamId) of
-        undefined ->
-            undefined;
-        #ws_state{
-            session = Session,
-            handler_state = SState,
-            deliver_ping = DP,
-            deliver_pong = DG,
-            max_message_size = MS
-        } ->
-            #{
-                handler_state => SState,
-                runtime_opts => #{
-                    deliver_ping => DP,
-                    deliver_pong => DG,
-                    max_message_size => MS
-                },
-                session => Session
-            }
-    end.
 
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - STREAM MAP HELPERS
@@ -392,11 +341,11 @@ get_ws(#state{h3_streams = Streams}, StreamId) ->
         _ -> undefined
     end.
 
--spec update(#state{}, nhttp_lib:stream_id(), fun((#ws_state{}) -> #ws_state{})) -> #state{}.
-update(#state{h3_streams = Streams} = State, StreamId, F) ->
+-spec put_ws(#state{}, nhttp_lib:stream_id(), #ws_state{}) -> #state{}.
+put_ws(#state{h3_streams = Streams} = State, StreamId, Ws) ->
     case maps:get(StreamId, Streams, undefined) of
-        #h3_stream{ws = #ws_state{} = Ws} = Stream ->
-            NewStream = Stream#h3_stream{ws = F(Ws)},
+        #h3_stream{ws = #ws_state{}} = Stream ->
+            NewStream = Stream#h3_stream{ws = Ws},
             State#state{h3_streams = Streams#{StreamId => NewStream}};
         _ ->
             State

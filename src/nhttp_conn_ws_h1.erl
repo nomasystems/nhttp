@@ -41,8 +41,8 @@
 -doc """
 Entry point for the WebSocket session. Called by
 `nhttp_conn_h1:handle_ws_upgrade/4` after the `101 Switching Protocols`
-response is on the wire and the socket is in `{packet, raw}, {active, once}`
-mode.
+response is on the wire and the socket is in `{packet, raw}, {active, N}`
+mode. The loop arms the socket again on each `tcp_passive` or `ssl_passive`.
 
 Builds the `#ws_state{}` session, fires `handle_ws_open/2` (if exported) via
 the dispatcher, applies any runtime opts the handler returned, then enters
@@ -122,6 +122,10 @@ ws_receive(Parent, Debug, #state{hibernate_after = HibernateAfter} = State, Idle
             handle_data(Parent, Debug, State, Data);
         {ssl, _Socket, Data} ->
             handle_data(Parent, Debug, State, Data);
+        {tcp_passive, _Socket} ->
+            activate(Parent, Debug, State);
+        {ssl_passive, _Socket} ->
+            activate(Parent, Debug, State);
         {tcp_closed, _Socket} ->
             finish({transport, closed}, normal, State);
         {ssl_closed, _Socket} ->
@@ -158,8 +162,8 @@ on. Armed here rather than at session construction because
 """.
 -spec arm_decoder(#state{}) -> #state{}.
 arm_decoder(#state{protocol_state = #h1_state{h1_ws = #ws_state{} = Ws} = H1} = State) ->
-    #{runtime_opts := Opts} = view(Ws),
-    State#state{protocol_state = H1#h1_state{ws_decoder = nhttp_ws:decoder_new(server, Opts)}}.
+    Dec = nhttp_ws:decoder_new(server, nhttp_conn_ws:runtime_opts(Ws)),
+    State#state{protocol_state = H1#h1_state{ws_decoder = Dec}}.
 
 -spec drain_peer(#state{}) -> ok.
 drain_peer(#state{socket = undefined}) ->
@@ -194,26 +198,12 @@ finish_parent(WsReason, Reason, State) ->
 -spec finish_state(nhttp_handler:ws_close_reason(), #state{}) -> #state{}.
 finish_state(
     WsReason,
-    #state{handler = Handler, protocol_state = #h1_state{h1_ws = #ws_state{} = Ws}} = State
+    #state{handler = Handler, protocol_state = #h1_state{h1_ws = #ws_state{} = Ws} = H1} = State
 ) ->
-    View = view(Ws),
-    Actions = nhttp_conn_ws:close_lifecycle(nhttp_conn:log_ctx(State), WsReason, View, Handler),
-    State1 =
-        case interpret(Actions, State) of
-            {ok, S} -> S;
-            {close, S, _} -> S
-        end,
-    #state{protocol_state = #h1_state{h1_ws = WsAfter} = H1After} = State1,
-    NewSState =
-        case WsAfter of
-            #ws_state{handler_state = LatestS} -> LatestS;
-            undefined -> State1#state.handler_state
-        end,
+    #ws_state{handler_state = SState} =
+        nhttp_conn_ws:close_lifecycle(nhttp_conn:log_ctx(State), WsReason, Ws, Handler),
     ok = nhttp_stats:decr_ws_session(),
-    State1#state{
-        handler_state = NewSState,
-        protocol_state = H1After#h1_state{h1_ws = undefined}
-    }.
+    State#state{handler_state = SState, protocol_state = H1#h1_state{h1_ws = undefined}}.
 
 -spec open(#state{}) -> #state{} | no_return().
 open(
@@ -229,36 +219,41 @@ open(
         deliver_pong = false,
         max_message_size = infinity
     },
-    State1 = State#state{protocol_state = H1#h1_state{h1_ws = Ws0}},
     ok = nhttp_stats:incr_ws_session(),
-    View0 = view(Ws0),
-    Actions = nhttp_conn_ws:open(nhttp_conn:log_ctx(State1), View0, Handler),
-    arm_decoder(apply_actions(State1, Actions)).
+    {Ws1, Actions} = nhttp_conn_ws:open(nhttp_conn:log_ctx(State), Ws0, Handler),
+    arm_decoder(apply_actions(State#state{protocol_state = H1#h1_state{h1_ws = Ws1}}, Actions)).
 
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - INCOMING DATA
 %%%-----------------------------------------------------------------------------
 -spec activate(pid(), [sys:debug_option()], #state{}) -> no_return().
 activate(Parent, Debug, State) ->
-    case nhttp_conn:activate(State) of
+    case nhttp_conn:activate_n(State, []) of
         ok -> loop(Parent, Debug, State);
         {stop, Reason} -> finish({transport, closed}, Reason, State)
     end.
 
--spec dispatch_frame(#state{}, nhttp_ws:ws_message()) -> #state{}.
-dispatch_frame(
-    #state{handler = Handler, protocol_state = #h1_state{h1_ws = #ws_state{} = Ws}} = State,
-    Message
+-spec dispatch_frames(#state{}, [nhttp_ws:ws_message()], iodata()) -> {#state{}, iodata()}.
+dispatch_frames(State, [], Out) ->
+    {State, Out};
+dispatch_frames(
+    #state{handler = Handler, protocol_state = #h1_state{h1_ws = #ws_state{} = Ws} = H1} = State,
+    [Message | Rest],
+    Out
 ) ->
-    Actions = nhttp_conn_ws:dispatch_frame(nhttp_conn:log_ctx(State), Message, view(Ws), Handler),
-    apply_actions(State, Actions).
+    {Ws1, Actions} = nhttp_conn_ws:dispatch_frame(nhttp_conn:log_ctx(State), Message, Ws, Handler),
+    State1 = State#state{protocol_state = H1#h1_state{h1_ws = Ws1}},
+    case encode_actions(Actions, Out) of
+        {ok, Out1} -> dispatch_frames(State1, Rest, Out1);
+        {close, Out1, WsReason} -> flush_and_finish(State1, Out1, WsReason)
+    end.
 
--spec dispatch_frames(#state{}, [nhttp_ws:ws_message()]) -> #state{}.
-dispatch_frames(State, []) ->
-    State;
-dispatch_frames(State, [Message | Rest]) ->
-    dispatch_frames(dispatch_frame(State, Message), Rest).
-
+-doc """
+Decode one socket read and dispatch every complete message in it. The
+frames the read produces leave in one socket write after the last
+message, so a read that holds many frames costs one send, and control
+replies and the close keep their order within it.
+""".
 -spec handle_data(pid(), [sys:debug_option()], #state{}, binary()) -> no_return().
 handle_data(
     Parent, Debug, #state{protocol_state = #h1_state{ws_decoder = Dec} = H1} = State, Data
@@ -266,11 +261,13 @@ handle_data(
     case nhttp_ws:feed(Data, Dec) of
         {ok, Messages, NewDec} ->
             State1 = State#state{protocol_state = H1#h1_state{ws_decoder = NewDec}},
-            activate(Parent, Debug, dispatch_frames(State1, Messages));
+            {State2, Out} = dispatch_frames(State1, Messages, []),
+            ok = flush(State2, Out),
+            loop(Parent, Debug, State2);
         {error, Reason, Messages} ->
-            State1 = dispatch_frames(State, Messages),
+            {State1, Out} = dispatch_frames(State, Messages, []),
             {Code, ReasonBin} = nhttp_conn_ws:decode_error_close(Reason),
-            send_close(State1, Code, ReasonBin),
+            ok = flush(State1, [Out, nhttp_ws:encode({close, Code, ReasonBin})]),
             finish({fail, Code, ReasonBin}, {ws_error, Reason}, State1)
     end.
 
@@ -281,12 +278,11 @@ handle_data(
 dispatch_info_loop(
     Parent,
     Debug,
-    #state{handler = Handler, protocol_state = #h1_state{h1_ws = #ws_state{} = Ws}} = State,
+    #state{handler = Handler, protocol_state = #h1_state{h1_ws = #ws_state{} = Ws} = H1} = State,
     Msg
 ) ->
-    View = view(Ws),
-    Actions = nhttp_conn_ws:dispatch_info(nhttp_conn:log_ctx(State), Msg, View, Handler),
-    State1 = apply_actions(State, Actions),
+    {Ws1, Actions} = nhttp_conn_ws:dispatch_info(nhttp_conn:log_ctx(State), Msg, Ws, Handler),
+    State1 = apply_actions(State#state{protocol_state = H1#h1_state{h1_ws = Ws1}}, Actions),
     loop(Parent, Debug, State1).
 
 -spec handle_call(#state{}, gen_server:from(), term()) -> #state{}.
@@ -336,68 +332,40 @@ handle_info_loop(Parent, Debug, State, Msg) ->
     dispatch_info_loop(Parent, Debug, State, Msg).
 
 %%%-----------------------------------------------------------------------------
-%% INTERNAL FUNCTIONS - VIEW + ACTION INTERPRETER
+%% INTERNAL FUNCTIONS - ACTION INTERPRETER
 %%%-----------------------------------------------------------------------------
 -spec apply_actions(#state{}, nhttp_conn_ws:actions()) ->
     #state{} | no_return().
 apply_actions(State, Actions) ->
-    case interpret(Actions, State) of
-        {ok, NewState} ->
-            NewState;
-        {close, NewState, WsReason} ->
-            finish(WsReason, ws_reason_to_exit(WsReason), NewState)
+    case encode_actions(Actions, []) of
+        {ok, Out} ->
+            ok = flush(State, Out),
+            State;
+        {close, Out, WsReason} ->
+            flush_and_finish(State, Out, WsReason)
     end.
 
--spec from_view(nhttp_conn_ws:session_view(), #ws_state{}) -> #ws_state{}.
-from_view(View, Ws) ->
-    #{handler_state := SState, runtime_opts := Opts} = View,
-    #{deliver_ping := DP, deliver_pong := DG, max_message_size := MS} = Opts,
-    Ws#ws_state{
-        handler_state = SState,
-        deliver_ping = DP,
-        deliver_pong = DG,
-        max_message_size = MS
-    }.
+-doc """
+Append the wire bytes of each send action to `Out`, in order, up to the
+first `close_session`.
+""".
+-spec encode_actions(nhttp_conn_ws:actions(), iodata()) ->
+    {ok, iodata()} | {close, iodata(), nhttp_handler:ws_close_reason()}.
+encode_actions([], Out) ->
+    {ok, Out};
+encode_actions([{send_frame, Msg} | Rest], Out) ->
+    encode_actions(Rest, [Out, nhttp_ws:encode(Msg)]);
+encode_actions([{send_close, no_code, _} | Rest], Out) ->
+    encode_actions(Rest, [Out, nhttp_ws:encode(close)]);
+encode_actions([{send_close, Code, Reason} | Rest], Out) ->
+    encode_actions(Rest, [Out, nhttp_ws:encode({close, Code, Reason})]);
+encode_actions([{close_session, WsReason} | _Rest], Out) ->
+    {close, Out, WsReason}.
 
--spec interpret(nhttp_conn_ws:actions(), #state{}) ->
-    {ok, #state{}} | {close, #state{}, nhttp_handler:ws_close_reason()}.
-interpret([], State) ->
-    {ok, State};
-interpret([{send_frame, Msg} | Rest], State) ->
-    send_msg_async(State, Msg),
-    interpret(Rest, State);
-interpret([{send_close, no_code, _} | Rest], State) ->
-    send_close_no_code(State),
-    interpret(Rest, State);
-interpret([{send_close, Code, Reason} | Rest], State) ->
-    send_close(State, Code, Reason),
-    interpret(Rest, State);
-interpret(
-    [{update_view, View} | Rest],
-    #state{protocol_state = #h1_state{h1_ws = #ws_state{} = Ws} = H1} = State
-) ->
-    NewWs = from_view(View, Ws),
-    interpret(Rest, State#state{protocol_state = H1#h1_state{h1_ws = NewWs}});
-interpret([{close_session, WsReason} | _Rest], State) ->
-    {close, State, WsReason}.
-
--spec view(#ws_state{}) -> nhttp_conn_ws:session_view().
-view(#ws_state{
-    session = Session,
-    handler_state = SState,
-    deliver_ping = DP,
-    deliver_pong = DG,
-    max_message_size = MS
-}) ->
-    #{
-        handler_state => SState,
-        runtime_opts => #{
-            deliver_ping => DP,
-            deliver_pong => DG,
-            max_message_size => MS
-        },
-        session => Session
-    }.
+-spec flush_and_finish(#state{}, iodata(), nhttp_handler:ws_close_reason()) -> no_return().
+flush_and_finish(State, Out, WsReason) ->
+    ok = flush(State, Out),
+    finish(WsReason, ws_reason_to_exit(WsReason), State).
 
 -spec ws_reason_to_exit(nhttp_handler:ws_close_reason()) -> term().
 ws_reason_to_exit({fail, _, ReasonBin}) -> {ws_error, ReasonBin};
@@ -406,24 +374,22 @@ ws_reason_to_exit(_) -> normal.
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - SEND HELPERS
 %%%-----------------------------------------------------------------------------
--spec send_close(#state{}, nhttp_ws:close_code(), binary()) -> ok.
-send_close(State, Code, Reason) ->
-    nhttp_conn:sock_send(State, nhttp_ws:encode({close, Code, Reason})).
-
--spec send_close_no_code(#state{}) -> ok.
-send_close_no_code(State) ->
-    nhttp_conn:sock_send(State, nhttp_ws:encode(close)).
-
--spec send_msg(#state{}, nhttp_ws:ws_message()) -> ok | {error, term()}.
-send_msg(#state{socket = Socket}, Msg) ->
-    nhttp_sock:send(Socket, nhttp_ws:encode(Msg)).
-
--spec send_msg_async(#state{}, nhttp_ws:ws_message()) -> ok.
-send_msg_async(State, Msg) ->
-    case send_msg(State, Msg) of
+-spec flush(#state{}, iodata()) -> ok.
+flush(_State, []) ->
+    ok;
+flush(#state{socket = Socket} = State, Out) ->
+    case nhttp_sock:send(Socket, Out) of
         ok ->
             ok;
         {error, Reason} ->
             nhttp_log:ws_send_failed(nhttp_conn:log_ctx(State), Reason),
             ok
     end.
+
+-spec send_close(#state{}, nhttp_ws:close_code(), binary()) -> ok.
+send_close(State, Code, Reason) ->
+    nhttp_conn:sock_send(State, nhttp_ws:encode({close, Code, Reason})).
+
+-spec send_msg(#state{}, nhttp_ws:ws_message()) -> ok | {error, term()}.
+send_msg(#state{socket = Socket}, Msg) ->
+    nhttp_sock:send(Socket, nhttp_ws:encode(Msg)).
