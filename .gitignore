@@ -51,5 +51,5 @@ priv/h3spec
 test/conf/*.pem
 test/conf/*.key
 
-# Autobahn WebSocket compliance reports
-autobahn-reports/
+# Compliance reports (h2spec JUnit, Autobahn)
+compliance-reports/

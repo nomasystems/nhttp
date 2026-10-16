@@ -21,7 +21,12 @@ AUTOBAHN_IMAGE := nhttp/autobahn:$(AUTOBAHN_VERSION)
 AUTOBAHN_DOCKERFILE := priv/Dockerfile.autobahn
 AUTOBAHN_SPEC := priv/autobahn/fuzzingclient.json
 AUTOBAHN_GATE := priv/autobahn/gate.sh
-AUTOBAHN_REPORTS := autobahn-reports
+# Each suite starts its server through this script and exits with the
+# status of the runner, so a failed suite fails the target.
+COMPLIANCE_RUN := REBAR3=$(REBAR3) priv/compliance/run.sh
+COMPLIANCE_REPORTS := compliance-reports
+AUTOBAHN_REPORTS := $(COMPLIANCE_REPORTS)/autobahn
+DOCKER_USER := --user $(shell id -u):$(shell id -g)
 # h3spec only ships an x86_64 Linux binary; force amd64 so arm64 hosts
 # (e.g. Apple Silicon, arm64 Linux with qemu-user) can still run it.
 DOCKER_PLATFORM := linux/amd64
@@ -44,10 +49,6 @@ TEST_CERTS_DIR := test/conf
 TEST_CERTS_MARKER := $(TEST_CERTS_DIR)/server.pem
 TEST_CERTS_SCRIPT := $(TEST_CERTS_DIR)/gen_test_certs.sh
 
-# Temp files for server coordination
-COMPLIANCE_PORT_FILE := .compliance_port
-COMPLIANCE_PID_FILE := .compliance_pid
-
 #==============================================================================
 # Core targets
 #==============================================================================
@@ -59,8 +60,7 @@ compile:
 
 clean:
 	$(REBAR3) clean
-	@rm -f .compliance_port .compliance_pid
-	@rm -rf $(AUTOBAHN_REPORTS)
+	@rm -rf $(COMPLIANCE_REPORTS)
 
 check: certs
 	$(REBAR3) check
@@ -103,30 +103,8 @@ binopt:
 h1-compliance: h1spec-image
 	@echo "=== HTTP/1.1 Compliance Tests with h1spec (Docker) ==="
 	@$(REBAR3) as test compile
-	@rm -f $(COMPLIANCE_PORT_FILE) $(COMPLIANCE_PID_FILE)
-	@echo "Starting HTTP/1.1 server (plaintext)..."
-	@( tail -f /dev/null | $(REBAR3) as test shell --eval 'nhttp_h1_compliance:start().' ) > $(COMPLIANCE_PORT_FILE) 2>&1 & echo $$! > $(COMPLIANCE_PID_FILE)
-	@for _ in $$(seq 1 100); do \
-		grep -qE 'PORT:[0-9]+' $(COMPLIANCE_PORT_FILE) 2>/dev/null && break; \
-		sleep 0.1; \
-	done
-	@PORT=$$(grep -oE 'PORT:[0-9]+' $(COMPLIANCE_PORT_FILE) | head -1 | cut -d: -f2); \
-	if [ -z "$$PORT" ]; then \
-		echo "Error: Could not parse port from server output:"; \
-		cat $(COMPLIANCE_PORT_FILE); \
-		kill $$(cat $(COMPLIANCE_PID_FILE)) 2>/dev/null; \
-		rm -f $(COMPLIANCE_PORT_FILE) $(COMPLIANCE_PID_FILE); \
-		exit 1; \
-	fi; \
-	echo "Server running on port $$PORT"; \
-	echo ""; \
-	docker run --rm $(DOCKER_NET_ARGS) $(H1SPEC_IMAGE) \
-		$(COMPLIANCE_TARGET) $$PORT || true
-	@-kill $$(cat $(COMPLIANCE_PID_FILE)) 2>/dev/null
-	@-pkill -f 'nhttp_h1_compliance:start' 2>/dev/null
-	@rm -f $(COMPLIANCE_PORT_FILE) $(COMPLIANCE_PID_FILE)
-	@echo ""
-	@echo "=== HTTP/1.1 Compliance Tests Complete ==="
+	@$(COMPLIANCE_RUN) nhttp_h1_compliance \
+		'docker run --rm $(DOCKER_NET_ARGS) $(H1SPEC_IMAGE) $(COMPLIANCE_TARGET) $$PORT'
 
 h1spec-image:
 	@command -v docker >/dev/null 2>&1 || { \
@@ -141,30 +119,11 @@ h1spec-image:
 h2-compliance: certs h2spec-image
 	@echo "=== HTTP/2 RFC 9113 Compliance Tests with h2spec (Docker) ==="
 	@$(REBAR3) as test compile
-	@rm -f $(COMPLIANCE_PORT_FILE) $(COMPLIANCE_PID_FILE)
-	@echo "Starting HTTP/2 server (TLS)..."
-	@( tail -f /dev/null | $(REBAR3) as test shell --eval 'nhttp_compliance:start().' ) > $(COMPLIANCE_PORT_FILE) 2>&1 & echo $$! > $(COMPLIANCE_PID_FILE)
-	@for _ in $$(seq 1 100); do \
-		grep -qE 'PORT:[0-9]+' $(COMPLIANCE_PORT_FILE) 2>/dev/null && break; \
-		sleep 0.1; \
-	done
-	@PORT=$$(grep -oE 'PORT:[0-9]+' $(COMPLIANCE_PORT_FILE) | head -1 | cut -d: -f2); \
-	if [ -z "$$PORT" ]; then \
-		echo "Error: Could not parse port from server output:"; \
-		cat $(COMPLIANCE_PORT_FILE); \
-		kill $$(cat $(COMPLIANCE_PID_FILE)) 2>/dev/null; \
-		rm -f $(COMPLIANCE_PORT_FILE) $(COMPLIANCE_PID_FILE); \
-		exit 1; \
-	fi; \
-	echo "Server running on port $$PORT"; \
-	echo ""; \
-	docker run --rm $(DOCKER_NET_ARGS) $(H2SPEC_IMAGE) \
-		-t -k -h $(COMPLIANCE_TARGET) -p $$PORT -o 5 || true
-	@-kill $$(cat $(COMPLIANCE_PID_FILE)) 2>/dev/null
-	@-pkill -f 'nhttp_compliance:start' 2>/dev/null
-	@rm -f $(COMPLIANCE_PORT_FILE) $(COMPLIANCE_PID_FILE)
-	@echo ""
-	@echo "=== Compliance Tests Complete ==="
+	@mkdir -p $(COMPLIANCE_REPORTS)
+	@$(COMPLIANCE_RUN) nhttp_compliance \
+		'docker run --rm $(DOCKER_NET_ARGS) $(DOCKER_USER) \
+			-v $(CURDIR)/$(COMPLIANCE_REPORTS):/reports $(H2SPEC_IMAGE) \
+			-t -k -h $(COMPLIANCE_TARGET) -p $$PORT -o 5 -j /reports/h2spec.xml'
 
 h2spec-image:
 	@command -v docker >/dev/null 2>&1 || { \
@@ -179,30 +138,9 @@ h2spec-image:
 h3-compliance: certs h3spec-image
 	@echo "=== HTTP/3 Compliance Tests with h3spec (Docker) ==="
 	@$(REBAR3) as test compile
-	@rm -f $(COMPLIANCE_PORT_FILE) $(COMPLIANCE_PID_FILE)
-	@echo "Starting HTTP/3 server (QUIC)..."
-	@( tail -f /dev/null | $(REBAR3) as test shell --eval 'nhttp_h3_compliance:start().' ) > $(COMPLIANCE_PORT_FILE) 2>&1 & echo $$! > $(COMPLIANCE_PID_FILE)
-	@for _ in $$(seq 1 100); do \
-		grep -qE 'PORT:[0-9]+' $(COMPLIANCE_PORT_FILE) 2>/dev/null && break; \
-		sleep 0.1; \
-	done
-	@PORT=$$(grep -oE 'PORT:[0-9]+' $(COMPLIANCE_PORT_FILE) | head -1 | cut -d: -f2); \
-	if [ -z "$$PORT" ]; then \
-		echo "Error: Could not parse port from server output:"; \
-		cat $(COMPLIANCE_PORT_FILE); \
-		kill $$(cat $(COMPLIANCE_PID_FILE)) 2>/dev/null; \
-		rm -f $(COMPLIANCE_PORT_FILE) $(COMPLIANCE_PID_FILE); \
-		exit 1; \
-	fi; \
-	echo "Server running on port $$PORT"; \
-	echo ""; \
-	docker run --rm --platform $(DOCKER_PLATFORM) $(DOCKER_NET_ARGS) $(H3SPEC_IMAGE) \
-		$(COMPLIANCE_TARGET) $$PORT -n -t 3000 || true
-	@-kill $$(cat $(COMPLIANCE_PID_FILE)) 2>/dev/null
-	@-pkill -f 'nhttp_h3_compliance:start' 2>/dev/null
-	@rm -f $(COMPLIANCE_PORT_FILE) $(COMPLIANCE_PID_FILE)
-	@echo ""
-	@echo "=== HTTP/3 Compliance Tests Complete ==="
+	@$(COMPLIANCE_RUN) nhttp_h3_compliance \
+		'docker run --rm --platform $(DOCKER_PLATFORM) $(DOCKER_NET_ARGS) $(H3SPEC_IMAGE) \
+			$(COMPLIANCE_TARGET) $$PORT -n -t 3000'
 
 h3spec-image:
 	@command -v docker >/dev/null 2>&1 || { \
@@ -220,34 +158,13 @@ ws-compliance: autobahn-image
 	@$(REBAR3) as test compile
 	@rm -rf $(AUTOBAHN_REPORTS)
 	@mkdir -p $(AUTOBAHN_REPORTS)
-	@rm -f $(COMPLIANCE_PORT_FILE) $(COMPLIANCE_PID_FILE)
-	@echo "Starting WebSocket server (plaintext)..."
-	@( tail -f /dev/null | $(REBAR3) as test shell --eval 'nhttp_ws_compliance:start().' ) > $(COMPLIANCE_PORT_FILE) 2>&1 & echo $$! > $(COMPLIANCE_PID_FILE)
-	@for _ in $$(seq 1 100); do \
-		grep -qE 'PORT:[0-9]+' $(COMPLIANCE_PORT_FILE) 2>/dev/null && break; \
-		sleep 0.1; \
-	done
-	@PORT=$$(grep -oE 'PORT:[0-9]+' $(COMPLIANCE_PORT_FILE) | head -1 | cut -d: -f2); \
-	if [ -z "$$PORT" ]; then \
-		echo "Error: Could not parse port from server output:"; \
-		cat $(COMPLIANCE_PORT_FILE); \
-		kill $$(cat $(COMPLIANCE_PID_FILE)) 2>/dev/null; \
-		rm -f $(COMPLIANCE_PORT_FILE) $(COMPLIANCE_PID_FILE); \
-		exit 1; \
-	fi; \
-	echo "Server running on port $$PORT"; \
-	echo ""; \
-	sed "s|ws://[^\"]*|ws://$(COMPLIANCE_TARGET):$$PORT/ws|" \
-		$(AUTOBAHN_SPEC) > $(AUTOBAHN_REPORTS)/fuzzingclient.json; \
-	docker run --rm $(DOCKER_NET_ARGS) --user $$(id -u):$$(id -g) \
-		-v $(CURDIR)/$(AUTOBAHN_REPORTS):/reports $(AUTOBAHN_IMAGE) \
-		wstest --mode fuzzingclient --spec /reports/fuzzingclient.json || true
-	@-kill $$(cat $(COMPLIANCE_PID_FILE)) 2>/dev/null
-	@-pkill -f 'nhttp_ws_compliance:start' 2>/dev/null
-	@rm -f $(COMPLIANCE_PORT_FILE) $(COMPLIANCE_PID_FILE)
-	@./$(AUTOBAHN_GATE) $(AUTOBAHN_REPORTS)
-	@echo ""
-	@echo "=== WebSocket Compliance Tests Complete ==="
+	@$(COMPLIANCE_RUN) nhttp_ws_compliance \
+		'sed "s|ws://[^\"]*|ws://$(COMPLIANCE_TARGET):$$PORT/ws|" \
+			$(AUTOBAHN_SPEC) > $(AUTOBAHN_REPORTS)/fuzzingclient.json \
+		&& docker run --rm $(DOCKER_NET_ARGS) $(DOCKER_USER) \
+			-v $(CURDIR)/$(AUTOBAHN_REPORTS):/reports $(AUTOBAHN_IMAGE) \
+			wstest --mode fuzzingclient --spec /reports/fuzzingclient.json; \
+		$(AUTOBAHN_GATE) $(AUTOBAHN_REPORTS)'
 
 autobahn-image:
 	@command -v docker >/dev/null 2>&1 || { \
@@ -291,8 +208,9 @@ help:
 	@echo "    make h3-compliance   - Run HTTP/3 tests (Docker: $(H3SPEC_IMAGE))"
 	@echo "    make ws-compliance   - Run WebSocket RFC 6455 tests (Docker: $(AUTOBAHN_IMAGE))"
 	@echo ""
-	@echo "  ws-compliance gates on the report it writes to $(AUTOBAHN_REPORTS)/;"
-	@echo "  read the detail in $(AUTOBAHN_REPORTS)/index.html."
+	@echo "  Each target exits with the status of its runner. Reports land in"
+	@echo "  $(COMPLIANCE_REPORTS)/: h2spec.xml (JUnit) and autobahn/index.html."
+	@echo "  make -k compliance runs every suite before it reports a failure."
 	@echo ""
 	@echo "  Requirement: Docker daemon running. On macOS/Windows, Docker Desktop."
 	@echo ""

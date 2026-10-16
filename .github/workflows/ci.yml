@@ -52,3 +52,37 @@ jobs:
         if: always()
         with:
           paths: '_build/test/logs/**/report.xml'
+
+  compliance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1.24.0
+        with:
+          otp-version: '28.0'
+          rebar3-version: '3.25.0'
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/rebar3
+            _build
+          key: ${{ runner.os }}-${{ runner.arch }}-28.0-3.25.0-${{ hashFiles('rebar.config', 'rebar.lock') }}
+
+      - run: make certs
+
+      - run: make -k compliance
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compliance-reports
+          path: compliance-reports/
+
+      - uses: test-summary/action@v2
+        if: always()
+        with:
+          paths: 'compliance-reports/h2spec.xml'

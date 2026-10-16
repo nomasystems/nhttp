@@ -20,7 +20,8 @@
 
 -export([
     init/1,
-    handle_request/2
+    handle_request/2,
+    handle_request_body/3
 ]).
 
 -define(DEFAULT_CERT_DIR, "test/conf").
@@ -71,6 +72,22 @@ start(Opts) ->
 init(_Args) ->
     {ok, #{}}.
 
--spec handle_request(nhttp_lib:request(), #{}) -> {reply, nhttp_lib:response(), #{}}.
+-doc """
+Consume a streaming request body before the reply. An early reply makes the
+connection reset the stream with NO_ERROR (RFC 9113 Section 8.1), and the
+codec then discards the frames that h2spec sends to provoke a stream error.
+""".
+-spec handle_request(nhttp_lib:request(), #{}) -> nhttp_handler:request_result(#{}).
+handle_request(#{body := streaming}, State) ->
+    {accept_body, unread, State};
 handle_request(_Req, State) ->
     {reply, nhttp_resp:ok(<<"hello">>), State}.
+
+-spec handle_request_body(nhttp_handler:body_event(), unread, #{}) ->
+    nhttp_handler:request_result(#{}).
+handle_request_body({data, _Chunk}, unread, State) ->
+    {accept_body, unread, State};
+handle_request_body({fin, _Trailers}, unread, State) ->
+    {reply, nhttp_resp:ok(<<"hello">>), State};
+handle_request_body({abort, Reason}, unread, State) ->
+    {abort, Reason, State}.
