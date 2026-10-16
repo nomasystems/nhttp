@@ -12,6 +12,8 @@
 
 -include("../src/nhttp_ws_codes.hrl").
 
+-define(ROUND_TRIPS_PAST_ACTIVE_N, 250).
+
 %%%-----------------------------------------------------------------------------
 %%% CT CALLBACKS
 %%%-----------------------------------------------------------------------------
@@ -84,7 +86,10 @@
     ws_invalid_utf8_closes_1007/1,
     ws_invalid_utf8_fragment_closes_early/1,
     ws_sys_get_status/1,
-    ws_server_drained_during_session/1
+    ws_server_drained_during_session/1,
+    ws_echo_past_active_count/1,
+    ws_tls_echo_past_active_count/1,
+    ws_one_write_many_frames_keeps_order/1
 ]).
 
 %%%-----------------------------------------------------------------------------
@@ -169,7 +174,10 @@ groups() ->
             ws_invalid_utf8_closes_1007,
             ws_invalid_utf8_fragment_closes_early,
             ws_sys_get_status,
-            ws_server_drained_during_session
+            ws_server_drained_during_session,
+            ws_echo_past_active_count,
+            ws_tls_echo_past_active_count,
+            ws_one_write_many_frames_keeps_order
         ]}
     ].
 
@@ -753,6 +761,43 @@ ws_server_drained_during_session(_Config) ->
     gen_tcp:close(Socket),
     nhttp:stop(Pid).
 
+ws_echo_past_active_count(_Config) ->
+    {ok, Pid, Socket} = ws_session(),
+    ok = echo_round_trips(gen_tcp, Socket, ?ROUND_TRIPS_PAST_ACTIVE_N),
+    gen_tcp:close(Socket),
+    nhttp:stop(Pid).
+
+ws_one_write_many_frames_keeps_order(_Config) ->
+    {ok, Pid, Socket} = ws_session(),
+    ok = gen_tcp:send(Socket, [
+        masked_frame(1, 1, <<"a">>),
+        masked_frame(1, 9, <<"p">>),
+        masked_frame(1, 2, <<"b">>),
+        masked_frame(1, 8, <<?WS_CLOSE_NORMAL:16>>)
+    ]),
+    Expected = <<16#81, 1, "a", 16#8A, 1, "p", 16#82, 1, "b", 16#88, 2, ?WS_CLOSE_NORMAL:16>>,
+    {ok, Received} = gen_tcp:recv(Socket, byte_size(Expected), 5000),
+    ?assertEqual(Expected, Received),
+    ?assertEqual({error, closed}, gen_tcp:recv(Socket, 0, 5000)),
+    nhttp:stop(Pid).
+
+ws_tls_echo_past_active_count(_Config) ->
+    {CertFile, KeyFile} = nhttp_test_helpers:certs(),
+    {ok, Pid, Port} = nhttp_test_helpers:start(#{
+        handler => ?MODULE,
+        versions => [http1_1],
+        telemetry => false,
+        tls => #{certfile => CertFile, keyfile => KeyFile}
+    }),
+    {ok, Socket} = ssl:connect(
+        "127.0.0.1", Port, [binary, {active, false}, {verify, verify_none}], 5000
+    ),
+    ok = ssl:send(Socket, ws_upgrade_request()),
+    {ok, <<"HTTP/1.1 101 ", _/binary>>} = ssl:recv(Socket, 0, 5000),
+    ok = echo_round_trips(ssl, Socket, ?ROUND_TRIPS_PAST_ACTIVE_N),
+    ssl:close(Socket),
+    nhttp:stop(Pid).
+
 %%%-----------------------------------------------------------------------------
 %%% HELPERS
 %%%-----------------------------------------------------------------------------
@@ -772,6 +817,15 @@ mask_loop(<<B, Rest/binary>>, <<K1, K2, K3, K4>> = Key, Idx, Acc) ->
             3 -> K4
         end,
     mask_loop(Rest, Key, Idx + 1, <<Acc/binary, (B bxor KeyByte)>>).
+
+echo_round_trips(_Transport, _Socket, 0) ->
+    ok;
+echo_round_trips(Transport, Socket, N) ->
+    Payload = integer_to_binary(N),
+    Len = byte_size(Payload),
+    ok = Transport:send(Socket, masked_frame(1, 1, Payload)),
+    {ok, <<16#81, Len, Payload:Len/binary>>} = Transport:recv(Socket, 2 + Len, 5000),
+    echo_round_trips(Transport, Socket, N - 1).
 
 masked_frame(Fin, Opcode, Payload) ->
     MaskKey = crypto:strong_rand_bytes(4),

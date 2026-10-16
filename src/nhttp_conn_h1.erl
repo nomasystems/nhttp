@@ -772,7 +772,7 @@ handle_ws_upgrade(
             end,
             case nhttp_sock:send(Socket, Response) of
                 ok ->
-                    case nhttp_conn:activate(State, [{packet, raw}]) of
+                    case nhttp_conn:activate_n(State, [{packet, raw}]) of
                         ok ->
                             nhttp_conn_ws_h1:start(
                                 Parent,

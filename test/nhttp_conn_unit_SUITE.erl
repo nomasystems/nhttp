@@ -9,6 +9,7 @@
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
 
+-include("../src/nhttp_conn_ws.hrl").
 -include("../src/nhttp_ws_codes.hrl").
 
 -compile([export_all, nowarn_export_all]).
@@ -155,60 +156,48 @@ ws_apply_runtime_opts_test(_Config) ->
     ).
 
 ws_oversize_test(_Config) ->
-    ?assertNot(nhttp_conn_ws:oversize(<<"data">>, #{max_message_size => infinity})),
-    ?assertNot(nhttp_conn_ws:oversize(<<"data">>, #{max_message_size => 10})),
-    ?assert(nhttp_conn_ws:oversize(<<"too long payload">>, #{max_message_size => 4})).
+    ?assertNot(nhttp_conn_ws:oversize(<<"data">>, infinity)),
+    ?assertNot(nhttp_conn_ws:oversize(<<"data">>, 10)),
+    ?assert(nhttp_conn_ws:oversize(<<"too long payload">>, 4)).
 
 ws_apply_handler_result_test(_Config) ->
-    View = #{
-        handler_state => old, runtime_opts => nhttp_conn_ws:default_runtime_opts(), session => s
-    },
+    Ws = #ws_state{session = s, ref = make_ref(), handler_state = old},
+    New = Ws#ws_state{handler_state = new},
+
+    ?assertEqual({New, []}, nhttp_conn_ws:apply_handler_result({ok, new}, Ws)),
 
     ?assertEqual(
-        [{update_view, View#{handler_state := new}}],
-        nhttp_conn_ws:apply_handler_result({ok, new}, View)
+        {New, [{send_frame, {text, <<"a">>}}, {send_frame, {text, <<"b">>}}]},
+        nhttp_conn_ws:apply_handler_result({reply, [{text, <<"a">>}, {text, <<"b">>}], new}, Ws)
     ),
 
     ?assertEqual(
-        [
-            {update_view, View#{handler_state := new}},
-            {send_frame, {text, <<"a">>}},
-            {send_frame, {text, <<"b">>}}
-        ],
-        nhttp_conn_ws:apply_handler_result(
-            {reply, [{text, <<"a">>}, {text, <<"b">>}], new}, View
-        )
+        {New, [{send_frame, {text, <<"x">>}}]},
+        nhttp_conn_ws:apply_handler_result({reply, {text, <<"x">>}, new}, Ws)
     ),
 
     ?assertEqual(
-        [{update_view, View#{handler_state := new}}, {send_frame, {text, <<"x">>}}],
-        nhttp_conn_ws:apply_handler_result({reply, {text, <<"x">>}, new}, View)
-    ),
-
-    ?assertEqual(
-        [
-            {update_view, View#{handler_state := new}},
+        {New, [
             {send_close, ?WS_CLOSE_NORMAL, <<"bye">>},
             {close_session, {local, ?WS_CLOSE_NORMAL, <<"bye">>}}
-        ],
-        nhttp_conn_ws:apply_handler_result({close, ?WS_CLOSE_NORMAL, <<"bye">>, new}, View)
+        ]},
+        nhttp_conn_ws:apply_handler_result({close, ?WS_CLOSE_NORMAL, <<"bye">>, new}, Ws)
     ),
 
     ?assertEqual(
-        [
-            {update_view, View#{handler_state := new}},
+        {New, [
             {send_close, ?WS_CLOSE_GOING_AWAY, <<"Server Going Away">>},
             {close_session, {handler_stop, my_reason}}
-        ],
-        nhttp_conn_ws:apply_handler_result({stop, my_reason, new}, View)
+        ]},
+        nhttp_conn_ws:apply_handler_result({stop, my_reason, new}, Ws)
     ),
 
     ?assertEqual(
-        [
+        {Ws, [
             {send_close, ?WS_CLOSE_INTERNAL_ERROR, <<"Internal Server Error">>},
             {close_session, {handler_crash, {error, boom}}}
-        ],
-        nhttp_conn_ws:apply_handler_result({nhttp_handler_exception, error, boom}, View)
+        ]},
+        nhttp_conn_ws:apply_handler_result({nhttp_handler_exception, error, boom}, Ws)
     ).
 
 %%%-----------------------------------------------------------------------------

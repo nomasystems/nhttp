@@ -5,6 +5,7 @@
 %%%-----------------------------------------------------------------------------
 %% INCLUDES
 %%%-----------------------------------------------------------------------------
+-include("nhttp_conn_ws.hrl").
 -include("nhttp_ws_codes.hrl").
 
 %%%-----------------------------------------------------------------------------
@@ -25,6 +26,7 @@
     dispatch_info/4,
     open/3,
     oversize/2,
+    runtime_opts/1,
     str_or_atom/1
 ]).
 
@@ -34,8 +36,7 @@
 -export_type([
     action/0,
     actions/0,
-    runtime_opts/0,
-    session_view/0
+    runtime_opts/0
 ]).
 
 -type runtime_opts() :: #{
@@ -44,16 +45,9 @@
     max_message_size := pos_integer() | infinity
 }.
 
--type session_view() :: #{
-    handler_state := term(),
-    runtime_opts := runtime_opts(),
-    session := nhttp_ws:session()
-}.
-
 -type action() ::
     {send_frame, nhttp_ws:ws_message()}
     | {send_close, no_code | nhttp_ws:close_code(), binary()}
-    | {update_view, session_view()}
     | {close_session, nhttp_handler:ws_close_reason()}.
 
 -type actions() :: [action()].
@@ -63,39 +57,31 @@
 %%%-----------------------------------------------------------------------------
 -doc """
 Apply the result of a handler callback (`handle_ws_frame/3` or
-`handle_ws_info/3`) to the session view. Returns the actions the
-transport must interpret.
+`handle_ws_info/3`) to the session. Returns the session with the new
+handler state and the actions the transport must interpret, in order.
 """.
--spec apply_handler_result(term(), session_view()) -> actions().
-apply_handler_result({ok, NewSState}, View) ->
-    [{update_view, View#{handler_state := NewSState}}];
-apply_handler_result({reply, Frames, NewSState}, View) when is_list(Frames) ->
-    [
-        {update_view, View#{handler_state := NewSState}}
-        | [{send_frame, F} || F <- Frames]
-    ];
-apply_handler_result({reply, Frame, NewSState}, View) ->
-    [
-        {update_view, View#{handler_state := NewSState}},
-        {send_frame, Frame}
-    ];
-apply_handler_result({close, Code, Reason, NewSState}, View) ->
-    [
-        {update_view, View#{handler_state := NewSState}},
+-spec apply_handler_result(term(), #ws_state{}) -> {#ws_state{}, actions()}.
+apply_handler_result({ok, NewSState}, Ws) ->
+    {Ws#ws_state{handler_state = NewSState}, []};
+apply_handler_result({reply, Frames, NewSState}, Ws) when is_list(Frames) ->
+    {Ws#ws_state{handler_state = NewSState}, [{send_frame, F} || F <- Frames]};
+apply_handler_result({reply, Frame, NewSState}, Ws) ->
+    {Ws#ws_state{handler_state = NewSState}, [{send_frame, Frame}]};
+apply_handler_result({close, Code, Reason, NewSState}, Ws) ->
+    {Ws#ws_state{handler_state = NewSState}, [
         {send_close, Code, Reason},
         {close_session, {local, Code, Reason}}
-    ];
-apply_handler_result({stop, Reason, NewSState}, View) ->
-    [
-        {update_view, View#{handler_state := NewSState}},
+    ]};
+apply_handler_result({stop, Reason, NewSState}, Ws) ->
+    {Ws#ws_state{handler_state = NewSState}, [
         {send_close, ?WS_CLOSE_GOING_AWAY, <<"Server Going Away">>},
         {close_session, {handler_stop, Reason}}
-    ];
-apply_handler_result({nhttp_handler_exception, Class, Reason}, _View) ->
-    [
+    ]};
+apply_handler_result({nhttp_handler_exception, Class, Reason}, Ws) ->
+    {Ws, [
         {send_close, ?WS_CLOSE_INTERNAL_ERROR, <<"Internal Server Error">>},
         {close_session, {handler_crash, {Class, Reason}}}
-    ].
+    ]}.
 
 -doc """
 Apply user-provided runtime opts on top of the current opts map.
@@ -116,26 +102,19 @@ apply_runtime_opts(Opts, Current) ->
 
 -doc """
 Run the close lifecycle for a session. Fires `handle_ws_closed/3` if the
-handler exports it, otherwise returns no actions. The transport completes
-the close (terminate conn or drop stream) after interpreting the result.
+handler exports it and returns the session with the handler state it
+left. The transport completes the close (terminate conn or drop stream).
 """.
--spec close_lifecycle(
-    nhttp_log:ctx(), nhttp_handler:ws_close_reason(), session_view(), module()
-) -> actions().
-close_lifecycle(Ctx, Reason, View, Handler) ->
-    case erlang:function_exported(Handler, handle_ws_closed, 3) of
-        false ->
-            [];
-        true ->
-            #{handler_state := SState, session := Session} = View,
-            Result = nhttp_handler:safe_handle_ws_closed(Handler, Reason, Session, SState),
-            log_crash_if_any(Result, Ctx, handle_ws_closed),
-            case Result of
-                {ok, NewSState} ->
-                    [{update_view, View#{handler_state := NewSState}}];
-                _ ->
-                    []
-            end
+-spec close_lifecycle(nhttp_log:ctx(), nhttp_handler:ws_close_reason(), #ws_state{}, module()) ->
+    #ws_state{}.
+close_lifecycle(_Ctx, _Reason, #ws_state{handles_closed = false} = Ws, _Handler) ->
+    Ws;
+close_lifecycle(Ctx, Reason, #ws_state{handler_state = SState, session = Session} = Ws, Handler) ->
+    Result = nhttp_handler:safe_handle_ws_closed(Handler, Reason, Session, SState),
+    log_crash_if_any(Result, Ctx, handle_ws_closed),
+    case Result of
+        {ok, NewSState} -> Ws#ws_state{handler_state = NewSState};
+        _ -> Ws
     end.
 
 -doc """
@@ -168,32 +147,31 @@ synchronously (always for text/binary, opt-in for ping/pong via
 `deliver_ping` / `deliver_pong`). CLOSE frames never reach the handler.
 The dispatcher reciprocates the close per RFC 6455 §5.5.1 / §7.1.5.
 """.
--spec dispatch_frame(nhttp_log:ctx(), nhttp_ws:ws_message(), session_view(), module()) ->
-    actions().
-dispatch_frame(Ctx, ping, View, Handler) ->
-    [{send_frame, pong} | maybe_handler_frame(Ctx, deliver_ping, {ping, <<>>}, View, Handler)];
-dispatch_frame(Ctx, {ping, Data}, View, Handler) ->
-    [
-        {send_frame, {pong, Data}}
-        | maybe_handler_frame(Ctx, deliver_ping, {ping, Data}, View, Handler)
-    ];
-dispatch_frame(Ctx, pong, View, Handler) ->
-    maybe_handler_frame(Ctx, deliver_pong, {pong, <<>>}, View, Handler);
-dispatch_frame(Ctx, {pong, Data}, View, Handler) ->
-    maybe_handler_frame(Ctx, deliver_pong, {pong, Data}, View, Handler);
-dispatch_frame(_Ctx, close, _View, _Handler) ->
-    [{send_close, no_code, <<>>}, {close_session, {peer, ?WS_CLOSE_NO_STATUS, <<>>}}];
-dispatch_frame(_Ctx, {close, Code, Reason}, _View, _Handler) ->
-    [{send_close, Code, Reason}, {close_session, {peer, Code, Reason}}];
-dispatch_frame(Ctx, {Type, Data}, View, Handler) when Type =:= text orelse Type =:= binary ->
-    case oversize(Data, maps:get(runtime_opts, View)) of
+-spec dispatch_frame(nhttp_log:ctx(), nhttp_ws:ws_message(), #ws_state{}, module()) ->
+    {#ws_state{}, actions()}.
+dispatch_frame(Ctx, ping, #ws_state{deliver_ping = Deliver} = Ws, Handler) ->
+    control_frame_actions(Ctx, [{send_frame, pong}], Deliver, {ping, <<>>}, Ws, Handler);
+dispatch_frame(Ctx, {ping, Data}, #ws_state{deliver_ping = Deliver} = Ws, Handler) ->
+    control_frame_actions(Ctx, [{send_frame, {pong, Data}}], Deliver, {ping, Data}, Ws, Handler);
+dispatch_frame(Ctx, pong, #ws_state{deliver_pong = Deliver} = Ws, Handler) ->
+    control_frame_actions(Ctx, [], Deliver, {pong, <<>>}, Ws, Handler);
+dispatch_frame(Ctx, {pong, Data}, #ws_state{deliver_pong = Deliver} = Ws, Handler) ->
+    control_frame_actions(Ctx, [], Deliver, {pong, Data}, Ws, Handler);
+dispatch_frame(_Ctx, close, Ws, _Handler) ->
+    {Ws, [{send_close, no_code, <<>>}, {close_session, {peer, ?WS_CLOSE_NO_STATUS, <<>>}}]};
+dispatch_frame(_Ctx, {close, Code, Reason}, Ws, _Handler) ->
+    {Ws, [{send_close, Code, Reason}, {close_session, {peer, Code, Reason}}]};
+dispatch_frame(Ctx, {Type, Data}, #ws_state{max_message_size = Max} = Ws, Handler) when
+    Type =:= text orelse Type =:= binary
+->
+    case oversize(Data, Max) of
         true ->
-            [
+            {Ws, [
                 {send_close, ?WS_CLOSE_MESSAGE_TOO_BIG, ?MESSAGE_TOO_BIG},
                 {close_session, {fail, ?WS_CLOSE_MESSAGE_TOO_BIG, ?MESSAGE_TOO_BIG}}
-            ];
+            ]};
         false ->
-            handler_frame_actions(Ctx, {Type, Data}, View, Handler)
+            handler_frame_actions(Ctx, {Type, Data}, Ws, Handler)
     end.
 
 -doc """
@@ -201,54 +179,62 @@ Dispatch an Erlang message addressed to the session via
 `gen_server:cast/2` ({ws_info, ...}) or via untagged broadcast. Calls
 `handle_ws_info/3` if the handler exports it.
 """.
--spec dispatch_info(nhttp_log:ctx(), term(), session_view(), module()) -> actions().
-dispatch_info(Ctx, Msg, View, Handler) ->
-    case erlang:function_exported(Handler, handle_ws_info, 3) of
-        false ->
-            [];
-        true ->
-            #{handler_state := SState, session := Session} = View,
-            Result = nhttp_handler:safe_handle_ws_info(Handler, Msg, Session, SState),
-            log_crash_if_any(Result, Ctx, handle_ws_info),
-            apply_handler_result(Result, View)
-    end.
+-spec dispatch_info(nhttp_log:ctx(), term(), #ws_state{}, module()) -> {#ws_state{}, actions()}.
+dispatch_info(_Ctx, _Msg, #ws_state{handles_info = false} = Ws, _Handler) ->
+    {Ws, []};
+dispatch_info(Ctx, Msg, #ws_state{handler_state = SState, session = Session} = Ws, Handler) ->
+    Result = nhttp_handler:safe_handle_ws_info(Handler, Msg, Session, SState),
+    log_crash_if_any(Result, Ctx, handle_ws_info),
+    apply_handler_result(Result, Ws).
 
 -doc """
-Run the open lifecycle. Fires `handle_ws_open/2` if exported and
-translates the result into actions.
+Run the open lifecycle. Records which optional callbacks the handler
+exports, fires `handle_ws_open/2` if exported, applies the runtime opts it
+returns, and translates the result into actions. The handler module is
+loaded at this point, because `handle_request/2` ran to accept the upgrade.
 """.
--spec open(nhttp_log:ctx(), session_view(), module()) -> actions().
-open(Ctx, View, Handler) ->
+-spec open(nhttp_log:ctx(), #ws_state{}, module()) -> {#ws_state{}, actions()}.
+open(Ctx, Ws0, Handler) ->
+    Ws = Ws0#ws_state{
+        handles_frame = erlang:function_exported(Handler, handle_ws_frame, 3),
+        handles_info = erlang:function_exported(Handler, handle_ws_info, 3),
+        handles_closed = erlang:function_exported(Handler, handle_ws_closed, 3)
+    },
     case erlang:function_exported(Handler, handle_ws_open, 2) of
         false ->
-            [];
+            {Ws, []};
         true ->
-            #{handler_state := SState, session := Session} = View,
+            #ws_state{handler_state = SState, session = Session} = Ws,
             Result = nhttp_handler:safe_handle_ws_open(Handler, Session, SState),
             log_crash_if_any(Result, Ctx, handle_ws_open),
             case Result of
                 {ok, NewSState} ->
-                    [{update_view, View#{handler_state := NewSState}}];
+                    {Ws#ws_state{handler_state = NewSState}, []};
                 {ok, NewSState, Opts} when is_map(Opts) ->
-                    NewOpts = apply_runtime_opts(Opts, maps:get(runtime_opts, View)),
-                    [{update_view, View#{handler_state := NewSState, runtime_opts := NewOpts}}];
+                    NewOpts = apply_runtime_opts(Opts, runtime_opts(Ws)),
+                    {put_runtime_opts(NewOpts, Ws#ws_state{handler_state = NewSState}), []};
                 {close, Code, Reason} ->
-                    [
+                    {Ws, [
                         {send_close, Code, Reason},
                         {close_session, {local, Code, Reason}}
-                    ];
+                    ]};
                 {nhttp_handler_exception, Class, Reason} ->
-                    [
+                    {Ws, [
                         {send_close, ?WS_CLOSE_INTERNAL_ERROR, <<"Internal Server Error">>},
                         {close_session, {handler_crash, {Class, Reason}}}
-                    ]
+                    ]}
             end
     end.
 
--doc "Check whether a payload exceeds the max message size in the runtime opts.".
--spec oversize(binary(), runtime_opts()) -> boolean().
-oversize(_Data, #{max_message_size := infinity}) -> false;
-oversize(Data, #{max_message_size := Max}) -> byte_size(Data) > Max.
+-doc "Check whether a payload exceeds the max message size.".
+-spec oversize(binary(), pos_integer() | infinity) -> boolean().
+oversize(_Data, infinity) -> false;
+oversize(Data, Max) -> byte_size(Data) > Max.
+
+-doc "The runtime opts of a session, the input of `nhttp_ws:decoder_new/2`.".
+-spec runtime_opts(#ws_state{}) -> runtime_opts().
+runtime_opts(#ws_state{deliver_ping = DP, deliver_pong = DG, max_message_size = MS}) ->
+    #{deliver_ping => DP, deliver_pong => DG, max_message_size => MS}.
 
 -doc """
 Render an arbitrary term as a binary suitable for use in CLOSE reason
@@ -262,18 +248,26 @@ str_or_atom(R) -> iolist_to_binary(io_lib:format("~p", [R])).
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS
 %%%-----------------------------------------------------------------------------
--spec handler_frame_actions(nhttp_log:ctx(), nhttp_ws:ws_frame(), session_view(), module()) ->
-    actions().
-handler_frame_actions(Ctx, Frame, View, Handler) ->
-    case erlang:function_exported(Handler, handle_ws_frame, 3) of
-        false ->
-            [];
-        true ->
-            #{handler_state := SState, session := Session} = View,
-            Result = nhttp_handler:safe_handle_ws_frame(Handler, Frame, Session, SState),
-            log_crash_if_any(Result, Ctx, handle_ws_frame),
-            apply_handler_result(Result, View)
-    end.
+-spec control_frame_actions(
+    nhttp_log:ctx(), actions(), boolean(), nhttp_ws:ws_frame(), #ws_state{}, module()
+) ->
+    {#ws_state{}, actions()}.
+control_frame_actions(_Ctx, Reply, false, _Frame, Ws, _Handler) ->
+    {Ws, Reply};
+control_frame_actions(Ctx, Reply, true, Frame, Ws, Handler) ->
+    {Ws1, Actions} = handler_frame_actions(Ctx, Frame, Ws, Handler),
+    {Ws1, Reply ++ Actions}.
+
+-spec handler_frame_actions(nhttp_log:ctx(), nhttp_ws:ws_frame(), #ws_state{}, module()) ->
+    {#ws_state{}, actions()}.
+handler_frame_actions(_Ctx, _Frame, #ws_state{handles_frame = false} = Ws, _Handler) ->
+    {Ws, []};
+handler_frame_actions(
+    Ctx, Frame, #ws_state{handler_state = SState, session = Session} = Ws, Handler
+) ->
+    Result = nhttp_handler:safe_handle_ws_frame(Handler, Frame, Session, SState),
+    log_crash_if_any(Result, Ctx, handle_ws_frame),
+    apply_handler_result(Result, Ws).
 
 -spec log_crash_if_any(term(), nhttp_log:ctx(), atom()) -> ok.
 log_crash_if_any({nhttp_handler_exception, Class, Reason}, Ctx, Callback) ->
@@ -281,17 +275,6 @@ log_crash_if_any({nhttp_handler_exception, Class, Reason}, Ctx, Callback) ->
 log_crash_if_any(_Result, _Ctx, _Callback) ->
     ok.
 
--spec maybe_handler_frame(
-    nhttp_log:ctx(),
-    deliver_ping | deliver_pong,
-    nhttp_ws:ws_frame(),
-    session_view(),
-    module()
-) ->
-    actions().
-maybe_handler_frame(Ctx, Flag, Frame, View, Handler) ->
-    Opts = maps:get(runtime_opts, View),
-    case maps:get(Flag, Opts) of
-        true -> handler_frame_actions(Ctx, Frame, View, Handler);
-        false -> []
-    end.
+-spec put_runtime_opts(runtime_opts(), #ws_state{}) -> #ws_state{}.
+put_runtime_opts(#{deliver_ping := DP, deliver_pong := DG, max_message_size := MS}, Ws) ->
+    Ws#ws_state{deliver_ping = DP, deliver_pong = DG, max_message_size = MS}.

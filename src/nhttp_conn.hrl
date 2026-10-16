@@ -107,6 +107,7 @@
     protocol_state :: undefined | #h1_state{} | #h2_state{},
     opts :: nhttp:opts(),
     ctx :: nhttp_conn:ctx(),
+    log_ctx :: nhttp_log:ctx() | undefined,
     limits = #{} :: nhttp_limits:t(),
     idle_timeout = ?DEFAULT_IDLE_TIMEOUT :: timeout(),
     hibernate_after = ?DEFAULT_HIBERNATE_AFTER :: timeout(),

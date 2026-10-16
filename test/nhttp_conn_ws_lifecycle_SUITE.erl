@@ -24,6 +24,7 @@
 ]).
 
 -export([
+    ws_h1_closed_crash_log_ctx/1,
     ws_h1_server_drain/1,
     ws_h1_sys_and_info/1,
     ws_h2_bad_gencall/1,
@@ -51,6 +52,7 @@
 
 all() ->
     [
+        ws_h1_closed_crash_log_ctx,
         ws_h1_server_drain,
         ws_h1_sys_and_info,
         ws_h2_bad_gencall,
@@ -108,6 +110,34 @@ ws_h1_sys_and_info(_Config) ->
         error(conn_did_not_terminate)
     end,
     gen_tcp:close(Sock),
+    nhttp:stop(Pid),
+    ok.
+
+ws_h1_closed_crash_log_ctx(_Config) ->
+    {ok, Pid, Port} = nhttp_test_helpers:start(#{
+        handler => ?MODULE,
+        handler_args => #{notify => self(), crash_on_closed => true},
+        versions => [http1_1]
+    }),
+    Sock = nhttp_test_helpers:tcp_connect(Port),
+    {ok, ClientAddr} = inet:sockname(Sock),
+    ok = gen_tcp:send(Sock, ws_upgrade_request()),
+    {ok, <<"HTTP/1.1 101", _/binary>>} = gen_tcp:recv(Sock, 0, 5000),
+    ok = logger:add_handler(?FUNCTION_NAME, ?MODULE, #{config => {report_to, self()}}),
+    try
+        ok = gen_tcp:close(Sock),
+        receive
+            {handler_crash_logged, Report} ->
+                ?assertMatch(
+                    #{transport := tcp, version := http1_1, peer := ClientAddr, handler := ?MODULE},
+                    Report
+                )
+        after 2000 ->
+            error(handler_crash_not_logged)
+        end
+    after
+        _ = logger:remove_handler(?FUNCTION_NAME)
+    end,
     nhttp:stop(Pid),
     ok.
 
@@ -264,6 +294,12 @@ terminate(_Reason, _State) ->
 %%% LOGGER HANDLER CALLBACK
 %%%-----------------------------------------------------------------------------
 
+log(
+    #{msg := {report, #{event := handler_crashed, callback := handle_ws_closed} = Report}},
+    #{config := {report_to, Pid}}
+) ->
+    Pid ! {handler_crash_logged, Report},
+    ok;
 log(#{msg := {report, #{event := handler_crashed, callback := handle_ws_closed}}}, #{
     config := Pid
 }) ->

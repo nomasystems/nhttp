@@ -36,6 +36,7 @@
 -export([
     activate/1,
     activate/2,
+    activate_n/2,
     alt_svc_headers/2,
     cancel_hibernate_timer/1,
     compress_config/1,
@@ -88,6 +89,7 @@ Alt-Svc advertisement of the HTTP/3 endpoint.
 %%%-----------------------------------------------------------------------------
 %% LOCAL MACROS
 %%%-----------------------------------------------------------------------------
+-define(ACTIVE_N, 100).
 -define(H2_SEND_QUEUE_BOUNDS, #{max_send_buffer => infinity, max_queued_streams => infinity}).
 -define(SOCKET_TRANSFER_TIMEOUT, 5000).
 
@@ -238,16 +240,31 @@ compress_config(#state{
 }) ->
     nhttp_conn_compress:config(Enabled, Level, Threshold, MimeTypes).
 
--doc """
-Project the connection state into the structured-logging context map
-consumed by `nhttp_log`. Cheap (record field reads) so call sites can
-build it on demand without caching.
-""".
--spec log_ctx(#state{}) -> nhttp_log:ctx().
-log_ctx(#state{
+-spec build_log_ctx(#state{}) -> nhttp_log:ctx().
+build_log_ctx(#state{
     name = Name, transport = Transport, family = Family, peer = Peer, handler = Handler
 }) ->
     nhttp_log:conn_ctx(Name, Transport, family_to_version(Family), Peer, Handler).
+
+-doc """
+The structured-logging context map consumed by `nhttp_log`. After
+classification it is the map that `put_log_ctx/1` stored, a field read.
+Before it, the map is built from the state on each call.
+""".
+-spec log_ctx(#state{}) -> nhttp_log:ctx().
+log_ctx(#state{log_ctx = undefined} = State) ->
+    build_log_ctx(State);
+log_ctx(#state{log_ctx = Ctx}) ->
+    Ctx.
+
+-doc """
+Store the log context once the family and the peer are final. The fields
+it reads do not change after classification: a WebSocket upgrade moves the
+family from `http1` to `websocket`, and both give the version `http1_1`.
+""".
+-spec put_log_ctx(#state{}) -> #state{}.
+put_log_ctx(State) ->
+    State#state{log_ctx = build_log_ctx(State)}.
 
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - CONNECTION LOOP
@@ -269,16 +286,32 @@ Same as `activate/1`, with socket options applied together with
 """.
 -spec activate(#state{}, [gen_tcp:option() | ssl:tls_option()]) -> ok | {stop, term()}.
 activate(#state{socket = Socket}, ExtraOpts) ->
-    case nhttp_sock:setopts(Socket, ExtraOpts ++ [{active, once}]) of
-        ok -> ok;
-        {error, Reason} -> {stop, sock_stop_reason(Reason)}
-    end.
+    set_active(Socket, ExtraOpts ++ [{active, once}]).
+
+-doc """
+Same as `activate/2`, with `{active, N}` instead of `{active, once}`. The
+socket delivers up to `N` reads and then a `{tcp_passive, S}` or
+`{ssl_passive, S}` message, on which the caller arms it again. The count
+bounds the reads queued in the mailbox, so backpressure holds. Setting
+`{active, N}` on a socket in `once` mode replaces the mode, it does not
+add to a count.
+""".
+-spec activate_n(#state{}, [gen_tcp:option() | ssl:tls_option()]) -> ok | {stop, term()}.
+activate_n(#state{socket = Socket}, ExtraOpts) ->
+    set_active(Socket, ExtraOpts ++ [{active, ?ACTIVE_N}]).
 
 -spec enter_protocol_loop(pid(), [sys:debug_option()], #state{}) -> no_return().
 enter_protocol_loop(Parent, Debug, #state{family = http1} = State) ->
     nhttp_conn_h1:loop(Parent, Debug, State);
 enter_protocol_loop(Parent, Debug, #state{family = http2} = State) ->
     nhttp_conn_h2:loop(Parent, Debug, State).
+
+-spec set_active(nhttp_sock:t(), [gen_tcp:option() | ssl:tls_option()]) -> ok | {stop, term()}.
+set_active(Socket, Opts) ->
+    case nhttp_sock:setopts(Socket, Opts) of
+        ok -> ok;
+        {error, Reason} -> {stop, sock_stop_reason(Reason)}
+    end.
 
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - HIBERNATION
@@ -699,7 +732,7 @@ sock_stop_reason(Reason) ->
 start_protocol(Parent, Debug, #state{socket = Socket, ctx = #{versions := Versions}} = State) ->
     case detect_protocol(Socket, Versions) of
         {ok, Family} ->
-            State1 = finalize_peer(State#state{family = Family}),
+            State1 = put_log_ctx(finalize_peer(State#state{family = Family})),
             case init_protocol(State1) of
                 {ok, State2} ->
                     State3 = emit_connection_start(State2),
