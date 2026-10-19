@@ -167,6 +167,7 @@ RFC 9001 §9.2).
     header_name/0,
     header_value/0,
     headers/0,
+    h2_dispatch/0,
     h2_response_delay/0,
     h2_window_policy/0,
 
@@ -201,6 +202,7 @@ RFC 9001 §9.2).
     buffer => pos_integer(),
     h2_connection_window_policy => h2_window_policy(),
     h2_credit_batch => non_neg_integer(),
+    h2_dispatch => h2_dispatch(),
     h2_initial_window_size => 1..16#7fffffff,
     h2_max_frame_size => 16#4000..16#ffffff,
     h2_response_delay => h2_response_delay(),
@@ -225,6 +227,14 @@ RFC 9001 §9.2).
     tls => tls(),
     proxy_protocol => boolean() | proxy_protocol_opts()
 }.
+
+-doc """
+Where `handle_request/2` runs on HTTP/2. `inline`: in the connection
+process, in stream order, as on HTTP/1.1 and HTTP/3. A request with a
+body runs in a worker. `worker`: in one worker per stream. Default
+`inline`.
+""".
+-type h2_dispatch() :: worker | inline.
 
 -doc """
 Delay before the response headers of a `{reply, _, _}` handler result on

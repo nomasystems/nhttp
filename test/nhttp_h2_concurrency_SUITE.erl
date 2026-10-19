@@ -275,7 +275,8 @@ start_server(Config) ->
         port => 0,
         tls => #{certfile => CertFile, keyfile => KeyFile},
         handler => ?MODULE,
-        versions => [http2]
+        versions => [http2],
+        h2_dispatch => worker
     },
     {ok, Pid} = nhttp:start_link(Opts),
     {ok, Port} = nhttp:get_port(Pid),

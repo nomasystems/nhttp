@@ -36,7 +36,8 @@
     advertise_tab :: nhttp_registry:tab() | undefined,
     counter :: nhttp_listener_counter:counter(),
     monitors = #{} :: #{pid() => reference()},
-    pending_drains = [] :: [gen_server:from()]
+    pending_drains = [] :: [gen_server:from()],
+    draining = false :: boolean()
 }).
 
 %%%-----------------------------------------------------------------------------
@@ -86,14 +87,13 @@ stop_advertising(TrackerPid) ->
     gen_server:call(TrackerPid, stop_advertising).
 
 -doc """
-Begin tracking a connection pid.
-Synchronous so the monitor is registered before `start_conn/3` returns:
-a fire-and-forget cast can be silently dropped if the tracker is briefly
-down (e.g. mid `rest_for_one` restart), which would leak a counter slot.
+Begin tracking a connection pid. A cast: a tracker restart resets the
+counter and kills the connections, so a dropped message leaks no slot.
+A track after `drain_all/1` gets the drain signal at once.
 """.
 -spec track(pid(), pid()) -> ok.
 track(TrackerPid, ConnPid) ->
-    gen_server:call(TrackerPid, {track, ConnPid}).
+    gen_server:cast(TrackerPid, {track, ConnPid}).
 
 -doc """
 Block the caller until every tracked connection has exited, or until
@@ -120,7 +120,7 @@ code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
 -spec handle_call(
-    drain_all | listener_port | stop_advertising | {track, pid()} | wait_for_drained,
+    drain_all | listener_port | stop_advertising | wait_for_drained,
     gen_server:from(),
     #state{}
 ) ->
@@ -136,13 +136,10 @@ handle_call(stop_advertising, _From, State) ->
 handle_call(drain_all, _From, #state{monitors = Monitors} = State) ->
     ok = mark_advertise_draining(State),
     ok = lists:foreach(
-        fun(Pid) -> Pid ! shutdown end,
+        fun(Pid) -> nhttp_conn:drain(Pid) end,
         maps:keys(Monitors)
     ),
-    {reply, ok, State};
-handle_call({track, Pid}, _From, #state{monitors = Monitors} = State) ->
-    MRef = erlang:monitor(process, Pid),
-    {reply, ok, State#state{monitors = Monitors#{Pid => MRef}}};
+    {reply, ok, State#state{draining = true}};
 handle_call(
     wait_for_drained, From, #state{monitors = Monitors, pending_drains = Pending} = State
 ) ->
@@ -153,9 +150,11 @@ handle_call(
             {noreply, State#state{pending_drains = [From | Pending]}}
     end.
 
--spec handle_cast(term(), #state{}) -> {noreply, #state{}}.
-handle_cast(_Msg, State) ->
-    {noreply, State}.
+-spec handle_cast({track, pid()}, #state{}) -> {noreply, #state{}}.
+handle_cast({track, Pid}, #state{monitors = Monitors, draining = Draining} = State) ->
+    MRef = erlang:monitor(process, Pid),
+    ok = drain_if_draining(Draining, Pid),
+    {noreply, State#state{monitors = Monitors#{Pid => MRef}}}.
 
 -spec handle_info({'DOWN', reference(), process, pid(), term()}, #state{}) ->
     {noreply, #state{}}.
@@ -185,6 +184,10 @@ terminate(_Reason, _State) ->
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS
 %%%-----------------------------------------------------------------------------
+-spec drain_if_draining(boolean(), pid()) -> ok.
+drain_if_draining(true, Pid) -> nhttp_conn:drain(Pid);
+drain_if_draining(false, _Pid) -> ok.
+
 -spec init_advertise(nhttp_registry:tab() | undefined) -> ok.
 init_advertise(undefined) ->
     ok;

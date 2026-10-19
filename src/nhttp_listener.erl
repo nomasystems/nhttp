@@ -477,6 +477,14 @@ validate_h2_aliases(Opts) ->
         ok
     end.
 
+-spec validate_h2_dispatch(nhttp:h2_dispatch()) -> ok | {error, term()}.
+validate_h2_dispatch(worker) ->
+    ok;
+validate_h2_dispatch(inline) ->
+    ok;
+validate_h2_dispatch(V) ->
+    {error, {invalid_h2_dispatch, V, "must be worker or inline"}}.
+
 -spec validate_h2_response_delay(nhttp:h2_response_delay() | undefined) -> ok | {error, term()}.
 validate_h2_response_delay(undefined) ->
     ok;
@@ -601,6 +609,7 @@ validate_opts(Opts) ->
         ok ?= validate_h2_settings(maps:get(h2_settings, Opts, #{})),
         ok ?= validate_h2_aliases(Opts),
         ok ?= validate_h2_response_delay(maps:get(h2_response_delay, Opts, undefined)),
+        ok ?= validate_h2_dispatch(maps:get(h2_dispatch, Opts, inline)),
         ok ?= validate_h2_window_policies(Opts),
         ok ?= validate_proxy_protocol(maps:get(proxy_protocol, Opts, false)),
         ok ?= validate_acceptor_count(maps:get(acceptor_count, Opts, undefined)),

@@ -108,15 +108,12 @@ drain(Pid) ->
     ok.
 
 -doc """
-Start a connection under `nhttp_conn_sup`.
-Uses `proc_lib:start_link/3` semantics: the caller (the conn supervisor)
-blocks until init_ack is received, so `supervisor:start_child/2` correctly
-reports init failures.
+Start a connection under `nhttp_conn_sup` without waiting for `init/1`.
+A failed handler `init/1` ends the process with `{shutdown, _}`.
 """.
--spec start_link_supervised(term(), nhttp_sock:t(), nhttp:opts(), ctx()) ->
-    {ok, pid()} | {error, term()}.
+-spec start_link_supervised(term(), nhttp_sock:t(), nhttp:opts(), ctx()) -> {ok, pid()}.
 start_link_supervised(Name, Socket, Opts, Ctx) ->
-    proc_lib:start_link(?MODULE, init, [{Name, Socket, Opts, Ctx, self()}]).
+    {ok, proc_lib:spawn_link(?MODULE, init, [{Name, Socket, Opts, Ctx, self()}])}.
 
 %%%-----------------------------------------------------------------------------
 %% PROC_LIB CALLBACKS
@@ -138,7 +135,6 @@ init({Name, Socket, Opts, Ctx, Parent}) ->
     CompressMimeTypes = maps:get(compress_mime_types, Opts, nhttp_compress:default_mime_types()),
     case nhttp_handler:safe_init(Handler, HandlerArgs) of
         {ok, HandlerState} ->
-            proc_lib:init_ack(Parent, {ok, self()}),
             ok = nhttp_stats:incr_connection(),
             Debug = sys:debug_options([]),
             State = #state{
@@ -161,11 +157,13 @@ init({Name, Socket, Opts, Ctx, Parent}) ->
             },
             wait_for_socket(Parent, Debug, State);
         {error, Reason} ->
-            proc_lib:init_ack(Parent, {error, {handler_init, Reason}});
+            InitCtx = #{listener_name => Name, transport => Transport, handler => Handler},
+            nhttp_log:handler_init_failed(InitCtx, Reason),
+            exit({shutdown, {handler_init, Reason}});
         {nhttp_handler_exception, Class, Reason} ->
             InitCtx = #{listener_name => Name, transport => Transport, handler => Handler},
             nhttp_log:handler_crashed(InitCtx, init, Class, Reason),
-            proc_lib:init_ack(Parent, {error, {handler_init_exception, Class, Reason}})
+            exit({shutdown, {handler_init_exception, Class, Reason}})
     end.
 
 -doc """
@@ -549,7 +547,8 @@ init_protocol(#state{family = http2, socket = Socket, peer = Peer, opts = Opts} 
                     maps:get(h2_credit_batch, Opts, 0)
                 ),
                 response_delay = maps:get(h2_response_delay, Opts, 0),
-                stream_credit = h2_stream_credit(maps:get(h2_stream_window_policy, Opts, eager))
+                stream_credit = h2_stream_credit(maps:get(h2_stream_window_policy, Opts, eager)),
+                dispatch = maps:get(h2_dispatch, Opts, inline)
             }
         }}
     end;

@@ -414,10 +414,14 @@ complete_h2_reply(State, StreamId, Stream, Response) ->
     finish_h2_reply(State, StreamId, Stream, Response, []).
 
 -spec dispatch_h2_request(#state{}, nhttp_lib:stream_id(), nhttp_lib:request()) -> #state{}.
-dispatch_h2_request(#state{limits = Limits} = State, StreamId, Request) ->
+dispatch_h2_request(
+    #state{limits = Limits, protocol_state = #h2_state{dispatch = Dispatch}} = State,
+    StreamId,
+    Request
+) ->
     case nhttp_limits:validate_request(Request, Limits) of
         ok ->
-            spawn_h2_request_worker(State, StreamId, Request, true);
+            dispatch_h2_complete_request(Dispatch, State, StreamId, Request);
         {error, LimitError} ->
             handle_h2_limit_error(State, StreamId, LimitError)
     end.
@@ -448,6 +452,86 @@ finish_h2_reply(State, StreamId, Stream, #{status := Status} = Response, Credit)
     State3 = release_request_worker(State2, StreamId, Stream),
     nhttp_conn:emit_request_stop(State3, Status, Stream#h2_stream.req_span),
     State3#state{requests_count = State3#state.requests_count + 1}.
+
+-spec dispatch_h2_complete_request(
+    nhttp:h2_dispatch(), #state{}, nhttp_lib:stream_id(), nhttp_lib:request()
+) -> #state{}.
+dispatch_h2_complete_request(worker, State, StreamId, Request) ->
+    spawn_h2_request_worker(State, StreamId, Request, true);
+dispatch_h2_complete_request(inline, State, StreamId, Request) ->
+    run_h2_request_inline(State, StreamId, Request).
+
+-doc """
+Run `handle_request/2` in the connection process and apply the result
+as a worker result. A `{stream, _, _}` result starts a producer worker.
+An `{accept_body, _, _}` result gets the terminal body event at once.
+""".
+-spec run_h2_request_inline(#state{}, nhttp_lib:stream_id(), nhttp_lib:request()) -> #state{}.
+run_h2_request_inline(
+    #state{handler = Handler, handler_state = HState} = State, StreamId, Request
+) ->
+    ReqSpan = nhttp_conn:emit_request_start(State, StreamId, Request),
+    Stream = #h2_stream{
+        type = request,
+        req_span = ReqSpan,
+        end_stream = true,
+        request = Request#{body => <<>>}
+    },
+    State1 = put_h2_stream(State, StreamId, Stream),
+    Result = nhttp_handler:safe_handle_request(Handler, Request, HState),
+    apply_inline_result(State1, StreamId, Result, HState).
+
+-spec apply_inline_result(
+    #state{},
+    nhttp_lib:stream_id(),
+    nhttp_handler:request_result(term()) | nhttp_handler:handler_exception() | term(),
+    term()
+) -> #state{}.
+apply_inline_result(
+    #state{protocol_state = #h2_state{h2_workers = Workers} = H2} = State,
+    StreamId,
+    {stream, {producer, _Status, _Headers, Producer} = Spec, NewHState},
+    _HState
+) ->
+    Ref = make_ref(),
+    WorkerPid = nhttp_stream_worker:start(self(), Ref, Producer),
+    MRef = erlang:monitor(process, WorkerPid),
+    Stream = stream(State, StreamId),
+    State1 = put_h2_stream(
+        State#state{protocol_state = H2#h2_state{h2_workers = Workers#{WorkerPid => StreamId}}},
+        StreamId,
+        Stream#h2_stream{worker = WorkerPid, worker_ref = Ref, worker_mref = MRef}
+    ),
+    apply_request_result(State1, StreamId, {stream, Spec, NewHState});
+apply_inline_result(
+    #state{handler = Handler} = State, StreamId, {accept_body, BodyState, NewHState}, _HState
+) ->
+    Result = nhttp_handler:safe_handle_request_body(Handler, {fin, []}, BodyState, NewHState),
+    apply_inline_body_result(State, StreamId, Result, NewHState);
+apply_inline_result(State, StreamId, {reply, _, _} = Result, _HState) ->
+    apply_request_result(State, StreamId, Result);
+apply_inline_result(State, StreamId, {abort, _, _} = Result, _HState) ->
+    apply_request_result(State, StreamId, Result);
+apply_inline_result(State, StreamId, {upgrade, websocket, _} = Result, _HState) ->
+    apply_request_result(State, StreamId, Result);
+apply_inline_result(State, StreamId, {upgrade, websocket, _, _} = Result, _HState) ->
+    apply_request_result(State, StreamId, Result);
+apply_inline_result(State, StreamId, {nhttp_handler_exception, _, _} = Result, _HState) ->
+    apply_request_result(State, StreamId, Result);
+apply_inline_result(State, StreamId, Other, HState) ->
+    apply_request_result(State, StreamId, {abort, {bad_handler_return, Other}, HState}).
+
+-doc "The result of the terminal body event of an inline request.".
+-spec apply_inline_body_result(
+    #state{},
+    nhttp_lib:stream_id(),
+    nhttp_handler:request_result(term()) | nhttp_handler:handler_exception() | term(),
+    term()
+) -> #state{}.
+apply_inline_body_result(State, StreamId, {accept_body, _BodyState, NewHState}, _HState) ->
+    apply_request_result(State, StreamId, {abort, body_unconsumed, NewHState});
+apply_inline_body_result(State, StreamId, Result, HState) ->
+    apply_inline_result(State, StreamId, Result, HState).
 
 -spec spawn_h2_request_worker(
     #state{}, nhttp_lib:stream_id(), nhttp_lib:request(), boolean()

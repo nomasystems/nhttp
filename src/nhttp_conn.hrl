@@ -95,6 +95,7 @@
     credit_timer :: {reference(), integer()} | undefined,
     response_delay = 0 :: nhttp:h2_response_delay(),
     stream_credit = eager :: h2_stream_credit(),
+    dispatch = inline :: nhttp:h2_dispatch(),
     out = [] :: iodata(),
     out_bytes = 0 :: non_neg_integer()
 }).
