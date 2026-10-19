@@ -7,8 +7,11 @@
 %%% can share `#state{}`, `#h3_stream{}`, and `#h3_push_ctx{}` without
 %%% leaking these records to public consumers. Push-stream state lives in
 %%% `#h3_push_ctx{}` (mirroring `#h1_push_ctx{}`), populated only for
-%%% `type = push` streams. The WS session record `#ws_state{}` comes from
-%%% `nhttp_conn_ws.hrl`, shared with the H1/H2 header.
+%%% `type = push` streams. Frames that QUIC flow control refuses wait in
+%%% `h3_send_buffers` of `#state{}`, keyed by stream id, because a buffered
+%%% WebSocket Close+FIN outlives its stream entry. The WS session record
+%%% `#ws_state{}` comes from `nhttp_conn_ws.hrl`, shared with the H1/H2
+%%% header.
 %%%
 %%% H1 and H2 records live in `nhttp_conn.hrl`; H3 keeps its own header
 %%% because the `#state{}` record shape diverges (QUIC ctx + nhttp_h3 conn
@@ -29,9 +32,7 @@
     req_span :: {nhttp_otel:span_ctx(), integer()},
     bytes = 0 :: non_neg_integer(),
     started = false :: boolean(),
-    pending_ack :: reference() | undefined,
-    send_buffer = <<>> :: binary(),
-    send_end_stream = false :: boolean()
+    pending :: undefined | {reference(), nhttp_h3:fin()}
 }).
 
 -record(h3_stream, {
@@ -53,6 +54,7 @@
     h3_conn :: nhttp_h3:conn(),
     h3_streams = #{} :: #{nhttp_lib:stream_id() => #h3_stream{}},
     h3_push_workers = #{} :: #{pid() => nhttp_lib:stream_id()},
+    h3_send_buffers = #{} :: #{nhttp_lib:stream_id() => nhttp_conn_h3:send_buffer()},
     handler :: module(),
     handler_state :: term(),
     opts :: nhttp:opts(),
