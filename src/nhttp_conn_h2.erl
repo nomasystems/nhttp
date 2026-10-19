@@ -24,6 +24,7 @@
 -export([
     apply_h2_request_result/3,
     offer_h2_data/5,
+    queue_h2_out/2,
     reset_h2_stream/3,
     send_h2_error_response/3,
     send_h2_headers/4,
@@ -67,6 +68,7 @@ closed in the codec and nothing more goes out on it.
 %%%-----------------------------------------------------------------------------
 -define(CREDIT_DELAY_TAG, nhttp_h2_credit_delay).
 -define(DRAIN_IDLE_WAKE_MS, 100).
+-define(H2_OUT_MAX_BYTES, 65536).
 -define(RESPONSE_DELAY_TAG, nhttp_h2_response_delay).
 
 %%%-----------------------------------------------------------------------------
@@ -117,9 +119,7 @@ drain_idle(#state{protocol_state = #h2_state{h2_streams = Streams, h2_workers = 
 -spec finalize_goaway(#state{}) -> #state{}.
 finalize_goaway(#state{protocol_state = #h2_state{h2_conn = H2Conn} = H2} = State) ->
     {ok, NewH2Conn, GoawayFrame} = nhttp_h2:send_goaway(H2Conn, no_error, <<>>),
-    State1 = State#state{protocol_state = H2#h2_state{h2_conn = NewH2Conn}},
-    ok = nhttp_conn:sock_send(State1, GoawayFrame),
-    State1.
+    queue_h2_out(State#state{protocol_state = H2#h2_state{h2_conn = NewH2Conn}}, GoawayFrame).
 
 -doc """
 Frame-wait block point. A connection with no streams, no workers and no
@@ -178,7 +178,7 @@ h2_receive(Parent, Debug, State, IdleDeadline) ->
         {'$gen_cast', Msg} ->
             h2_loop(Parent, Debug, nhttp_conn_ws_h2:handle_cast(State, Msg));
         {system, From, Request} ->
-            sys:handle_system_msg(Request, From, Parent, ?MODULE, Debug, State);
+            sys:handle_system_msg(Request, From, Parent, ?MODULE, Debug, flush_h2_out(State));
         shutdown ->
             case nhttp_conn:graceful_shutdown(State) of
                 #state{} = NewState -> h2_loop(Parent, Debug, NewState)
@@ -201,7 +201,7 @@ h2_receive(Parent, Debug, State, IdleDeadline) ->
 handle_h2_data(
     Parent,
     Debug,
-    #state{protocol_state = #h2_state{h2_conn = H2Conn} = H2, socket = Socket} = State,
+    #state{protocol_state = #h2_state{h2_conn = H2Conn} = H2} = State,
     Data
 ) ->
     case nhttp_h2:recv(H2Conn, Data) of
@@ -214,25 +214,19 @@ handle_h2_data(
                 {stop, Reason} -> nhttp_conn:stop(Reason, NewState)
             end;
         {ok, Events, NewH2Conn, FramesToSend} ->
-            case nhttp_sock:send(Socket, FramesToSend) of
-                ok ->
-                    NewState = handle_h2_events(
-                        State#state{protocol_state = H2#h2_state{h2_conn = NewH2Conn}}, Events
-                    ),
-                    case nhttp_conn:activate(NewState) of
-                        ok -> h2_loop(Parent, Debug, NewState);
-                        {stop, Reason} -> nhttp_conn:stop(Reason, NewState)
-                    end;
-                {error, Reason} ->
-                    nhttp_conn:stop(
-                        nhttp_conn:sock_stop_reason(Reason),
-                        State#state{protocol_state = H2#h2_state{h2_conn = NewH2Conn}}
-                    )
+            Queued = queue_h2_out(
+                State#state{protocol_state = H2#h2_state{h2_conn = NewH2Conn}}, FramesToSend
+            ),
+            NewState = handle_h2_events(Queued, Events),
+            case nhttp_conn:activate(NewState) of
+                ok -> h2_loop(Parent, Debug, NewState);
+                {stop, Reason} -> nhttp_conn:stop(Reason, NewState)
             end;
         {error, {connection_error, ErrorCode, _Reason}} ->
             {ok, FinalConn, GoawayFrame} = nhttp_h2:send_goaway(H2Conn, ErrorCode, <<>>),
-            State1 = State#state{protocol_state = H2#h2_state{h2_conn = FinalConn}},
-            ok = nhttp_conn:sock_send(State1, GoawayFrame),
+            State1 = queue_h2_out(
+                State#state{protocol_state = H2#h2_state{h2_conn = FinalConn}}, GoawayFrame
+            ),
             nhttp_conn:stop({h2_connection_error, ErrorCode}, State1);
         {error, Reason} ->
             nhttp_conn:stop({h2_error, Reason}, State)
@@ -240,6 +234,10 @@ handle_h2_data(
 
 -spec handle_h2_timeout(pid(), [sys:debug_option()], #state{}, nhttp_conn:deadline()) ->
     no_return().
+handle_h2_timeout(
+    Parent, Debug, #state{protocol_state = #h2_state{out = [_ | _]}} = State, IdleDeadline
+) ->
+    h2_receive(Parent, Debug, flush_h2_out(State), IdleDeadline);
 handle_h2_timeout(
     Parent,
     Debug,
@@ -258,7 +256,13 @@ handle_h2_timeout(
 handle_h2_timeout(_Parent, _Debug, #state{} = State, _IdleDeadline) ->
     nhttp_conn:stop(normal, finalize_goaway(State)).
 
+-doc """
+Pending output makes the wait zero, so the loop writes it in one socket
+write as soon as the mailbox holds nothing more to handle.
+""".
 -spec receive_timeout(#state{}, nhttp_conn:deadline()) -> timeout().
+receive_timeout(#state{protocol_state = #h2_state{out = [_ | _]}}, _IdleDeadline) ->
+    0;
 receive_timeout(
     #state{
         protocol_state = #h2_state{drain_deadline = undefined},
@@ -277,6 +281,34 @@ receive_timeout(
     case drain_idle(State) of
         true -> min(?DRAIN_IDLE_WAKE_MS, Remaining);
         false -> Remaining
+    end.
+
+-spec flush_h2_out(#state{}) -> #state{}.
+flush_h2_out(#state{protocol_state = #h2_state{out = []}} = State) ->
+    State;
+flush_h2_out(#state{protocol_state = #h2_state{out = Out} = H2} = State) ->
+    ok = nhttp_conn:sock_send(State, Out),
+    State#state{protocol_state = H2#h2_state{out = [], out_bytes = 0}}.
+
+-doc """
+Append frames to the output of the connection, so that one socket write
+carries the frames of every message the loop handles before its mailbox
+runs dry. The loop writes the output when it would wait for a message,
+before a system message and in `nhttp_conn:terminate/2`. Output that
+reaches `?H2_OUT_MAX_BYTES` goes out at once. Every write of the
+connection goes through here, so frames leave in the order the codec
+made them.
+""".
+-spec queue_h2_out(#state{}, iodata()) -> #state{}.
+queue_h2_out(#state{protocol_state = #h2_state{out = Out, out_bytes = Bytes} = H2} = State, Data) ->
+    case Bytes + iolist_size(Data) of
+        Bytes ->
+            State;
+        Total when Total < ?H2_OUT_MAX_BYTES ->
+            State#state{protocol_state = H2#h2_state{out = [Out | Data], out_bytes = Total}};
+        _ ->
+            ok = nhttp_conn:sock_send(State, [Out | Data]),
+            State#state{protocol_state = H2#h2_state{out = [], out_bytes = 0}}
     end.
 
 %%%-----------------------------------------------------------------------------
@@ -313,14 +345,16 @@ apply_request_result(State, StreamId, {accept_body, _BodyState, NewHState}) ->
     enter_h2_accept_body(State, StreamId, NewHState);
 apply_request_result(State, StreamId, {upgrade, websocket, _NewHState}) ->
     Stream = stream(State, StreamId),
-    send_h2_error_response(State, StreamId, ?HTTP_INTERNAL_SERVER_ERROR),
-    State1 = release_request_worker(State, StreamId, Stream),
+    State1 = release_request_worker(
+        send_h2_error_response(State, StreamId, ?HTTP_INTERNAL_SERVER_ERROR), StreamId, Stream
+    ),
     nhttp_conn:emit_request_stop(State1, ?HTTP_INTERNAL_SERVER_ERROR, Stream#h2_stream.req_span),
     State1;
 apply_request_result(State, StreamId, {upgrade, websocket, _SessionOpts, _NewHState}) ->
     Stream = stream(State, StreamId),
-    send_h2_error_response(State, StreamId, ?HTTP_INTERNAL_SERVER_ERROR),
-    State1 = release_request_worker(State, StreamId, Stream),
+    State1 = release_request_worker(
+        send_h2_error_response(State, StreamId, ?HTTP_INTERNAL_SERVER_ERROR), StreamId, Stream
+    ),
     nhttp_conn:emit_request_stop(State1, ?HTTP_INTERNAL_SERVER_ERROR, Stream#h2_stream.req_span),
     State1;
 apply_request_result(State, StreamId, {abort, _Reason, NewHState}) ->
@@ -338,8 +372,9 @@ apply_request_result(State, StreamId, {nhttp_handler_exception, Class, Reason}) 
     ),
     nhttp_log:handler_crashed(Ctx, handle_request, Class, Reason),
     nhttp_conn:emit_handler_exception(Stream#h2_stream.req_span, Class, Reason),
-    send_h2_error_response(State, StreamId, ?HTTP_INTERNAL_SERVER_ERROR),
-    State1 = release_request_worker(State, StreamId, Stream),
+    State1 = release_request_worker(
+        send_h2_error_response(State, StreamId, ?HTTP_INTERNAL_SERVER_ERROR), StreamId, Stream
+    ),
     nhttp_conn:emit_request_stop(State1, ?HTTP_INTERNAL_SERVER_ERROR, Stream#h2_stream.req_span),
     State1#state{requests_count = State1#state.requests_count + 1}.
 
@@ -592,7 +627,7 @@ apply_stream_credit(
     term()
 ) -> #state{}.
 apply_stream_push_validation(
-    #state{protocol_state = #h2_state{h2_streams = Streams} = H2} = State,
+    State,
     StreamId,
     Stream0,
     Request,
@@ -605,22 +640,19 @@ apply_stream_push_validation(
             RespHeaders = nhttp_conn:alt_svc_headers(
                 State, [{<<":status">>, integer_to_binary(Status)} | Headers]
             ),
-            NewH2Conn = send_h2_headers(State, StreamId, RespHeaders, nofin),
             Stream1 = Stream0#h2_stream{type = stream, status = Status},
-            State#state{
-                protocol_state = H2#h2_state{
-                    h2_conn = NewH2Conn,
-                    h2_streams = Streams#{StreamId => Stream1}
-                },
+            State1 = put_h2_stream(
+                send_h2_headers(State, StreamId, RespHeaders, nofin), StreamId, Stream1
+            ),
+            State1#state{
                 handler_state = NewHState,
-                requests_count = State#state.requests_count + 1
+                requests_count = State1#state.requests_count + 1
             };
         ok_head ->
             RespHeaders = nhttp_conn:alt_svc_headers(
                 State, [{<<":status">>, integer_to_binary(Status)} | Headers]
             ),
-            NewH2Conn = send_h2_headers(State, StreamId, RespHeaders, fin),
-            State1 = State#state{protocol_state = H2#h2_state{h2_conn = NewH2Conn}},
+            State1 = send_h2_headers(State, StreamId, RespHeaders, fin),
             State2 = abort_stream_worker(State1, StreamId),
             State3 = release_request_worker(State2, StreamId, Stream0),
             nhttp_conn:emit_request_stop_with_size(State3, Status, Stream0#h2_stream.req_span, 0),
@@ -636,8 +668,9 @@ apply_stream_push_validation(
                 Path,
                 RejectReason
             ),
-            send_h2_error_response(State, StreamId, ?HTTP_INTERNAL_SERVER_ERROR),
-            State1 = abort_stream_worker(State, StreamId),
+            State1 = abort_stream_worker(
+                send_h2_error_response(State, StreamId, ?HTTP_INTERNAL_SERVER_ERROR), StreamId
+            ),
             State2 = release_request_worker(State1, StreamId, Stream0),
             nhttp_conn:emit_request_stop(
                 State2, ?HTTP_INTERNAL_SERVER_ERROR, Stream0#h2_stream.req_span
@@ -679,8 +712,7 @@ cancel_credit_timer({Ref, _DueAt}) ->
 credit_connection(#state{protocol_state = #h2_state{h2_conn = H2Conn} = H2} = State, Size) ->
     case nhttp_h2:send_window_update(H2Conn, connection, Size) of
         {ok, H2Conn1, Frame} ->
-            ok = nhttp_conn:sock_send(State, Frame),
-            State#state{protocol_state = H2#h2_state{h2_conn = H2Conn1}};
+            queue_h2_out(State#state{protocol_state = H2#h2_state{h2_conn = H2Conn1}}, Frame);
         {error, _} ->
             State
     end.
@@ -715,8 +747,7 @@ credit_stream(
         {ok, _UnknownStream, []} ->
             State;
         {ok, H2Conn1, Frame} ->
-            ok = nhttp_conn:sock_send(State, Frame),
-            State#state{protocol_state = H2#h2_state{h2_conn = H2Conn1}};
+            queue_h2_out(State#state{protocol_state = H2#h2_state{h2_conn = H2Conn1}}, Frame);
         {error, _} ->
             State
     end.
@@ -1490,11 +1521,11 @@ handle_h2_events(State, [Event | Rest]) ->
 -spec handle_h2_limit_error(#state{}, nhttp_lib:stream_id(), nhttp_limits:limit_error()) ->
     #state{}.
 handle_h2_limit_error(State, StreamId, body_too_large = E) ->
-    send_h2_error_response(State, StreamId, nhttp_limits:error_to_status(E)),
-    remove_h2_stream(send_h2_rst_stream(State, StreamId), StreamId);
+    State1 = send_h2_error_response(State, StreamId, nhttp_limits:error_to_status(E)),
+    remove_h2_stream(send_h2_rst_stream(State1, StreamId), StreamId);
 handle_h2_limit_error(State, StreamId, LimitError) ->
-    send_h2_error_response(State, StreamId, nhttp_limits:error_to_status(LimitError)),
-    remove_h2_stream(State, StreamId).
+    State1 = send_h2_error_response(State, StreamId, nhttp_limits:error_to_status(LimitError)),
+    remove_h2_stream(State1, StreamId).
 
 -spec handle_h2_reply_drained(#state{}, nhttp_lib:stream_id(), #h2_stream{}, nhttp_h2:fin()) ->
     #state{}.
@@ -1549,8 +1580,10 @@ handle_h2_worker_down(
                     nhttp_conn:emit_handler_exception(
                         Stream#h2_stream.req_span, exit, Reason
                     ),
-                    send_h2_error_response(State, StreamId, ?HTTP_INTERNAL_SERVER_ERROR),
-                    State1 = remove_h2_stream(Released, StreamId),
+                    State1 = remove_h2_stream(
+                        send_h2_error_response(Released, StreamId, ?HTTP_INTERNAL_SERVER_ERROR),
+                        StreamId
+                    ),
                     nhttp_conn:emit_request_stop(
                         State1, ?HTTP_INTERNAL_SERVER_ERROR, Stream#h2_stream.req_span
                     ),
@@ -1668,20 +1701,17 @@ offer_h2_data(
 ) ->
     case nhttp_h2:send_data(H2Conn, StreamId, Data, Fin) of
         {ok, NewH2Conn, Frames} ->
-            ok = write_frames(State, Prefix, Frames),
-            {sent, State#state{protocol_state = H2#h2_state{h2_conn = NewH2Conn}}};
+            State1 = State#state{protocol_state = H2#h2_state{h2_conn = NewH2Conn}},
+            {sent, write_frames(State1, Prefix, Frames)};
         {queued, NewH2Conn, Frames, _Buffered} ->
-            ok = write_frames(State, Prefix, Frames),
-            {queued, State#state{protocol_state = H2#h2_state{h2_conn = NewH2Conn}}};
+            State1 = State#state{protocol_state = H2#h2_state{h2_conn = NewH2Conn}},
+            {queued, write_frames(State1, Prefix, Frames)};
         {error, send_buffer_full} ->
-            ok = write_frames(State, Prefix, []),
-            {send_buffer_full, State};
+            {send_buffer_full, write_frames(State, Prefix, [])};
         {error, {stream_closed, _}} ->
-            ok = write_frames(State, Prefix, []),
-            {stream_gone, State};
+            {stream_gone, write_frames(State, Prefix, [])};
         {error, {unknown_stream, _}} ->
-            ok = write_frames(State, Prefix, []),
-            {stream_gone, State}
+            {stream_gone, write_frames(State, Prefix, [])}
     end.
 
 -doc """
@@ -1750,55 +1780,46 @@ reset_h2_stream(
     #state{protocol_state = #h2_state{h2_conn = H2Conn} = H2} = State, StreamId, ErrorCode
 ) ->
     {ok, NewH2Conn, Frame} = nhttp_h2:send_rst_stream(H2Conn, StreamId, ErrorCode),
-    ok = nhttp_conn:sock_send(State, Frame),
-    State#state{protocol_state = H2#h2_state{h2_conn = NewH2Conn}}.
+    queue_h2_out(State#state{protocol_state = H2#h2_state{h2_conn = NewH2Conn}}, Frame).
 
 -spec response_to_headers(nhttp_lib:response()) -> [{binary(), binary()}].
 response_to_headers(#{status := Status, headers := Headers}) ->
     [{<<":status">>, integer_to_binary(Status)} | Headers].
 
--spec send_credit_only(#state{}, iodata()) -> ok.
-send_credit_only(_State, []) ->
-    ok;
-send_credit_only(State, Credit) ->
-    nhttp_conn:sock_send(State, Credit).
-
--spec send_h2_error_response(#state{}, nhttp_lib:stream_id(), nhttp_lib:status()) -> ok.
+-spec send_h2_error_response(#state{}, nhttp_lib:stream_id(), nhttp_lib:status()) -> #state{}.
 send_h2_error_response(
     #state{protocol_state = #h2_state{h2_conn = H2Conn}} = State, StreamId, Status
 ) ->
     Headers = [{<<":status">>, integer_to_binary(Status)}],
     case nhttp_h2:send_headers(H2Conn, StreamId, Headers, fin) of
         {ok, _NewConn, Frame} ->
-            ok = nhttp_conn:sock_send(State, Frame),
-            ok;
+            queue_h2_out(State, Frame);
         {error, {stream_closed, _}} ->
-            ok;
+            State;
         {error, connection_closing} ->
-            ok
+            State
     end.
 
 -doc """
-Send a HEADERS frame and return the codec state. A refusal keeps the
-codec state: the stream is closed or the connection sent GOAWAY, and
+Send a HEADERS frame and keep the codec state it returns. A refusal keeps
+the codec state: the stream is closed or the connection sent GOAWAY, and
 `{data_pending, _}` cannot happen on a stream that has not started its
 body.
 """.
 -spec send_h2_headers(#state{}, nhttp_lib:stream_id(), nhttp_lib:headers(), nhttp_h2:fin()) ->
-    nhttp_h2:conn().
+    #state{}.
 send_h2_headers(
-    #state{protocol_state = #h2_state{h2_conn = H2Conn}} = State, StreamId, Headers, Fin
+    #state{protocol_state = #h2_state{h2_conn = H2Conn} = H2} = State, StreamId, Headers, Fin
 ) ->
     case nhttp_h2:send_headers(H2Conn, StreamId, Headers, Fin) of
         {ok, NewH2Conn, Frame} ->
-            ok = nhttp_conn:sock_send(State, Frame),
-            NewH2Conn;
+            queue_h2_out(State#state{protocol_state = H2#h2_state{h2_conn = NewH2Conn}}, Frame);
         {error, connection_closing} ->
-            H2Conn;
+            State;
         {error, {stream_closed, _}} ->
-            H2Conn;
+            State;
         {error, {data_pending, _}} ->
-            H2Conn
+            State
     end.
 
 -doc """
@@ -1826,11 +1847,10 @@ send_h2_response_headers_only(
 ) ->
     case nhttp_h2:send_headers(H2Conn, StreamId, Headers, fin) of
         {ok, NewH2Conn, Frame} ->
-            ok = send_with_credit(State, Credit, Frame),
-            {sent, State#state{protocol_state = H2#h2_state{h2_conn = NewH2Conn}}};
+            State1 = State#state{protocol_state = H2#h2_state{h2_conn = NewH2Conn}},
+            {sent, write_frames(State1, Credit, Frame)};
         {error, Reason} ->
-            ok = send_credit_only(State, Credit),
-            refused_h2_response(State, StreamId, Reason)
+            refused_h2_response(write_frames(State, Credit, []), StreamId, Reason)
     end.
 
 -doc """
@@ -1864,8 +1884,7 @@ send_h2_response_with_body(
                     {closed, remove_h2_stream(State2, StreamId)}
             end;
         {error, Reason} ->
-            ok = send_credit_only(State, Credit),
-            refused_h2_response(State, StreamId, Reason)
+            refused_h2_response(write_frames(State, Credit, []), StreamId, Reason)
     end.
 
 -spec send_h2_rst_stream(#state{}, nhttp_lib:stream_id()) -> #state{}.
@@ -1891,10 +1910,9 @@ send_h2_trailers(
 ) ->
     case nhttp_h2:send_headers(H2Conn, StreamId, Trailers, fin) of
         {ok, NewH2Conn, Frame} ->
-            ok = nhttp_conn:sock_send(State, Frame),
             WPid ! {chunk_ack, Ref, ok},
             State1 = State#state{protocol_state = H2#h2_state{h2_conn = NewH2Conn}},
-            complete_h2_stream(State1, StreamId, normal);
+            complete_h2_stream(queue_h2_out(State1, Frame), StreamId, normal);
         {error, {data_pending, _}} ->
             State1 = reset_h2_stream(State, StreamId, internal_error),
             WPid ! {chunk_ack, Ref, {error, closed}},
@@ -1907,12 +1925,6 @@ send_h2_trailers(
             complete_h2_stream(State, StreamId, normal)
     end.
 
--spec send_with_credit(#state{}, iodata(), iodata()) -> ok.
-send_with_credit(State, [], Frames) ->
-    nhttp_conn:sock_send(State, Frames);
-send_with_credit(State, Credit, Frames) ->
-    nhttp_conn:sock_send(State, [Credit, Frames]).
-
 -doc """
 The codec holds octets of `StreamId` in its send queue. A `#h2_stream{}`
 stays in `h2_streams` while this holds, so that `drain_idle/1` sees the
@@ -1922,8 +1934,8 @@ stream, and it leaves on the `data_sent` event that carries END_STREAM.
 stream_send_pending(#state{protocol_state = #h2_state{h2_conn = H2Conn}}, StreamId) ->
     nhttp_h2:send_buffer_bytes(H2Conn, StreamId) > 0.
 
--spec write_frames(#state{}, iodata(), iodata()) -> ok.
-write_frames(_State, [], []) ->
-    ok;
+-spec write_frames(#state{}, iodata(), iodata()) -> #state{}.
+write_frames(State, [], []) ->
+    State;
 write_frames(State, Prefix, Frames) ->
-    nhttp_conn:sock_send(State, [Prefix, Frames]).
+    queue_h2_out(State, [Prefix, Frames]).

@@ -53,11 +53,9 @@ connect(#state{handler = Handler, handler_state = HState} = State, StreamId, Req
         {nhttp_handler_exception, Class, Reason} ->
             Ctx = nhttp_log:request_ctx(nhttp_conn:log_ctx(State), Request, StreamId),
             nhttp_log:handler_crashed(Ctx, handle_request, Class, Reason),
-            send_error_response(State, StreamId, ?HTTP_INTERNAL_SERVER_ERROR),
-            State;
+            send_error_response(State, StreamId, ?HTTP_INTERNAL_SERVER_ERROR);
         _ ->
-            send_error_response(State, StreamId, ?HTTP_BAD_REQUEST),
-            State
+            send_error_response(State, StreamId, ?HTTP_BAD_REQUEST)
     end.
 
 -doc """
@@ -218,15 +216,7 @@ finish(#state{handler = Handler} = State, StreamId, WsReason) ->
     end.
 
 -spec open(#state{}, nhttp_lib:stream_id(), nhttp_ws:ws_session_opts()) -> #state{}.
-open(
-    #state{
-        handler = Handler,
-        handler_state = HState,
-        protocol_state = #h2_state{h2_streams = Streams} = H2
-    } = State,
-    StreamId,
-    SessionOpts
-) ->
+open(#state{handler = Handler, handler_state = HState} = State0, StreamId, SessionOpts) ->
     SubprotocolHeaders =
         case maps:get(subprotocol, SessionOpts, undefined) of
             undefined -> [];
@@ -238,7 +228,8 @@ open(
             Exts -> [{<<"sec-websocket-extensions">>, iolist_to_binary(lists:join(<<", ">>, Exts))}]
         end,
     RespHeaders = [{<<":status">>, <<"200">>}] ++ SubprotocolHeaders ++ ExtensionHeaders,
-    NewH2Conn = send_headers(State, StreamId, RespHeaders, nofin),
+    #state{protocol_state = #h2_state{h2_streams = Streams} = H2} =
+        State = send_headers(State0, StreamId, RespHeaders, nofin),
     Ref = make_ref(),
     Session = nhttp_ws:new_session(h2, self(), StreamId, Ref),
     Ws0 = #ws_state{
@@ -255,10 +246,7 @@ open(
         ws = Ws0
     },
     State1 = State#state{
-        protocol_state = H2#h2_state{
-            h2_conn = NewH2Conn,
-            h2_streams = Streams#{StreamId => Stream0}
-        },
+        protocol_state = H2#h2_state{h2_streams = Streams#{StreamId => Stream0}},
         requests_count = State#state.requests_count + 1
     },
     ok = nhttp_stats:incr_ws_session(),
@@ -394,13 +382,13 @@ send_close(State, StreamId, Code, Reason) ->
         end,
     offer(State, StreamId, CloseFrame, fin).
 
--spec send_error_response(#state{}, nhttp_lib:stream_id(), nhttp_lib:status()) -> ok.
+-spec send_error_response(#state{}, nhttp_lib:stream_id(), nhttp_lib:status()) -> #state{}.
 send_error_response(
     #state{protocol_state = #h2_state{h2_conn = H2Conn}} = State, StreamId, Status
 ) ->
     Headers = [{<<":status">>, integer_to_binary(Status)}],
     {ok, _, HeaderFrame} = nhttp_h2:send_headers(H2Conn, StreamId, Headers, fin),
-    nhttp_conn:sock_send(State, HeaderFrame).
+    nhttp_conn_h2:queue_h2_out(State, HeaderFrame).
 
 -doc """
 Offer one WebSocket frame to the codec send queue. A frame that outruns
@@ -413,8 +401,11 @@ send_frame(State, StreamId, Message) ->
     offer(State, StreamId, nhttp_ws:encode(Message), nofin).
 
 -spec send_headers(#state{}, nhttp_lib:stream_id(), nhttp_lib:headers(), nhttp_h2:fin()) ->
-    nhttp_h2:conn().
-send_headers(#state{protocol_state = #h2_state{h2_conn = H2Conn}} = State, StreamId, Headers, Fin) ->
+    #state{}.
+send_headers(
+    #state{protocol_state = #h2_state{h2_conn = H2Conn} = H2} = State, StreamId, Headers, Fin
+) ->
     {ok, NewH2Conn, EncodedFrame} = nhttp_h2:send_headers(H2Conn, StreamId, Headers, Fin),
-    nhttp_conn:sock_send(State, EncodedFrame),
-    NewH2Conn.
+    nhttp_conn_h2:queue_h2_out(
+        State#state{protocol_state = H2#h2_state{h2_conn = NewH2Conn}}, EncodedFrame
+    ).
