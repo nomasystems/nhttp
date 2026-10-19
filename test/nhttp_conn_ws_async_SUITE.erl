@@ -13,6 +13,7 @@ H1/H2/H3) lands in phase 6.
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
 
+-include("../src/nhttp_conn.hrl").
 -include("../src/nhttp_ws_codes.hrl").
 
 -export([
@@ -48,7 +49,13 @@ H1/H2/H3) lands in phase 6.
     ws_h1_partial_frame/1,
     ws_h1_stale_close_cast/1,
     ws_h1_unknown_cast/1,
-    ws_h1_session_opts_upgrade/1
+    ws_h1_session_opts_upgrade/1,
+    ws_h1_send_after_socket_close_gone/1,
+    handler_reply_close/1,
+    handler_reply_invalid_close/1,
+    handler_reply_big_ping/1,
+    handler_close_invalid_code/1,
+    handler_close_big_reason/1
 ]).
 
 %%%-----------------------------------------------------------------------------
@@ -86,7 +93,13 @@ groups() ->
             ws_h1_partial_frame,
             ws_h1_stale_close_cast,
             ws_h1_unknown_cast,
-            ws_h1_session_opts_upgrade
+            ws_h1_session_opts_upgrade,
+            ws_h1_send_after_socket_close_gone,
+            handler_reply_close,
+            handler_reply_invalid_close,
+            handler_reply_big_ping,
+            handler_close_invalid_code,
+            handler_close_big_reason
         ]}
     ].
 
@@ -295,6 +308,77 @@ ws_h1_session_opts_upgrade(_Config) ->
     ?assertEqual(h1, nhttp_ws:transport(Session)),
     ok = gen_tcp:send(Sock, nhttp_ws:encode_masked({ping, <<"p">>})),
     ?assertEqual({pong, <<"p">>}, recv_frame(Sock)),
+    teardown_ws(Sock, Server).
+
+ws_h1_send_after_socket_close_gone(_Config) ->
+    {Sock, Server, Session} = setup_ws(echo, #{}),
+    ConnPid = nhttp_ws:owner(Session),
+    #state{socket = {tcp, Port}} = sys:get_state(ConnPid),
+    ok = gen_tcp:close(Port),
+    ?assertEqual({error, gone}, nhttp_ws:send(Session, {text, <<"late">>})),
+    ?assertEqual({error, gone}, nhttp_ws:send_async(Session, {text, <<"late">>})),
+    teardown_ws(Sock, Server).
+
+handler_reply_close(_Config) ->
+    {Sock, Server, _Session} = setup_ws(reply_close, #{}),
+    ok = send_text(Sock, <<"go">>),
+    {F1, F2} = recv_two_frames(Sock),
+    ?assertEqual({text, <<"before">>}, F1),
+    ?assertEqual({close, 4003, <<"reply close">>}, F2),
+    ?assertMatch({closed, {local, 4003, <<"reply close">>}}, recv_observer_event(closed)),
+    ?assertEqual({error, closed}, gen_tcp:recv(Sock, 0, 2000)),
+    teardown_ws(Sock, Server).
+
+handler_reply_invalid_close(_Config) ->
+    {Sock, Server, _Session} = setup_ws(reply_bad_close, #{}),
+    ok = send_text(Sock, <<"go">>),
+    ?assertEqual(
+        {close, ?WS_CLOSE_INTERNAL_ERROR, <<"Internal Server Error">>}, recv_frame(Sock)
+    ),
+    ?assertMatch(
+        {closed, {handler_crash, {error, {invalid_ws_message, {close, 1005, <<>>}, _}}}},
+        recv_observer_event(closed)
+    ),
+    teardown_ws(Sock, Server).
+
+handler_reply_big_ping(_Config) ->
+    {Sock, Server, _Session} = setup_ws(reply_big_ping, #{}),
+    ok = send_text(Sock, <<"go">>),
+    ?assertEqual(
+        {close, ?WS_CLOSE_INTERNAL_ERROR, <<"Internal Server Error">>}, recv_frame(Sock)
+    ),
+    ?assertMatch(
+        {closed,
+            {handler_crash, {error, {invalid_ws_message, {ping, _}, control_frame_too_large}}}},
+        recv_observer_event(closed)
+    ),
+    teardown_ws(Sock, Server).
+
+handler_close_invalid_code(_Config) ->
+    {Sock, Server, _Session} = setup_ws(close_bad_code, #{}),
+    ok = send_text(Sock, <<"go">>),
+    ?assertEqual(
+        {close, ?WS_CLOSE_INTERNAL_ERROR, <<"Internal Server Error">>}, recv_frame(Sock)
+    ),
+    ?assertMatch(
+        {closed,
+            {handler_crash, {error, {invalid_ws_message, {close, 1004, _}, invalid_close_code}}}},
+        recv_observer_event(closed)
+    ),
+    teardown_ws(Sock, Server).
+
+handler_close_big_reason(_Config) ->
+    {Sock, Server, _Session} = setup_ws(close_big_reason, #{}),
+    ok = send_text(Sock, <<"go">>),
+    ?assertEqual(
+        {close, ?WS_CLOSE_INTERNAL_ERROR, <<"Internal Server Error">>}, recv_frame(Sock)
+    ),
+    ?assertMatch(
+        {closed,
+            {handler_crash,
+                {error, {invalid_ws_message, {close, 4000, _}, close_reason_too_large}}}},
+        recv_observer_event(closed)
+    ),
     teardown_ws(Sock, Server).
 
 %%%-----------------------------------------------------------------------------

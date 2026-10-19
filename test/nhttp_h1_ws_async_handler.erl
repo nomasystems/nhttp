@@ -24,6 +24,15 @@ the listener, where `Mode` selects per-test variations:
 - `multi_reply` :`handle_ws_frame/3` returns `{reply, [F1, F2], _}`
                    (list of frames in one return), exercising the list
                    branch of `apply_ws_result/3`.
+- `reply_close`  :`handle_ws_frame/3` replies a text, a CLOSE and a text
+                   in one list. The CLOSE ends the session, the text after
+                   it never reaches the wire.
+- `reply_bad_close`: `handle_ws_frame/3` replies `{close, 1005, <<>>}`,
+                   a code an endpoint must not send (RFC 6455 §7.4.1).
+- `reply_big_ping`: `handle_ws_frame/3` replies a PING over 125 bytes.
+- `close_bad_code`: `handle_ws_frame/3` returns `{close, 1004, _, _}`.
+- `close_big_reason`: `handle_ws_frame/3` returns a close with a reason
+                   over 123 bytes.
 - `plain_open`  :`handle_ws_open/2` returns `{ok, State}` without the
                    optional runtime-opts map.
 - `session_opts_upgrade`: `handle_request/2` returns the 4-tuple
@@ -87,6 +96,16 @@ handle_ws_frame({text, _Data}, _Session, #{mode := stop_on_text} = State) ->
     {stop, stop_requested, State};
 handle_ws_frame({text, Data}, _Session, #{mode := multi_reply} = State) ->
     {reply, [{text, <<"first:", Data/binary>>}, {text, <<"second:", Data/binary>>}], State};
+handle_ws_frame({text, _Data}, _Session, #{mode := reply_close} = State) ->
+    {reply, [{text, <<"before">>}, {close, 4003, <<"reply close">>}, {text, <<"after">>}], State};
+handle_ws_frame({text, _Data}, _Session, #{mode := reply_bad_close} = State) ->
+    {reply, {close, 1005, <<>>}, State};
+handle_ws_frame({text, _Data}, _Session, #{mode := reply_big_ping} = State) ->
+    {reply, {ping, binary:copy(<<"p">>, 126)}, State};
+handle_ws_frame({text, _Data}, _Session, #{mode := close_bad_code} = State) ->
+    {close, 1004, <<"reserved">>, State};
+handle_ws_frame({text, _Data}, _Session, #{mode := close_big_reason} = State) ->
+    {close, 4000, binary:copy(<<"r">>, 124), State};
 handle_ws_frame({Type, Data} = Frame, _Session, #{observer := Obs, mode := echo} = State) when
     Type =:= text orelse Type =:= binary
 ->

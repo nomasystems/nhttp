@@ -12,6 +12,7 @@
 %% MACROS
 %%%-----------------------------------------------------------------------------
 -define(MESSAGE_TOO_BIG, <<"Message Too Big">>).
+-define(INTERNAL_SERVER_ERROR, <<"Internal Server Error">>).
 
 %%%-----------------------------------------------------------------------------
 %% API EXPORTS
@@ -36,6 +37,7 @@
 -export_type([
     action/0,
     actions/0,
+    message_summary/0,
     runtime_opts/0
 ]).
 
@@ -52,6 +54,9 @@
 
 -type actions() :: [action()].
 
+-type message_summary() ::
+    {close, nhttp_ws:close_code(), non_neg_integer()} | {nhttp_ws:ws_opcode(), non_neg_integer()}.
+
 %%%-----------------------------------------------------------------------------
 %% API
 %%%-----------------------------------------------------------------------------
@@ -59,29 +64,30 @@
 Apply the result of a handler callback (`handle_ws_frame/3` or
 `handle_ws_info/3`) to the session. Returns the session with the new
 handler state and the actions the transport must interpret, in order.
+
+A `close` or `{close, Code, Reason}` inside a reply ends the session the
+same way `{close, Code, Reason, State}` does, and the frames after it in
+the reply are not written (RFC 6455 §5.5.1). A CLOSE with a code or
+reason that `nhttp_ws_frame:validate_close/2` refuses, or a PING or
+PONG over 125 bytes, is a handler error: the session closes with 1011
+and `{handler_crash, {error, {invalid_ws_message, Frame, Why}}}`.
 """.
 -spec apply_handler_result(term(), #ws_state{}) -> {#ws_state{}, actions()}.
 apply_handler_result({ok, NewSState}, Ws) ->
     {Ws#ws_state{handler_state = NewSState}, []};
 apply_handler_result({reply, Frames, NewSState}, Ws) when is_list(Frames) ->
-    {Ws#ws_state{handler_state = NewSState}, [{send_frame, F} || F <- Frames]};
+    {Ws#ws_state{handler_state = NewSState}, reply_actions(Frames)};
 apply_handler_result({reply, Frame, NewSState}, Ws) ->
-    {Ws#ws_state{handler_state = NewSState}, [{send_frame, Frame}]};
+    {Ws#ws_state{handler_state = NewSState}, reply_actions([Frame])};
 apply_handler_result({close, Code, Reason, NewSState}, Ws) ->
-    {Ws#ws_state{handler_state = NewSState}, [
-        {send_close, Code, Reason},
-        {close_session, {local, Code, Reason}}
-    ]};
+    {Ws#ws_state{handler_state = NewSState}, close_actions(Code, Reason)};
 apply_handler_result({stop, Reason, NewSState}, Ws) ->
     {Ws#ws_state{handler_state = NewSState}, [
         {send_close, ?WS_CLOSE_GOING_AWAY, <<"Server Going Away">>},
         {close_session, {handler_stop, Reason}}
     ]};
 apply_handler_result({nhttp_handler_exception, Class, Reason}, Ws) ->
-    {Ws, [
-        {send_close, ?WS_CLOSE_INTERNAL_ERROR, <<"Internal Server Error">>},
-        {close_session, {handler_crash, {Class, Reason}}}
-    ]}.
+    {Ws, handler_error_actions(Class, Reason)}.
 
 -doc """
 Apply user-provided runtime opts on top of the current opts map.
@@ -185,7 +191,7 @@ dispatch_info(_Ctx, _Msg, #ws_state{handles_info = false} = Ws, _Handler) ->
 dispatch_info(Ctx, Msg, #ws_state{handler_state = SState, session = Session} = Ws, Handler) ->
     Result = nhttp_handler:safe_handle_ws_info(Handler, Msg, Session, SState),
     log_crash_if_any(Result, Ctx, handle_ws_info),
-    apply_handler_result(Result, Ws).
+    log_invalid_reply(apply_handler_result(Result, Ws), Ctx, handle_ws_info).
 
 -doc """
 Run the open lifecycle. Records which optional callbacks the handler
@@ -214,15 +220,9 @@ open(Ctx, Ws0, Handler) ->
                     NewOpts = apply_runtime_opts(Opts, runtime_opts(Ws)),
                     {put_runtime_opts(NewOpts, Ws#ws_state{handler_state = NewSState}), []};
                 {close, Code, Reason} ->
-                    {Ws, [
-                        {send_close, Code, Reason},
-                        {close_session, {local, Code, Reason}}
-                    ]};
+                    log_invalid_reply({Ws, close_actions(Code, Reason)}, Ctx, handle_ws_open);
                 {nhttp_handler_exception, Class, Reason} ->
-                    {Ws, [
-                        {send_close, ?WS_CLOSE_INTERNAL_ERROR, <<"Internal Server Error">>},
-                        {close_session, {handler_crash, {Class, Reason}}}
-                    ]}
+                    {Ws, handler_error_actions(Class, Reason)}
             end
     end.
 
@@ -248,6 +248,15 @@ str_or_atom(R) -> iolist_to_binary(io_lib:format("~p", [R])).
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS
 %%%-----------------------------------------------------------------------------
+-spec close_actions(nhttp_ws:close_code(), binary()) -> actions().
+close_actions(Code, Reason) ->
+    case nhttp_ws_frame:validate_close(Code, Reason) of
+        ok ->
+            [{send_close, Code, Reason}, {close_session, {local, Code, Reason}}];
+        {error, Why} ->
+            handler_error_actions(error, {invalid_ws_message, {close, Code, Reason}, Why})
+    end.
+
 -spec control_frame_actions(
     nhttp_log:ctx(), actions(), boolean(), nhttp_ws:ws_frame(), #ws_state{}, module()
 ) ->
@@ -258,6 +267,13 @@ control_frame_actions(Ctx, Reply, true, Frame, Ws, Handler) ->
     {Ws1, Actions} = handler_frame_actions(Ctx, Frame, Ws, Handler),
     {Ws1, Reply ++ Actions}.
 
+-spec handler_error_actions(atom(), term()) -> actions().
+handler_error_actions(Class, Reason) ->
+    [
+        {send_close, ?WS_CLOSE_INTERNAL_ERROR, ?INTERNAL_SERVER_ERROR},
+        {close_session, {handler_crash, {Class, Reason}}}
+    ].
+
 -spec handler_frame_actions(nhttp_log:ctx(), nhttp_ws:ws_frame(), #ws_state{}, module()) ->
     {#ws_state{}, actions()}.
 handler_frame_actions(_Ctx, _Frame, #ws_state{handles_frame = false} = Ws, _Handler) ->
@@ -267,7 +283,7 @@ handler_frame_actions(
 ) ->
     Result = nhttp_handler:safe_handle_ws_frame(Handler, Frame, Session, SState),
     log_crash_if_any(Result, Ctx, handle_ws_frame),
-    apply_handler_result(Result, Ws).
+    log_invalid_reply(apply_handler_result(Result, Ws), Ctx, handle_ws_frame).
 
 -spec log_crash_if_any(term(), nhttp_log:ctx(), atom()) -> ok.
 log_crash_if_any({nhttp_handler_exception, Class, Reason}, Ctx, Callback) ->
@@ -275,6 +291,61 @@ log_crash_if_any({nhttp_handler_exception, Class, Reason}, Ctx, Callback) ->
 log_crash_if_any(_Result, _Ctx, _Callback) ->
     ok.
 
+-doc "Log a reply that the validator refused and pass the dispatch result through.".
+
+-spec log_invalid_reply({#ws_state{}, actions()}, nhttp_log:ctx(), atom()) ->
+    {#ws_state{}, actions()}.
+log_invalid_reply({_Ws, []} = Dispatched, _Ctx, _Callback) ->
+    Dispatched;
+log_invalid_reply({_Ws, Actions} = Dispatched, Ctx, Callback) ->
+    case lists:last(Actions) of
+        {close_session, {handler_crash, {error, {invalid_ws_message, Frame, Why}}}} ->
+            nhttp_log:ws_invalid_reply(Ctx, Callback, message_summary(Frame), Why);
+        _ ->
+            ok
+    end,
+    Dispatched.
+
+-spec message_summary(nhttp_ws:ws_message()) -> message_summary().
+message_summary({close, Code, Reason}) -> {close, Code, byte_size(Reason)};
+message_summary({Opcode, Data}) -> {Opcode, byte_size(Data)};
+message_summary(Opcode) -> {Opcode, 0}.
+
 -spec put_runtime_opts(runtime_opts(), #ws_state{}) -> #ws_state{}.
 put_runtime_opts(#{deliver_ping := DP, deliver_pong := DG, max_message_size := MS}, Ws) ->
     Ws#ws_state{deliver_ping = DP, deliver_pong = DG, max_message_size = MS}.
+
+-doc """
+Turn the frames of a reply into send actions, in order, up to and
+including a CLOSE. A reply with a frame the validator refuses writes
+nothing and ends the session with the handler error actions, the same as
+a handler exception.
+""".
+-spec reply_actions([nhttp_ws:ws_message()]) -> actions().
+reply_actions(Frames) ->
+    case validate_reply(Frames) of
+        ok -> send_actions(Frames);
+        {error, Frame, Why} -> handler_error_actions(error, {invalid_ws_message, Frame, Why})
+    end.
+
+-spec send_actions([nhttp_ws:ws_message()]) -> actions().
+send_actions([]) ->
+    [];
+send_actions([close | _Rest]) ->
+    [{send_close, no_code, <<>>}, {close_session, {local, ?WS_CLOSE_NO_STATUS, <<>>}}];
+send_actions([{close, Code, Reason} | _Rest]) ->
+    [{send_close, Code, Reason}, {close_session, {local, Code, Reason}}];
+send_actions([Frame | Rest]) ->
+    [{send_frame, Frame} | send_actions(Rest)].
+
+-spec validate_reply([nhttp_ws:ws_message()]) ->
+    ok | {error, nhttp_ws:ws_message(), nhttp_ws_frame:message_error()}.
+validate_reply([]) ->
+    ok;
+validate_reply([Frame | Rest]) ->
+    case {nhttp_ws_frame:validate_message(Frame), Frame} of
+        {{error, Why}, _} -> {error, Frame, Why};
+        {ok, close} -> ok;
+        {ok, {close, _Code, _Reason}} -> ok;
+        {ok, _} -> validate_reply(Rest)
+    end.

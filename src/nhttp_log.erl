@@ -17,6 +17,7 @@
     sock_send_failed/2,
     stream_push_producer_crashed/2,
     stream_push_rejected/4,
+    ws_invalid_reply/4,
     ws_send_failed/2
 ]).
 
@@ -155,6 +156,17 @@ stream_push_rejected(Ctx, Method, Path, Reason) ->
         method => Method,
         path => Path,
         reject_reason => Reason
+    }).
+
+-doc """
+A handler replied a frame that RFC 6455 forbids the server to send: a CLOSE
+with a reserved code or an oversize reason, or a control frame over 125
+bytes. The session closes with 1011.
+""".
+-spec ws_invalid_reply(ctx(), atom(), nhttp_conn_ws:message_summary(), atom()) -> ok.
+ws_invalid_reply(Ctx, Callback, Frame, Reason) ->
+    logger:warning(Ctx#{
+        event => ws_invalid_reply, callback => Callback, frame => Frame, reason => Reason
     }).
 
 -doc "WebSocket frame send returned `{error, _}` on a fire-and-forget path.".

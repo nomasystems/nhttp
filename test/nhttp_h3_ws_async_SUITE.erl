@@ -48,6 +48,8 @@ Reuses the transport-agnostic `nhttp_h1_ws_async_handler` test handler.
     multi_session_addressed_info/1,
     multi_reply_list/1,
     plain_open_no_opts/1,
+    handler_reply_close/1,
+    handler_reply_invalid_close/1,
     ws_h3_blocked_send_in_order/1
 ]).
 
@@ -80,6 +82,8 @@ groups() ->
             multi_session_addressed_info,
             multi_reply_list,
             plain_open_no_opts,
+            handler_reply_close,
+            handler_reply_invalid_close,
             ws_h3_blocked_send_in_order
         ]}
     ].
@@ -251,6 +255,27 @@ plain_open_no_opts(Config) ->
     Ctx = setup_ws(Config, plain_open),
     ok = h3_ws_send_frame(Ctx, {ping, <<"p">>}),
     ?assertEqual({pong, <<"p">>}, h3_ws_recv_frame(Ctx)),
+    teardown_ws(Ctx).
+
+handler_reply_close(Config) ->
+    Ctx = setup_ws(Config, reply_close),
+    ok = h3_ws_send_frame(Ctx, {text, <<"go">>}),
+    ?assertEqual({text, <<"before">>}, h3_ws_recv_frame(Ctx)),
+    ?assertEqual({close, 4003, <<"reply close">>}, h3_ws_recv_frame(Ctx)),
+    ?assertMatch({closed, {local, 4003, <<"reply close">>}}, recv_observer_event(closed)),
+    ?assertEqual(fin, h3_ws_recv_frame(Ctx)),
+    teardown_ws(Ctx).
+
+handler_reply_invalid_close(Config) ->
+    Ctx = setup_ws(Config, reply_bad_close),
+    ok = h3_ws_send_frame(Ctx, {text, <<"go">>}),
+    ?assertEqual(
+        {close, ?WS_CLOSE_INTERNAL_ERROR, <<"Internal Server Error">>}, h3_ws_recv_frame(Ctx)
+    ),
+    ?assertMatch(
+        {closed, {handler_crash, {error, {invalid_ws_message, {close, 1005, <<>>}, _}}}},
+        recv_observer_event(closed)
+    ),
     teardown_ws(Ctx).
 
 ws_h3_blocked_send_in_order(Config) ->

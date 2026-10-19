@@ -32,6 +32,8 @@ all() ->
         ws_apply_runtime_opts_test,
         ws_oversize_test,
         ws_apply_handler_result_test,
+        ws_apply_handler_result_close_in_reply_test,
+        ws_apply_handler_result_invalid_frame_test,
         stream_worker_body_fin_unconsumed_test,
         stream_worker_body_peer_aborted_test,
         stream_worker_body_handler_crash_test,
@@ -199,6 +201,52 @@ ws_apply_handler_result_test(_Config) ->
         ]},
         nhttp_conn_ws:apply_handler_result({nhttp_handler_exception, error, boom}, Ws)
     ).
+
+ws_apply_handler_result_close_in_reply_test(_Config) ->
+    Ws = #ws_state{session = s, ref = make_ref(), handler_state = old},
+    New = Ws#ws_state{handler_state = new},
+    ?assertEqual(
+        {New, [
+            {send_frame, {text, <<"a">>}},
+            {send_close, no_code, <<>>},
+            {close_session, {local, ?WS_CLOSE_NO_STATUS, <<>>}}
+        ]},
+        nhttp_conn_ws:apply_handler_result(
+            {reply, [{text, <<"a">>}, close, {text, <<"b">>}], new}, Ws
+        )
+    ),
+    ?assertEqual(
+        {New, [{send_close, 4000, <<"r">>}, {close_session, {local, 4000, <<"r">>}}]},
+        nhttp_conn_ws:apply_handler_result({reply, {close, 4000, <<"r">>}, new}, Ws)
+    ).
+
+ws_apply_handler_result_invalid_frame_test(_Config) ->
+    Ws = #ws_state{session = s, ref = make_ref(), handler_state = old},
+    New = Ws#ws_state{handler_state = new},
+    BadClose = {close, 1005, <<>>},
+    LongReason = binary:copy(<<"r">>, 124),
+    BigPing = {ping, binary:copy(<<"p">>, 126)},
+    Rejected = [
+        {{reply, BadClose, new}, BadClose, invalid_close_code},
+        {{reply, [{text, <<"a">>}, BigPing], new}, BigPing, control_frame_too_large},
+        {
+            {reply, {pong, binary:copy(<<"p">>, 126)}, new},
+            {pong, binary:copy(<<"p">>, 126)},
+            control_frame_too_large
+        },
+        {{close, 1005, <<>>, new}, BadClose, invalid_close_code},
+        {{close, 4000, LongReason, new}, {close, 4000, LongReason}, close_reason_too_large}
+    ],
+    [
+        ?assertEqual(
+            {New, [
+                {send_close, ?WS_CLOSE_INTERNAL_ERROR, <<"Internal Server Error">>},
+                {close_session, {handler_crash, {error, {invalid_ws_message, Frame, Why}}}}
+            ]},
+            nhttp_conn_ws:apply_handler_result(Result, Ws)
+        )
+     || {Result, Frame, Why} <- Rejected
+    ].
 
 %%%-----------------------------------------------------------------------------
 %%% nhttp_stream_worker: the test process plays the connection role.
