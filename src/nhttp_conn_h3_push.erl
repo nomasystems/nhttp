@@ -212,6 +212,10 @@ handle_h3_push_worker_down(
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - HTTP/3 PUSH STREAMING
 %%%-----------------------------------------------------------------------------
+-spec ack_ref(#h3_push_ctx{}) -> reference().
+ack_ref(#h3_push_ctx{ref = Ref, pending = undefined}) -> Ref;
+ack_ref(#h3_push_ctx{pending = {Ref, _Fin}}) -> Ref.
+
 -spec cleanup_h3_push_stream(
     #state{}, nhttp_lib:stream_id(), pid()
 ) -> #state{}.
@@ -241,10 +245,6 @@ emit_h3_stream_complete(_State, _StreamId, #h3_stream{push = undefined}, _Reason
 emit_h3_stream_complete(State, _StreamId, #h3_stream{push = Ctx}, _Reason) ->
     #h3_push_ctx{status = Status, req_span = ReqSpan, bytes = Bytes} = Ctx,
     nhttp_conn_h3:emit_request_stop_with_size(State, Status, ReqSpan, Bytes).
-
--spec ack_ref(#h3_push_ctx{}) -> reference().
-ack_ref(#h3_push_ctx{ref = Ref, pending = undefined}) -> Ref;
-ack_ref(#h3_push_ctx{pending = {Ref, _Fin}}) -> Ref.
 
 -spec finalize_h3_push_send(
     #state{}, nhttp_lib:stream_id(), pid(), reference(), nhttp_h3:fin()

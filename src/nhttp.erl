@@ -164,12 +164,13 @@ RFC 9001 §9.2).
 %%%-----------------------------------------------------------------------------
 -export_type([
     authority/0,
-    header_name/0,
-    header_value/0,
-    headers/0,
+
     h2_dispatch/0,
     h2_response_delay/0,
     h2_window_policy/0,
+    header_name/0,
+    header_value/0,
+    headers/0,
 
     method/0,
     name/0,

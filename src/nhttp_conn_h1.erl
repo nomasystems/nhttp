@@ -104,6 +104,52 @@ system_terminate(Reason, _Parent, _Debug, State) ->
 %% INTERNAL FUNCTIONS - HTTP/1.1 LOOP
 %%%-----------------------------------------------------------------------------
 -doc """
+Arm the absolute request-head deadline the first time a head is buffered
+incomplete. Persists across packets (and pipelined leftover bytes) so the
+deadline is measured from the first byte of the head, not re-armed per
+arrival. Cleared on a complete head parse.
+""".
+-spec arm_head_deadline(#state{}) -> #state{}.
+arm_head_deadline(#state{protocol_state = #h1_state{buffer = <<>>}} = State) ->
+    State;
+arm_head_deadline(
+    #state{protocol_state = #h1_state{head_deadline_at = undefined, request_timeout = infinity}} =
+        State
+) ->
+    State;
+arm_head_deadline(
+    #state{
+        protocol_state =
+            #h1_state{head_deadline_at = undefined, request_timeout = RequestTimeout} = H1
+    } = State
+) ->
+    State#state{
+        protocol_state = H1#h1_state{
+            head_deadline_at = erlang:monotonic_time(millisecond) + RequestTimeout
+        }
+    };
+arm_head_deadline(#state{} = State) ->
+    State.
+
+-doc """
+Effective wait while receiving a request head. With no head in flight the
+quiescence wait governs; once a head is partially buffered the absolute
+`request_timeout` deadline caps the time left to the idle deadline, so a
+per-packet drip (slowloris) cannot re-arm the wait forever.
+""".
+-spec h1_head_timeout(#state{}, nhttp_conn:deadline()) -> timeout().
+h1_head_timeout(
+    #state{
+        protocol_state = #h1_state{head_deadline_at = undefined},
+        hibernate_after = HibernateAfter
+    },
+    IdleDeadline
+) ->
+    nhttp_conn:quiescence_wait(HibernateAfter, IdleDeadline);
+h1_head_timeout(#state{protocol_state = #h1_state{head_deadline_at = Deadline}}, IdleDeadline) ->
+    min(nhttp_conn:deadline_remaining(IdleDeadline), nhttp_conn:deadline_remaining(Deadline)).
+
+-doc """
 Head-wait block point. With no head in flight the receive waits the
 `hibernate` timeout, capped by the idle deadline. A keep-alive connection
 that is serving requests re-enters here per request and never
@@ -117,11 +163,6 @@ absolute `request_timeout` deadline caps the wait instead.
 -spec h1_loop(pid(), [sys:debug_option()], #state{}) -> no_return().
 h1_loop(Parent, Debug, #state{idle_timeout = IdleTimeout} = State) ->
     h1_receive(Parent, Debug, State, nhttp_conn:idle_deadline(IdleTimeout)).
-
--spec hibernate(pid(), [sys:debug_option()], #state{}, timeout()) -> no_return().
-hibernate(Parent, Debug, State, IdleRemaining) ->
-    Timer = nhttp_conn:start_hibernate_timer(IdleRemaining),
-    proc_lib:hibernate(?MODULE, h1_wake, [Parent, Debug, State, Timer]).
 
 -spec h1_receive(pid(), [sys:debug_option()], #state{}, nhttp_conn:deadline()) -> no_return().
 h1_receive(Parent, Debug, State, IdleDeadline) ->
@@ -148,23 +189,16 @@ h1_receive(Parent, Debug, State, IdleDeadline) ->
         handle_h1_head_timeout(Parent, Debug, State, IdleDeadline)
     end.
 
--doc """
-Effective wait while receiving a request head. With no head in flight the
-quiescence wait governs; once a head is partially buffered the absolute
-`request_timeout` deadline caps the time left to the idle deadline, so a
-per-packet drip (slowloris) cannot re-arm the wait forever.
-""".
--spec h1_head_timeout(#state{}, nhttp_conn:deadline()) -> timeout().
-h1_head_timeout(
-    #state{
-        protocol_state = #h1_state{head_deadline_at = undefined},
-        hibernate_after = HibernateAfter
-    },
-    IdleDeadline
+-spec handle_h1_data(pid(), [sys:debug_option()], #state{}, binary()) -> no_return().
+handle_h1_data(Parent, Debug, #state{protocol_state = #h1_state{buffer = <<>>} = H1} = State, Data) ->
+    process_h1_pipeline(Parent, Debug, State#state{protocol_state = H1#h1_state{buffer = Data}}, 0);
+handle_h1_data(
+    Parent, Debug, #state{protocol_state = #h1_state{buffer = Buffer} = H1} = State, Data
 ) ->
-    nhttp_conn:quiescence_wait(HibernateAfter, IdleDeadline);
-h1_head_timeout(#state{protocol_state = #h1_state{head_deadline_at = Deadline}}, IdleDeadline) ->
-    min(nhttp_conn:deadline_remaining(IdleDeadline), nhttp_conn:deadline_remaining(Deadline)).
+    Combined = <<Buffer/binary, Data/binary>>,
+    process_h1_pipeline(
+        Parent, Debug, State#state{protocol_state = H1#h1_state{buffer = Combined}}, 0
+    ).
 
 -spec handle_h1_head_timeout(pid(), [sys:debug_option()], #state{}, nhttp_conn:deadline()) ->
     no_return().
@@ -200,44 +234,10 @@ handle_h1_head_timeout(
             nhttp_conn:stop(idle_timeout, State)
     end.
 
--doc """
-Arm the absolute request-head deadline the first time a head is buffered
-incomplete. Persists across packets (and pipelined leftover bytes) so the
-deadline is measured from the first byte of the head, not re-armed per
-arrival. Cleared on a complete head parse.
-""".
--spec arm_head_deadline(#state{}) -> #state{}.
-arm_head_deadline(#state{protocol_state = #h1_state{buffer = <<>>}} = State) ->
-    State;
-arm_head_deadline(
-    #state{protocol_state = #h1_state{head_deadline_at = undefined, request_timeout = infinity}} =
-        State
-) ->
-    State;
-arm_head_deadline(
-    #state{
-        protocol_state =
-            #h1_state{head_deadline_at = undefined, request_timeout = RequestTimeout} = H1
-    } = State
-) ->
-    State#state{
-        protocol_state = H1#h1_state{
-            head_deadline_at = erlang:monotonic_time(millisecond) + RequestTimeout
-        }
-    };
-arm_head_deadline(#state{} = State) ->
-    State.
-
--spec handle_h1_data(pid(), [sys:debug_option()], #state{}, binary()) -> no_return().
-handle_h1_data(Parent, Debug, #state{protocol_state = #h1_state{buffer = <<>>} = H1} = State, Data) ->
-    process_h1_pipeline(Parent, Debug, State#state{protocol_state = H1#h1_state{buffer = Data}}, 0);
-handle_h1_data(
-    Parent, Debug, #state{protocol_state = #h1_state{buffer = Buffer} = H1} = State, Data
-) ->
-    Combined = <<Buffer/binary, Data/binary>>,
-    process_h1_pipeline(
-        Parent, Debug, State#state{protocol_state = H1#h1_state{buffer = Combined}}, 0
-    ).
+-spec hibernate(pid(), [sys:debug_option()], #state{}, timeout()) -> no_return().
+hibernate(Parent, Debug, State, IdleRemaining) ->
+    Timer = nhttp_conn:start_hibernate_timer(IdleRemaining),
+    proc_lib:hibernate(?MODULE, h1_wake, [Parent, Debug, State, Timer]).
 
 -doc "Process pipelined HTTP/1.1 requests.".
 -spec process_h1_pipeline(pid(), [sys:debug_option()], #state{}, non_neg_integer()) ->
@@ -435,6 +435,21 @@ apply_h1_request_result(State0, Request, ReqSpan, {nhttp_handler_exception, Clas
     nhttp_conn:emit_request_stop(State, ?HTTP_INTERNAL_SERVER_ERROR, ReqSpan),
     State#state{protocol_state = H1#h1_state{keep_alive = false}}.
 
+-doc """
+Arm the absolute body-receive deadline when the body phase starts.
+`infinity` (the default) leaves it disarmed, so legitimate large or slow
+uploads are bounded only by the per-chunk `body_timeout`.
+""".
+-spec arm_body_deadline(#state{}) -> #state{}.
+arm_body_deadline(#state{protocol_state = #h1_state{body_deadline = infinity} = H1} = State) ->
+    State#state{protocol_state = H1#h1_state{body_deadline_at = undefined}};
+arm_body_deadline(#state{protocol_state = #h1_state{body_deadline = BodyDeadline} = H1} = State) ->
+    State#state{
+        protocol_state = H1#h1_state{
+            body_deadline_at = erlang:monotonic_time(millisecond) + BodyDeadline
+        }
+    }.
+
 -spec await_h1_body_data(
     pid(),
     [sys:debug_option()],
@@ -496,32 +511,6 @@ await_h1_body_data(
     after BodyTimeout ->
         Reason = h1_body_timeout_reason(State),
         deliver_h1_body_abort(Parent, Debug, State, Request, BodyState, ReqSpan, Reason)
-    end.
-
--doc """
-Effective wait for the next body chunk: the per-chunk `body_timeout`
-capped by the absolute `body_deadline` (when armed), so a per-chunk drip
-cannot re-arm the wait past the deadline.
-""".
--spec h1_body_timeout(#state{}) -> timeout().
-h1_body_timeout(#state{
-    protocol_state = #h1_state{body_deadline_at = undefined, body_timeout = BodyTimeout}
-}) ->
-    BodyTimeout;
-h1_body_timeout(#state{
-    protocol_state = #h1_state{body_deadline_at = Deadline, body_timeout = BodyTimeout}
-}) ->
-    Now = erlang:monotonic_time(millisecond),
-    min(BodyTimeout, max(0, Deadline - Now)).
-
--spec h1_body_timeout_reason(#state{}) -> body_timeout | request_timeout.
-h1_body_timeout_reason(#state{protocol_state = #h1_state{body_deadline_at = undefined}}) ->
-    body_timeout;
-h1_body_timeout_reason(#state{protocol_state = #h1_state{body_deadline_at = Deadline}}) ->
-    Now = erlang:monotonic_time(millisecond),
-    case Now >= Deadline of
-        true -> request_timeout;
-        false -> body_timeout
     end.
 
 -spec clear_body_stream_or_close(#state{}) -> #state{}.
@@ -631,21 +620,6 @@ encode_h1_response(State, Response) ->
 enter_h1_body_loop(Parent, Debug, State, Request, BodyState, ReqSpan) ->
     drain_h1_body_buffer(Parent, Debug, arm_body_deadline(State), Request, BodyState, ReqSpan).
 
--doc """
-Arm the absolute body-receive deadline when the body phase starts.
-`infinity` (the default) leaves it disarmed, so legitimate large or slow
-uploads are bounded only by the per-chunk `body_timeout`.
-""".
--spec arm_body_deadline(#state{}) -> #state{}.
-arm_body_deadline(#state{protocol_state = #h1_state{body_deadline = infinity} = H1} = State) ->
-    State#state{protocol_state = H1#h1_state{body_deadline_at = undefined}};
-arm_body_deadline(#state{protocol_state = #h1_state{body_deadline = BodyDeadline} = H1} = State) ->
-    State#state{
-        protocol_state = H1#h1_state{
-            body_deadline_at = erlang:monotonic_time(millisecond) + BodyDeadline
-        }
-    }.
-
 -spec finalize_h1_body_terminal(#state{}, nhttp_handler:body_event()) -> #state{}.
 finalize_h1_body_terminal(#state{protocol_state = #h1_state{} = H1} = State, {fin, _}) ->
     State#state{protocol_state = H1#h1_state{body_stream = undefined}};
@@ -688,6 +662,32 @@ flush_h1_out(#state{protocol_state = #h1_state{out = []}} = State) ->
 flush_h1_out(#state{protocol_state = #h1_state{out = Out} = H1} = State) ->
     ok = nhttp_conn:sock_send(State, Out),
     State#state{protocol_state = H1#h1_state{out = [], out_bytes = 0}}.
+
+-doc """
+Effective wait for the next body chunk: the per-chunk `body_timeout`
+capped by the absolute `body_deadline` (when armed), so a per-chunk drip
+cannot re-arm the wait past the deadline.
+""".
+-spec h1_body_timeout(#state{}) -> timeout().
+h1_body_timeout(#state{
+    protocol_state = #h1_state{body_deadline_at = undefined, body_timeout = BodyTimeout}
+}) ->
+    BodyTimeout;
+h1_body_timeout(#state{
+    protocol_state = #h1_state{body_deadline_at = Deadline, body_timeout = BodyTimeout}
+}) ->
+    Now = erlang:monotonic_time(millisecond),
+    min(BodyTimeout, max(0, Deadline - Now)).
+
+-spec h1_body_timeout_reason(#state{}) -> body_timeout | request_timeout.
+h1_body_timeout_reason(#state{protocol_state = #h1_state{body_deadline_at = undefined}}) ->
+    body_timeout;
+h1_body_timeout_reason(#state{protocol_state = #h1_state{body_deadline_at = Deadline}}) ->
+    Now = erlang:monotonic_time(millisecond),
+    case Now >= Deadline of
+        true -> request_timeout;
+        false -> body_timeout
+    end.
 
 -spec handle_h1_body_event_result(
     pid(),

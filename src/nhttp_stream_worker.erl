@@ -50,15 +50,12 @@ reap(Pids) ->
 
 -doc """
 Spawn a worker to run `Producer(SendChunk)`.
-
 The worker process owns the producer's execution. The connection process
 (`ConnPid`) owns the socket and applies wire-level flow control. Messages
 between worker and conn are tagged with `Ref`.
-
 The worker is spawned with `proc_lib:spawn/3` (no link): a producer crash
 does not propagate to the connection. The connection should monitor the
 returned pid to learn when the worker exits.
-
 Monitoring alone only reaps a worker that is parked at a `receive` (it
 sees the conn's `DOWN` and exits). A producer stuck in handler code (a
 blocked external call, an infinite loop) never reaches a `receive`, so
@@ -97,7 +94,6 @@ start_request(ConnPid, StreamId, Ref, Handler, Request, HState) ->
 
 -doc """
 Unconditionally `kill` a single worker.
-
 Used where the connection has already given the worker its chance to
 finish (the h1 push pipeline hand-off) and only needs to reap a stuck
 survivor. For teardown of a worker map use `reap/1`, which preserves

@@ -71,8 +71,6 @@
 
 -type send_error() :: {h3, nhttp_h3:h3_error()} | {quic, term()}.
 
--type offer_result() :: {sent | stashed, #state{}} | {error, send_error(), #state{}}.
-
 -type h3_init_args() :: #{
     name := term(),
     opts := nhttp:opts(),
@@ -85,6 +83,7 @@
 %% LOCAL MACROS
 %%%-----------------------------------------------------------------------------
 -define(MAX_DRAIN_PACKETS, 64).
+-type offer_result() :: {sent | stashed, #state{}} | {error, send_error(), #state{}}.
 
 %%%-----------------------------------------------------------------------------
 %% API
@@ -115,6 +114,19 @@ start_link(NquicOpts) ->
 %%%-----------------------------------------------------------------------------
 %% PROC_LIB CALLBACKS
 %%%-----------------------------------------------------------------------------
+-doc """
+`proc_lib:hibernate/3` re-entry point for the event-wait hibernation.
+Cancels the idle timer armed before hibernating; when it already fired
+the wake-up is an idle timeout unless other traffic is queued (drained
+by the zero-timeout receive).
+""".
+-spec h3_wake(#state{}, nhttp_conn:hibernate_timer()) -> no_return().
+h3_wake(State, Timer) ->
+    case nhttp_conn:cancel_hibernate_timer(Timer) of
+        ok -> connection_loop_receive(State);
+        expired -> h3_receive(State, nhttp_conn:idle_deadline(0))
+    end.
+
 -spec init_handler(map()) -> no_return().
 init_handler(NquicOpts) ->
     process_flag(trap_exit, true),
@@ -140,19 +152,6 @@ from `nhttp_conn` classification), so this stores them back and enters
 -spec loop(pid(), [sys:debug_option()], #state{}) -> no_return().
 loop(Parent, Debug, State) ->
     connection_loop(State#state{parent = Parent, debug = Debug}).
-
--doc """
-`proc_lib:hibernate/3` re-entry point for the event-wait hibernation.
-Cancels the idle timer armed before hibernating; when it already fired
-the wake-up is an idle timeout unless other traffic is queued (drained
-by the zero-timeout receive).
-""".
--spec h3_wake(#state{}, nhttp_conn:hibernate_timer()) -> no_return().
-h3_wake(State, Timer) ->
-    case nhttp_conn:cancel_hibernate_timer(Timer) of
-        ok -> connection_loop_receive(State);
-        expired -> h3_receive(State, nhttp_conn:idle_deadline(0))
-    end.
 
 -spec system_code_change(#state{}, module(), term(), term()) -> {ok, #state{}}.
 ?NHTTP_SYSTEM_CODE_CHANGE_NOOP.
@@ -238,6 +237,17 @@ track(Tab) ->
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - ACTION EXECUTION
 %%%-----------------------------------------------------------------------------
+-spec drain_send_buffer(#state{}, nhttp_lib:stream_id(), [{iodata(), nhttp_h3:fin()}]) ->
+    offer_result().
+drain_send_buffer(State, _StreamId, []) ->
+    {sent, State};
+drain_send_buffer(State, StreamId, [{Data, Fin} | Rest] = Pending) ->
+    case quic_send(State, StreamId, Data, Fin) of
+        {sent, State1} -> drain_send_buffer(State1, StreamId, Rest);
+        {blocked, State1} -> {stashed, put_send_buffer(State1, StreamId, lists:reverse(Pending))};
+        {error, _Reason, _State1} = Error -> Error
+    end.
+
 -doc """
 Execute the actions of the H3 codec. Each send goes through
 `offer_h3_data/4`. A send that QUIC refuses for another reason than flow
@@ -254,6 +264,33 @@ execute_h3_actions(State, [{close_connection, Code, _Reason} | _]) ->
     ok = nquic_lib:shutdown(State#state.ctx, Code, <<>>),
     terminate({h3_connection_error, Code}, State#state{closing = true}).
 
+-spec execute_init_actions(nquic:ctx(), [nhttp_h3:action()]) -> nquic:ctx().
+execute_init_actions(Ctx, []) ->
+    Ctx;
+execute_init_actions(Ctx, [{send, StreamId, Data} | Rest]) ->
+    case nquic_lib:send(Ctx, StreamId, Data) of
+        {ok, Ctx1} ->
+            execute_init_actions(Ctx1, Rest);
+        {error, _, Ctx1} ->
+            execute_init_actions(Ctx1, Rest);
+        {error, _} ->
+            execute_init_actions(Ctx, Rest)
+    end;
+execute_init_actions(Ctx, [{send_fin, StreamId, Data} | Rest]) ->
+    case nquic_lib:send_fin_noflush(Ctx, StreamId, Data) of
+        {ok, Ctx1} ->
+            execute_init_actions(Ctx1, Rest);
+        {error, _, Ctx1} ->
+            execute_init_actions(Ctx1, Rest);
+        {error, _} ->
+            execute_init_actions(Ctx, Rest)
+    end;
+execute_init_actions(Ctx, [{close_connection, Code, _Reason} | _]) ->
+    ok = nquic_lib:shutdown(Ctx, Code, <<>>),
+    ok = nhttp_stats:decr_connection(),
+    cleanup_ctx(Ctx),
+    exit(normal).
+
 -doc """
 Write the buffered frames of a stream that QUIC reports writable again,
 oldest first, and hand the outcome to the owner of the stream.
@@ -268,17 +305,6 @@ flush_h3_send_buffer(#state{h3_send_buffers = Buffers} = State, StreamId) ->
                 State#state{h3_send_buffers = Buffers1}, StreamId, lists:reverse(Buffer)
             ),
             flushed(Outcome, StreamId)
-    end.
-
--spec drain_send_buffer(#state{}, nhttp_lib:stream_id(), [{iodata(), nhttp_h3:fin()}]) ->
-    offer_result().
-drain_send_buffer(State, _StreamId, []) ->
-    {sent, State};
-drain_send_buffer(State, StreamId, [{Data, Fin} | Rest] = Pending) ->
-    case quic_send(State, StreamId, Data, Fin) of
-        {sent, State1} -> drain_send_buffer(State1, StreamId, Rest);
-        {blocked, State1} -> {stashed, put_send_buffer(State1, StreamId, lists:reverse(Pending))};
-        {error, _Reason, _State1} = Error -> Error
     end.
 
 -spec flushed(offer_result(), nhttp_lib:stream_id()) -> #state{}.
@@ -335,33 +361,6 @@ settle_offer({error, Reason, State}) ->
     nhttp_log:sock_send_failed(log_ctx(State), Reason),
     State.
 
--spec execute_init_actions(nquic:ctx(), [nhttp_h3:action()]) -> nquic:ctx().
-execute_init_actions(Ctx, []) ->
-    Ctx;
-execute_init_actions(Ctx, [{send, StreamId, Data} | Rest]) ->
-    case nquic_lib:send(Ctx, StreamId, Data) of
-        {ok, Ctx1} ->
-            execute_init_actions(Ctx1, Rest);
-        {error, _, Ctx1} ->
-            execute_init_actions(Ctx1, Rest);
-        {error, _} ->
-            execute_init_actions(Ctx, Rest)
-    end;
-execute_init_actions(Ctx, [{send_fin, StreamId, Data} | Rest]) ->
-    case nquic_lib:send_fin_noflush(Ctx, StreamId, Data) of
-        {ok, Ctx1} ->
-            execute_init_actions(Ctx1, Rest);
-        {error, _, Ctx1} ->
-            execute_init_actions(Ctx1, Rest);
-        {error, _} ->
-            execute_init_actions(Ctx, Rest)
-    end;
-execute_init_actions(Ctx, [{close_connection, Code, _Reason} | _]) ->
-    ok = nquic_lib:shutdown(Ctx, Code, <<>>),
-    ok = nhttp_stats:decr_connection(),
-    cleanup_ctx(Ctx),
-    exit(normal).
-
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - COMPRESSION
 %%%-----------------------------------------------------------------------------
@@ -412,37 +411,49 @@ any packet.
 connection_loop_receive(#state{idle_timeout = IdleTimeout} = State) ->
     h3_receive(State, nhttp_conn:idle_deadline(IdleTimeout)).
 
--spec stream_idle(#state{}) -> boolean().
-stream_idle(#state{
-    closing = false, h3_streams = Streams, h3_push_workers = Workers, h3_send_buffers = Buffers
-}) ->
-    map_size(Streams) =:= 0 andalso map_size(Workers) =:= 0 andalso map_size(Buffers) =:= 0;
-stream_idle(#state{}) ->
-    false.
-
--spec receive_timeout(#state{}, nhttp_conn:deadline()) -> timeout().
-receive_timeout(#state{hibernate_after = HibernateAfter} = State, IdleDeadline) ->
-    case stream_idle(State) of
-        true -> nhttp_conn:quiescence_wait(HibernateAfter, IdleDeadline);
-        false -> nhttp_conn:deadline_remaining(IdleDeadline)
+-spec drain_connected_socket(#state{}, non_neg_integer()) -> #state{}.
+drain_connected_socket(State, 0) ->
+    State;
+drain_connected_socket(State, N) ->
+    Socket = nquic_lib:ctx_socket(State#state.ctx),
+    case socket:recvfrom(Socket, 0, nowait) of
+        {ok, {Source, Bin}} ->
+            handle_drained_packet(State, Source, Bin, N);
+        {select, _} ->
+            State;
+        {error, _} ->
+            State
     end.
 
--spec handle_h3_timeout(#state{}, nhttp_conn:deadline()) -> no_return().
-handle_h3_timeout(State, IdleDeadline) ->
-    case nhttp_conn:deadline_remaining(IdleDeadline) of
-        0 ->
-            terminate(idle_timeout, State);
-        IdleRemaining ->
-            case stream_idle(State) andalso nhttp_conn:mailbox_empty() of
-                true -> hibernate(State, IdleRemaining);
-                false -> h3_receive(State, IdleDeadline)
+-spec drain_packets(#state{}, non_neg_integer()) -> #state{}.
+drain_packets(State, 0) ->
+    State;
+drain_packets(State, N) ->
+    receive
+        {packet, Source, Bin} ->
+            case nquic_lib:handle_packet(State#state.ctx, Source, Bin) of
+                {ok, Events, Ctx1} ->
+                    State1 = process_quic_events(State#state{ctx = Ctx1}, Events),
+                    drain_packets(State1, N - 1);
+                {error, Reason, Ctx1} ->
+                    handle_connection_error(State#state{ctx = Ctx1}, Reason)
             end
+    after 0 ->
+        case nquic_lib:ctx_connected(State#state.ctx) of
+            true -> drain_connected_socket(State, N);
+            false -> State
+        end
     end.
 
--spec hibernate(#state{}, timeout()) -> no_return().
-hibernate(State, IdleRemaining) ->
-    Timer = nhttp_conn:start_hibernate_timer(IdleRemaining),
-    proc_lib:hibernate(?MODULE, h3_wake, [State, Timer]).
+-spec flush_batch(#state{}) -> no_return().
+flush_batch(State) ->
+    {ok, Ctx1} = nquic_lib:flush_notimers(State#state.ctx),
+    connection_loop(State#state{ctx = Ctx1}).
+
+-spec flush_ctx_state(#state{}) -> #state{}.
+flush_ctx_state(State) ->
+    {ok, Ctx1} = nquic_lib:flush(State#state.ctx),
+    State#state{ctx = Ctx1}.
 
 -spec h3_receive(#state{}, nhttp_conn:deadline()) -> no_return().
 h3_receive(#state{parent = Parent} = State, IdleDeadline) ->
@@ -500,50 +511,6 @@ h3_receive(#state{parent = Parent} = State, IdleDeadline) ->
         handle_h3_timeout(State, IdleDeadline)
     end.
 
--spec drain_connected_socket(#state{}, non_neg_integer()) -> #state{}.
-drain_connected_socket(State, 0) ->
-    State;
-drain_connected_socket(State, N) ->
-    Socket = nquic_lib:ctx_socket(State#state.ctx),
-    case socket:recvfrom(Socket, 0, nowait) of
-        {ok, {Source, Bin}} ->
-            handle_drained_packet(State, Source, Bin, N);
-        {select, _} ->
-            State;
-        {error, _} ->
-            State
-    end.
-
--spec drain_packets(#state{}, non_neg_integer()) -> #state{}.
-drain_packets(State, 0) ->
-    State;
-drain_packets(State, N) ->
-    receive
-        {packet, Source, Bin} ->
-            case nquic_lib:handle_packet(State#state.ctx, Source, Bin) of
-                {ok, Events, Ctx1} ->
-                    State1 = process_quic_events(State#state{ctx = Ctx1}, Events),
-                    drain_packets(State1, N - 1);
-                {error, Reason, Ctx1} ->
-                    handle_connection_error(State#state{ctx = Ctx1}, Reason)
-            end
-    after 0 ->
-        case nquic_lib:ctx_connected(State#state.ctx) of
-            true -> drain_connected_socket(State, N);
-            false -> State
-        end
-    end.
-
--spec flush_batch(#state{}) -> no_return().
-flush_batch(State) ->
-    {ok, Ctx1} = nquic_lib:flush_notimers(State#state.ctx),
-    connection_loop(State#state{ctx = Ctx1}).
-
--spec flush_ctx_state(#state{}) -> #state{}.
-flush_ctx_state(State) ->
-    {ok, Ctx1} = nquic_lib:flush(State#state.ctx),
-    State#state{ctx = Ctx1}.
-
 -spec handle_drained_packet(
     #state{}, nquic_socket:sockaddr(), binary(), non_neg_integer()
 ) -> #state{}.
@@ -554,6 +521,18 @@ handle_drained_packet(State, Source, Bin, N) ->
             drain_connected_socket(State1, N - 1);
         {error, Reason, Ctx1} ->
             handle_connection_error(State#state{ctx = Ctx1}, Reason)
+    end.
+
+-spec handle_h3_timeout(#state{}, nhttp_conn:deadline()) -> no_return().
+handle_h3_timeout(State, IdleDeadline) ->
+    case nhttp_conn:deadline_remaining(IdleDeadline) of
+        0 ->
+            terminate(idle_timeout, State);
+        IdleRemaining ->
+            case stream_idle(State) andalso nhttp_conn:mailbox_empty() of
+                true -> hibernate(State, IdleRemaining);
+                false -> h3_receive(State, IdleDeadline)
+            end
     end.
 
 -spec handle_packet_and_drain(#state{}, nquic_socket:sockaddr(), binary()) ->
@@ -589,6 +568,26 @@ handle_packet_ecn_and_drain(State, Source, Bin, ECN) ->
         {error, Reason, Ctx1} ->
             handle_connection_error(State#state{ctx = Ctx1}, Reason)
     end.
+
+-spec hibernate(#state{}, timeout()) -> no_return().
+hibernate(State, IdleRemaining) ->
+    Timer = nhttp_conn:start_hibernate_timer(IdleRemaining),
+    proc_lib:hibernate(?MODULE, h3_wake, [State, Timer]).
+
+-spec receive_timeout(#state{}, nhttp_conn:deadline()) -> timeout().
+receive_timeout(#state{hibernate_after = HibernateAfter} = State, IdleDeadline) ->
+    case stream_idle(State) of
+        true -> nhttp_conn:quiescence_wait(HibernateAfter, IdleDeadline);
+        false -> nhttp_conn:deadline_remaining(IdleDeadline)
+    end.
+
+-spec stream_idle(#state{}) -> boolean().
+stream_idle(#state{
+    closing = false, h3_streams = Streams, h3_push_workers = Workers, h3_send_buffers = Buffers
+}) ->
+    map_size(Streams) =:= 0 andalso map_size(Workers) =:= 0 andalso map_size(Buffers) =:= 0;
+stream_idle(#state{}) ->
+    false.
 
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - DISPATCH
@@ -975,6 +974,10 @@ log_ctx(#state{name = Name, peer = Peer, handler = Handler}) ->
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - QUIC PROTOCOL
 %%%-----------------------------------------------------------------------------
+-spec drop_send_buffer(#state{}, nhttp_lib:stream_id()) -> #state{}.
+drop_send_buffer(#state{h3_send_buffers = Buffers} = State, StreamId) ->
+    State#state{h3_send_buffers = maps:remove(StreamId, Buffers)}.
+
 -spec handle_connection_error(#state{}, term()) -> no_return().
 handle_connection_error(State, {transport_error, Reason}) ->
     ErrorCode = nquic_protocol:error_code(Reason),
@@ -1032,10 +1035,6 @@ process_quic_events(State, []) ->
 process_quic_events(State, [Event | Rest]) ->
     State1 = process_quic_event(State, Event),
     process_quic_events(State1, Rest).
-
--spec drop_send_buffer(#state{}, nhttp_lib:stream_id()) -> #state{}.
-drop_send_buffer(#state{h3_send_buffers = Buffers} = State, StreamId) ->
-    State#state{h3_send_buffers = maps:remove(StreamId, Buffers)}.
 
 -spec reset_stream(#state{}, nhttp_lib:stream_id(), non_neg_integer()) -> #state{}.
 reset_stream(State0, StreamId, ErrorCode) ->
@@ -1096,13 +1095,8 @@ handle_stream_reset(State, StreamId, ErrorCode) ->
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - RESPONSE SENDING
 %%%-----------------------------------------------------------------------------
--spec response_to_h3_headers(nhttp_lib:response()) -> [{binary(), binary()}].
-response_to_h3_headers(#{status := Status, headers := Headers}) ->
-    [{<<":status">>, integer_to_binary(Status)} | Headers].
-
 -doc """
 Offer one encoded frame for `StreamId` to QUIC, and name the outcome:
-
 - `sent`: QUIC took the frame.
 - `stashed`: flow control refused it, or older frames of the stream still
   wait. The frame waits in `h3_send_buffers` behind them and leaves on
@@ -1123,6 +1117,10 @@ offer_h3_data(#state{h3_send_buffers = Buffers} = State, StreamId, Data, Fin) ->
                 {error, _Reason, _State1} = Error -> Error
             end
     end.
+
+-spec response_to_h3_headers(nhttp_lib:response()) -> [{binary(), binary()}].
+response_to_h3_headers(#{status := Status, headers := Headers}) ->
+    [{<<":status">>, integer_to_binary(Status)} | Headers].
 
 -doc """
 Frame `Data` as an HTTP/3 DATA frame and offer it with `offer_h3_data/4`.

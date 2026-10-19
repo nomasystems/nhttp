@@ -100,7 +100,6 @@ handler_crashed(Ctx, Callback, Class, Reason) ->
     }).
 
 -doc "A handler `init/1` returned `{error, Reason}`.".
-
 -spec handler_init_failed(ctx(), term()) -> ok.
 handler_init_failed(Ctx, Reason) ->
     logger:error(Ctx#{event => handler_init_failed, reason => Reason}).

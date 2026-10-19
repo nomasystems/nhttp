@@ -9,12 +9,6 @@
 -include("nhttp_ws_codes.hrl").
 
 %%%-----------------------------------------------------------------------------
-%% MACROS
-%%%-----------------------------------------------------------------------------
--define(MESSAGE_TOO_BIG, <<"Message Too Big">>).
--define(INTERNAL_SERVER_ERROR, <<"Internal Server Error">>).
-
-%%%-----------------------------------------------------------------------------
 %% API EXPORTS
 %%%-----------------------------------------------------------------------------
 -export([
@@ -56,6 +50,12 @@
 
 -type message_summary() ::
     {close, nhttp_ws:close_code(), non_neg_integer()} | {nhttp_ws:ws_opcode(), non_neg_integer()}.
+
+%%%-----------------------------------------------------------------------------
+%% MACROS
+%%%-----------------------------------------------------------------------------
+-define(MESSAGE_TOO_BIG, <<"Message Too Big">>).
+-define(INTERNAL_SERVER_ERROR, <<"Internal Server Error">>).
 
 %%%-----------------------------------------------------------------------------
 %% API
@@ -130,7 +130,6 @@ message over the session limit is 1009 (§7.4.1), a frame header that
 declares a length over that limit is 1009 too (§10.4), and every other framing
 error is a protocol error. The set of reasons the decoder can return is
 open, so an unknown one is a protocol error too.
-
 `message_too_large` carries the same reason text as the message-level
 check in `dispatch_frame/4`, because the peer sees one limit whichever
 side of reassembly trips it.
@@ -292,7 +291,6 @@ log_crash_if_any(_Result, _Ctx, _Callback) ->
     ok.
 
 -doc "Log a reply that the validator refused and pass the dispatch result through.".
-
 -spec log_invalid_reply({#ws_state{}, actions()}, nhttp_log:ctx(), atom()) ->
     {#ws_state{}, actions()}.
 log_invalid_reply({_Ws, []} = Dispatched, _Ctx, _Callback) ->

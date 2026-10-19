@@ -477,6 +477,24 @@ validate_h2_aliases(Opts) ->
         ok
     end.
 
+-spec validate_h2_credit_batch(nhttp:opts()) -> ok | {error, term()}.
+validate_h2_credit_batch(Opts) ->
+    OnResponse =
+        maps:get(h2_connection_window_policy, Opts, eager) =:= on_response orelse
+            maps:get(h2_stream_window_policy, Opts, eager) =:= on_response,
+    case maps:get(h2_credit_batch, Opts, undefined) of
+        undefined ->
+            ok;
+        V when is_integer(V), V >= 0, V =< ?H2_MAX_WINDOW_SIZE, OnResponse ->
+            ok;
+        V when is_integer(V), V >= 0, V =< ?H2_MAX_WINDOW_SIZE ->
+            {error,
+                {invalid_h2_credit_batch, V,
+                    "needs h2_connection_window_policy or h2_stream_window_policy on_response"}};
+        V ->
+            {error, {invalid_h2_credit_batch, V, "must be 0..2147483647"}}
+    end.
+
 -spec validate_h2_dispatch(nhttp:h2_dispatch()) -> ok | {error, term()}.
 validate_h2_dispatch(worker) ->
     ok;
@@ -515,24 +533,6 @@ validate_h2_settings(Settings) ->
             validate_max_concurrent_streams(maps:get(max_concurrent_streams, Settings, undefined)),
         ok ?= validate_max_frame_size(maps:get(max_frame_size, Settings, undefined)),
         ok
-    end.
-
--spec validate_h2_credit_batch(nhttp:opts()) -> ok | {error, term()}.
-validate_h2_credit_batch(Opts) ->
-    OnResponse =
-        maps:get(h2_connection_window_policy, Opts, eager) =:= on_response orelse
-            maps:get(h2_stream_window_policy, Opts, eager) =:= on_response,
-    case maps:get(h2_credit_batch, Opts, undefined) of
-        undefined ->
-            ok;
-        V when is_integer(V), V >= 0, V =< ?H2_MAX_WINDOW_SIZE, OnResponse ->
-            ok;
-        V when is_integer(V), V >= 0, V =< ?H2_MAX_WINDOW_SIZE ->
-            {error,
-                {invalid_h2_credit_batch, V,
-                    "needs h2_connection_window_policy or h2_stream_window_policy on_response"}};
-        V ->
-            {error, {invalid_h2_credit_batch, V, "must be 0..2147483647"}}
     end.
 
 -spec validate_h2_window_policies(nhttp:opts()) -> ok | {error, term()}.

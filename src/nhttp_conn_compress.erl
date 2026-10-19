@@ -44,7 +44,6 @@ config(Enabled, Level, Threshold, MimeTypes) ->
 
 -doc """
 Potentially compress a response body based on the request `Accept-Encoding`.
-
 Returns the response unchanged when compression is disabled, no encoding
 is negotiated, the body is empty or smaller than the threshold, or the
 content type is not in the compressible list.
