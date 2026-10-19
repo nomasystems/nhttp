@@ -46,6 +46,7 @@
 %%%-----------------------------------------------------------------------------
 -define(DEFAULT_MAX_PIPELINE_DEPTH, 10).
 -define(H1_REQUEST_LINE_ALLOWANCE, 8192).
+-define(H1_OUT_MAX_BYTES, 65536).
 
 %%%-----------------------------------------------------------------------------
 %% TYPES
@@ -277,25 +278,27 @@ process_h1_pipeline(
                     finish_h1_request(Parent, Debug, NewState1, PipelineDepth, MaxPipelineDepth)
             end;
         {more, _} ->
+            Flushed = flush_h1_out(State),
             case byte_size(Buffer) > head_buffer_cap(ParseOpts) of
                 true ->
-                    send_h1_error(State, header_too_large),
-                    nhttp_conn:stop({protocol_error, header_too_large}, State);
+                    send_h1_error(Flushed, header_too_large),
+                    nhttp_conn:stop({protocol_error, header_too_large}, Flushed);
                 false ->
-                    case nhttp_conn:activate(State) of
-                        ok -> h1_loop(Parent, Debug, arm_head_deadline(State));
-                        {stop, Reason} -> nhttp_conn:stop(Reason, State)
+                    case nhttp_conn:activate(Flushed) of
+                        ok -> h1_loop(Parent, Debug, arm_head_deadline(Flushed));
+                        {stop, Reason} -> nhttp_conn:stop(Reason, Flushed)
                     end
             end;
         {error, Reason} ->
-            send_h1_error(State, Reason),
-            nhttp_conn:stop({protocol_error, Reason}, State)
+            Flushed = flush_h1_out(State),
+            send_h1_error(Flushed, Reason),
+            nhttp_conn:stop({protocol_error, Reason}, Flushed)
     end.
 
 -doc "Yield to scheduler and then continue processing buffered H1 requests.".
 -spec yield_and_continue_h1(pid(), [sys:debug_option()], #state{}) -> no_return().
 yield_and_continue_h1(
-    Parent, Debug, #state{protocol_state = #h1_state{buffer = Buffer}} = State
+    Parent, Debug, State
 ) ->
     receive
         {tcp, _Socket, Data} ->
@@ -303,26 +306,21 @@ yield_and_continue_h1(
         {ssl, _Socket, Data} ->
             handle_h1_data(Parent, Debug, State, Data);
         {tcp_closed, _Socket} ->
-            nhttp_conn:stop(normal, State);
+            nhttp_conn:stop(normal, flush_h1_out(State));
         {ssl_closed, _Socket} ->
-            nhttp_conn:stop(normal, State);
+            nhttp_conn:stop(normal, flush_h1_out(State));
         {tcp_error, _Socket, Reason} ->
             nhttp_conn:stop({socket_error, Reason}, State);
         {ssl_error, _Socket, Reason} ->
             nhttp_conn:stop({socket_error, Reason}, State);
         {system, From, Request} ->
-            sys:handle_system_msg(Request, From, Parent, ?MODULE, Debug, State);
+            handle_h1_system_msg(Request, From, Parent, Debug, State);
         shutdown ->
-            nhttp_conn:stop(normal, State);
+            nhttp_conn:stop(normal, flush_h1_out(State));
         {'EXIT', Parent, Reason} ->
-            nhttp_conn:stop_parent(Reason, State)
+            nhttp_conn:stop_parent(Reason, flush_h1_out(State))
     after 0 ->
-        case Buffer of
-            <<>> ->
-                h1_loop(Parent, Debug, State);
-            _ ->
-                process_h1_pipeline(Parent, Debug, State, 0)
-        end
+        process_h1_pipeline(Parent, Debug, State, 0)
     end.
 
 %%%-----------------------------------------------------------------------------
@@ -374,27 +372,32 @@ apply_h1_request_result(
     Response = nhttp_conn_compress:maybe_compress(
         Response0, Request, nhttp_conn:compress_config(State)
     ),
-    case send_h1_response(State, Response) of
-        ok ->
-            nhttp_conn:emit_request_stop(State, Status, ReqSpan),
+    case encode_h1_response(State, Response) of
+        {ok, IOList} ->
             KeepAlive = should_keep_alive(Request, Response),
-            State#state{
-                protocol_state = H1#h1_state{keep_alive = KeepAlive},
-                handler_state = NewHState,
-                requests_count = State#state.requests_count + 1
-            };
+            Queued = queue_h1_response(
+                State#state{
+                    protocol_state = H1#h1_state{keep_alive = KeepAlive},
+                    handler_state = NewHState,
+                    requests_count = State#state.requests_count + 1
+                },
+                IOList
+            ),
+            nhttp_conn:emit_request_stop(Queued, Status, ReqSpan),
+            Queued;
         {error, Reason} ->
-            reply_encode_failed(State, Request, ReqSpan, Reason, NewHState)
+            reply_encode_failed(flush_h1_out(State), Request, ReqSpan, Reason, NewHState)
     end;
 apply_h1_request_result(
     State, Request, ReqSpan, {stream, {producer, Status, Headers, Producer}, NewHState}
 ) ->
     nhttp_conn_h1_push:dispatch_h1_stream_push(
-        State, Request, Status, Headers, Producer, NewHState, ReqSpan
+        flush_h1_out(State), Request, Status, Headers, Producer, NewHState, ReqSpan
     );
 apply_h1_request_result(State, _Request, ReqSpan, {accept_body, BodyState, NewHState}) ->
-    {accept_body, State#state{handler_state = NewHState}, BodyState, ReqSpan};
-apply_h1_request_result(State, Request, ReqSpan, {upgrade, websocket, NewHState}) ->
+    {accept_body, (flush_h1_out(State))#state{handler_state = NewHState}, BodyState, ReqSpan};
+apply_h1_request_result(State0, Request, ReqSpan, {upgrade, websocket, NewHState}) ->
+    State = flush_h1_out(State0),
     nhttp_conn:emit_request_stop(State, ?HTTP_SWITCHING_PROTOCOLS, ReqSpan),
     {upgrade, websocket,
         State#state{
@@ -402,7 +405,8 @@ apply_h1_request_result(State, Request, ReqSpan, {upgrade, websocket, NewHState}
             requests_count = State#state.requests_count + 1
         },
         Request};
-apply_h1_request_result(State, Request, ReqSpan, {upgrade, websocket, SessionOpts, NewHState}) ->
+apply_h1_request_result(State0, Request, ReqSpan, {upgrade, websocket, SessionOpts, NewHState}) ->
+    State = flush_h1_out(State0),
     nhttp_conn:emit_request_stop(State, ?HTTP_SWITCHING_PROTOCOLS, ReqSpan),
     {upgrade, websocket,
         State#state{
@@ -422,12 +426,8 @@ apply_h1_request_result(
         handler_state = NewHState,
         requests_count = State#state.requests_count + 1
     };
-apply_h1_request_result(
-    #state{protocol_state = #h1_state{} = H1} = State,
-    Request,
-    ReqSpan,
-    {nhttp_handler_exception, Class, Reason}
-) ->
+apply_h1_request_result(State0, Request, ReqSpan, {nhttp_handler_exception, Class, Reason}) ->
+    #state{protocol_state = #h1_state{} = H1} = State = flush_h1_out(State0),
     Ctx = nhttp_log:request_ctx(nhttp_conn:log_ctx(State), Request, undefined),
     nhttp_log:handler_crashed(Ctx, handle_request, Class, Reason),
     nhttp_conn:emit_handler_exception(ReqSpan, Class, Reason),
@@ -558,20 +558,19 @@ deliver_h1_body_abort(Parent, Debug, State, Request, BodyState, ReqSpan, Reason)
     apply_h1_body_chunks(Parent, Debug, State, Request, BodyState, ReqSpan, [{abort, Reason}]).
 
 -spec dispatch_h1_request(#state{}, nhttp_lib:request()) -> h1_dispatch().
-dispatch_h1_request(
-    #state{limits = Limits, protocol_state = #h1_state{} = H1} = State, Request
-) ->
+dispatch_h1_request(#state{limits = Limits} = State, Request) ->
     case validate_h1_host(Request) of
         ok ->
             case nhttp_limits:validate_request(Request, Limits) of
                 ok ->
                     dispatch_h1_request_validated(State, Request);
                 {error, LimitError} ->
-                    handle_h1_limit_error(State, LimitError)
+                    handle_h1_limit_error(flush_h1_out(State), LimitError)
             end;
         {error, bad_host} ->
-            send_h1_error_response(State, ?HTTP_BAD_REQUEST, <<"Bad Request">>),
-            State#state{protocol_state = H1#h1_state{keep_alive = false}}
+            #state{protocol_state = #h1_state{} = H1} = Flushed = flush_h1_out(State),
+            send_h1_error_response(Flushed, ?HTTP_BAD_REQUEST, <<"Bad Request">>),
+            Flushed#state{protocol_state = H1#h1_state{keep_alive = false}}
     end.
 
 -spec dispatch_h1_request_validated(#state{}, nhttp_lib:request()) -> h1_dispatch().
@@ -618,6 +617,12 @@ drain_h1_body_buffer(
             deliver_h1_body_abort(Parent, Debug, State, Request, BodyState, ReqSpan, Reason)
     end.
 
+-spec encode_h1_response(#state{}, nhttp_lib:response()) ->
+    {ok, iodata()} | {error, nhttp_h1:encode_error()}.
+encode_h1_response(State, Response) ->
+    Headers = nhttp_conn:alt_svc_headers(State, maps:get(headers, Response, [])),
+    nhttp_h1:encode_response(Response#{headers => Headers}).
+
 -spec enter_h1_body_loop(
     pid(), [sys:debug_option()], #state{}, nhttp_lib:request(), term(), {
         nhttp_otel:span_ctx(), integer()
@@ -661,29 +666,28 @@ finish_h1_request(
 ) ->
     case KeepAlive of
         true when PipelineDepth < MaxPipelineDepth ->
-            case nhttp_conn:activate(State) of
-                ok ->
-                    receive
-                        {system, From, Request} ->
-                            sys:handle_system_msg(Request, From, Parent, ?MODULE, Debug, State);
-                        shutdown ->
-                            nhttp_conn:stop(normal, State);
-                        {'EXIT', Parent, Reason} ->
-                            nhttp_conn:stop_parent(Reason, State)
-                    after 0 ->
-                        process_h1_pipeline(Parent, Debug, State, PipelineDepth + 1)
-                    end;
-                {stop, Reason} ->
-                    nhttp_conn:stop(Reason, State)
+            receive
+                {system, From, Request} ->
+                    handle_h1_system_msg(Request, From, Parent, Debug, State);
+                shutdown ->
+                    nhttp_conn:stop(normal, flush_h1_out(State));
+                {'EXIT', Parent, Reason} ->
+                    nhttp_conn:stop_parent(Reason, flush_h1_out(State))
+            after 0 ->
+                process_h1_pipeline(Parent, Debug, State, PipelineDepth + 1)
             end;
         true ->
-            case nhttp_conn:activate(State) of
-                ok -> yield_and_continue_h1(Parent, Debug, State);
-                {stop, Reason} -> nhttp_conn:stop(Reason, State)
-            end;
+            yield_and_continue_h1(Parent, Debug, State);
         false ->
-            nhttp_conn:stop(normal, State)
+            nhttp_conn:stop(normal, flush_h1_out(State))
     end.
+
+-spec flush_h1_out(#state{}) -> #state{}.
+flush_h1_out(#state{protocol_state = #h1_state{out = []}} = State) ->
+    State;
+flush_h1_out(#state{protocol_state = #h1_state{out = Out} = H1} = State) ->
+    ok = nhttp_conn:sock_send(State, Out),
+    State#state{protocol_state = H1#h1_state{out = [], out_bytes = 0}}.
 
 -spec handle_h1_body_event_result(
     pid(),
@@ -746,6 +750,21 @@ handle_h1_limit_error(#state{protocol_state = #h1_state{} = H1} = State, LimitEr
     Status = nhttp_limits:error_to_status(LimitError),
     send_h1_error_response(State, Status, limit_error_body(Status)),
     State#state{protocol_state = H1#h1_state{keep_alive = false}}.
+
+-doc """
+Hand a system message that arrived between pipelined requests to `sys`.
+The socket is passive there, and `system_continue/3` resumes in
+`h1_loop/3`, which waits for socket input, so queued responses go out
+and the socket is armed first.
+""".
+-spec handle_h1_system_msg(term(), {pid(), term()}, pid(), [sys:debug_option()], #state{}) ->
+    no_return().
+handle_h1_system_msg(Request, From, Parent, Debug, State0) ->
+    State = flush_h1_out(State0),
+    case nhttp_conn:activate(State) of
+        ok -> sys:handle_system_msg(Request, From, Parent, ?MODULE, Debug, State);
+        {stop, Reason} -> nhttp_conn:stop(Reason, State)
+    end.
 
 -doc "Handle WebSocket upgrade request.".
 -spec handle_ws_upgrade(
@@ -817,6 +836,28 @@ lower_or_undefined(Value) -> nhttp_headers:to_lower(Value).
 max_pipeline_depth(#state{opts = Opts}) ->
     maps:get(max_pipeline_depth, Opts, ?DEFAULT_MAX_PIPELINE_DEPTH).
 
+-doc """
+Queue an encoded response while the buffer still holds pipelined input, so
+that one send carries the responses of a whole batch. The queue goes out
+with the response that empties the buffer, ends the connection or crosses
+`?H1_OUT_MAX_BYTES`, and through `flush_h1_out/1` before any other write
+and before the loop waits for input.
+""".
+-spec queue_h1_response(#state{}, iodata()) -> #state{}.
+queue_h1_response(#state{protocol_state = #h1_state{buffer = <<>>}} = State, IOList) ->
+    send_h1_out(State, IOList);
+queue_h1_response(#state{protocol_state = #h1_state{keep_alive = false}} = State, IOList) ->
+    send_h1_out(State, IOList);
+queue_h1_response(
+    #state{protocol_state = #h1_state{out = Out, out_bytes = Bytes} = H1} = State, IOList
+) ->
+    case Bytes + iolist_size(IOList) of
+        Total when Total < ?H1_OUT_MAX_BYTES ->
+            State#state{protocol_state = H1#h1_state{out = [Out | IOList], out_bytes = Total}};
+        _ ->
+            send_h1_out(State, IOList)
+    end.
+
 -spec reply_encode_failed(
     #state{},
     nhttp_lib:request(),
@@ -877,14 +918,10 @@ send_h1_last_chunk(State) ->
     LastChunk = nhttp_h1:encode_last_chunk(),
     nhttp_conn:sock_send(State, LastChunk).
 
--spec send_h1_response(#state{}, nhttp_lib:response()) -> ok | {error, nhttp_h1:encode_error()}.
-send_h1_response(State, Response0) ->
-    Headers = nhttp_conn:alt_svc_headers(State, maps:get(headers, Response0, [])),
-    Response = Response0#{headers => Headers},
-    case nhttp_h1:encode_response(Response) of
-        {ok, IOList} -> nhttp_conn:sock_send(State, IOList);
-        {error, _Reason} = Error -> Error
-    end.
+-spec send_h1_out(#state{}, iodata()) -> #state{}.
+send_h1_out(#state{protocol_state = #h1_state{out = Out} = H1} = State, IOList) ->
+    ok = nhttp_conn:sock_send(State, [Out | IOList]),
+    State#state{protocol_state = H1#h1_state{out = [], out_bytes = 0}}.
 
 -spec send_h1_response_head(#state{}, nhttp_lib:status(), nhttp_lib:headers()) ->
     ok | {error, term()}.
