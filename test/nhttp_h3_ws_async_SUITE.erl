@@ -13,6 +13,11 @@ Reuses the transport-agnostic `nhttp_h1_ws_async_handler` test handler.
 -include_lib("stdlib/include/assert.hrl").
 
 -include("../src/nhttp_ws_codes.hrl").
+-include_lib("nquic/src/nquic_transport.hrl").
+
+-define(SMALL_WINDOW, 64).
+-define(BLOCKED_FRAME, 100).
+-define(BLOCKED_FRAMES, 5).
 
 -export([
     all/0,
@@ -42,7 +47,10 @@ Reuses the transport-agnostic `nhttp_h1_ws_async_handler` test handler.
     multi_session_broadcast/1,
     multi_session_addressed_info/1,
     multi_reply_list/1,
-    plain_open_no_opts/1
+    plain_open_no_opts/1,
+    handler_reply_close/1,
+    handler_reply_invalid_close/1,
+    ws_h3_blocked_send_in_order/1
 ]).
 
 %%%-----------------------------------------------------------------------------
@@ -73,7 +81,10 @@ groups() ->
             multi_session_broadcast,
             multi_session_addressed_info,
             multi_reply_list,
-            plain_open_no_opts
+            plain_open_no_opts,
+            handler_reply_close,
+            handler_reply_invalid_close,
+            ws_h3_blocked_send_in_order
         ]}
     ].
 
@@ -246,6 +257,40 @@ plain_open_no_opts(Config) ->
     ?assertEqual({pong, <<"p">>}, h3_ws_recv_frame(Ctx)),
     teardown_ws(Ctx).
 
+handler_reply_close(Config) ->
+    Ctx = setup_ws(Config, reply_close),
+    ok = h3_ws_send_frame(Ctx, {text, <<"go">>}),
+    ?assertEqual({text, <<"before">>}, h3_ws_recv_frame(Ctx)),
+    ?assertEqual({close, 4003, <<"reply close">>}, h3_ws_recv_frame(Ctx)),
+    ?assertMatch({closed, {local, 4003, <<"reply close">>}}, recv_observer_event(closed)),
+    ?assertEqual(fin, h3_ws_recv_frame(Ctx)),
+    teardown_ws(Ctx).
+
+handler_reply_invalid_close(Config) ->
+    Ctx = setup_ws(Config, reply_bad_close),
+    ok = h3_ws_send_frame(Ctx, {text, <<"go">>}),
+    ?assertEqual(
+        {close, ?WS_CLOSE_INTERNAL_ERROR, <<"Internal Server Error">>}, h3_ws_recv_frame(Ctx)
+    ),
+    ?assertMatch(
+        {closed, {handler_crash, {error, {invalid_ws_message, {close, 1005, <<>>}, _}}}},
+        recv_observer_event(closed)
+    ),
+    teardown_ws(Ctx).
+
+ws_h3_blocked_send_in_order(Config) ->
+    TP = #transport_params{initial_max_stream_data_bidi_local = ?SMALL_WINDOW},
+    Ctx = setup_ws(Config, echo, #{transport_params => TP}),
+    Session = ctx_session(Ctx),
+    Payloads = [binary:copy(<<N>>, ?BLOCKED_FRAME) || N <- lists:seq(1, ?BLOCKED_FRAMES)],
+    [?assertEqual(ok, nhttp_ws:send(Session, {binary, P})) || P <- Payloads],
+    ?assertEqual(ok, nhttp_ws:close(Session, 4002, <<"after queue">>)),
+    ?assertMatch({closed, {local, 4002, <<"after queue">>}}, recv_observer_event(closed)),
+    [?assertEqual({binary, P}, h3_ws_recv_frame(Ctx)) || P <- Payloads],
+    ?assertEqual({close, 4002, <<"after queue">>}, h3_ws_recv_frame(Ctx)),
+    ?assertEqual(fin, h3_ws_recv_frame(Ctx)),
+    teardown_ws(Ctx).
+
 %%%-----------------------------------------------------------------------------
 %%% H3 CONNECTION / WS UPGRADE / FRAMING HELPERS
 %%%-----------------------------------------------------------------------------
@@ -264,9 +309,12 @@ ctx_sessions(#ctx{streams = Ss}) -> [S || {_, S} <- Ss].
 ctx_stream(#ctx{streams = [{Id, _} | _]}) -> Id.
 
 setup_ws(Config, Mode) ->
+    setup_ws(Config, Mode, #{}).
+
+setup_ws(Config, Mode, ClientOpts) ->
     Observer = self(),
     flush_observer(),
-    {Server, QConn, H3} = h3_connect(Config, Mode, Observer),
+    {Server, QConn, H3} = h3_connect(Config, Mode, Observer, ClientOpts),
     open_extra_stream(#ctx{server = Server, qconn = QConn, h3 = H3, streams = []}).
 
 open_extra_stream(#ctx{qconn = QConn, h3 = H3, streams = Streams} = Ctx) ->
@@ -292,7 +340,7 @@ teardown_ws(#ctx{server = Server, qconn = QConn}) ->
     nhttp:stop(Server),
     flush_observer().
 
-h3_connect(Config, Mode, Observer) ->
+h3_connect(Config, Mode, Observer, ClientOpts) ->
     CertFile = ?config(certfile, Config),
     KeyFile = ?config(keyfile, Config),
     {ok, Server} = nhttp:start_link(#{
@@ -304,7 +352,7 @@ h3_connect(Config, Mode, Observer) ->
         acceptor_count => 1
     }),
     {ok, Port} = nhttp:get_port(Server),
-    {QConn, H3} = nhttp_h3_test_client:connect(Port),
+    {QConn, H3} = nhttp_h3_test_client:connect(Port, ClientOpts),
     {Server, QConn, H3}.
 
 h3_ws_send_frame(#ctx{qconn = QConn, h3 = H3, streams = [{StreamId, _} | _]} = Ctx, Msg) ->
@@ -347,20 +395,30 @@ extract_ws_frame(Events, StreamId) ->
     [stash_frames_from_event(E) || E <- Events],
     pop_inbox(StreamId).
 
-stash_frames_from_event({data, StreamId, Data, _Fin}) ->
-    decode_and_push(StreamId, Data);
+stash_frames_from_event({data, StreamId, Data, Fin}) ->
+    decode_and_push(StreamId, Data),
+    case Fin of
+        fin -> push_inbox(StreamId, fin);
+        nofin -> ok
+    end;
 stash_frames_from_event(_) ->
     ok.
 
 decode_and_push(StreamId, Data) ->
-    case nhttp_ws:decode_unmasked(Data) of
-        {ok, Frame, <<>>} ->
-            push_inbox(StreamId, Frame);
-        {ok, Frame, Rest} ->
-            push_inbox(StreamId, Frame),
-            decode_and_push(StreamId, Rest);
-        _ ->
-            ok
+    Key = {?MODULE, decoder, StreamId},
+    Dec0 =
+        case erlang:get(Key) of
+            undefined -> nhttp_ws:decoder_new(client);
+            D -> D
+        end,
+    case nhttp_ws:feed(Data, Dec0) of
+        {ok, Frames, Dec1} ->
+            erlang:put(Key, Dec1),
+            [push_inbox(StreamId, Frame) || Frame <- Frames],
+            ok;
+        {error, Reason, Frames} ->
+            [push_inbox(StreamId, Frame) || Frame <- Frames],
+            ct:fail({ws_decode_error, StreamId, Reason})
     end.
 
 push_inbox(StreamId, Frame) ->

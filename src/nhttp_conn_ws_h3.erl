@@ -18,6 +18,7 @@
     handle_call/3,
     handle_cast/2,
     handle_data/3,
+    handle_flushed/2,
     handle_info/2,
     handle_stream_reset/3,
     notify_connection_close/2
@@ -33,8 +34,7 @@ Close every active WebSocket session on the connection. Called from
 -spec close_all(#state{}) -> #state{}.
 close_all(State) ->
     fold(State, fun(StreamId, _Ws, Acc) ->
-        Acc1 = send_close(Acc, StreamId, ?WS_CLOSE_GOING_AWAY, <<"Server shutting down">>),
-        finish(Acc1, StreamId, shutdown)
+        close_session(Acc, StreamId, ?WS_CLOSE_GOING_AWAY, <<"Server shutting down">>, shutdown)
     end).
 
 -doc """
@@ -86,8 +86,7 @@ handle_cast(State, {ws_info, StreamId, Msg}) ->
 handle_cast(State, {ws_close, Ref, StreamId, Code, Reason, _Opts}) ->
     case get_ws(State, StreamId) of
         #ws_state{ref = Ref} ->
-            State1 = send_close(State, StreamId, Code, Reason),
-            finish(State1, StreamId, {local, Code, Reason});
+            close_session(State, StreamId, Code, Reason, {local, Code, Reason});
         _ ->
             State
     end;
@@ -106,6 +105,18 @@ handle_data(#state{h3_streams = Streams} = State, StreamId, Data) ->
         _ ->
             State
     end.
+
+-doc """
+Settle a WebSocket stream after its send buffer drained or failed. A
+failed flush resets the stream and ends the session if it is still open.
+""".
+-spec handle_flushed(nhttp_lib:stream_id(), nhttp_conn_h3:offer_result()) -> #state{}.
+handle_flushed(_StreamId, {sent, State}) ->
+    State;
+handle_flushed(_StreamId, {stashed, State}) ->
+    State;
+handle_flushed(StreamId, {error, Reason, State}) ->
+    abort(State, StreamId, Reason).
 
 -doc """
 Broadcast an untagged Erlang message to every active WS session on the
@@ -168,9 +179,14 @@ arm_decoder(State, StreamId) ->
 call_send(State, From, Ref, StreamId, Frame) ->
     case get_ws(State, StreamId) of
         #ws_state{ref = Ref} ->
-            State1 = send_frame(State, StreamId, Frame),
-            gen_server:reply(From, ok),
-            State1;
+            case send_frame(State, StreamId, Frame) of
+                {error, Reason, State1} ->
+                    gen_server:reply(From, {error, gone}),
+                    abort(State1, StreamId, Reason);
+                {_SentOrStashed, State1} ->
+                    gen_server:reply(From, ok),
+                    State1
+            end;
         #ws_state{} ->
             gen_server:reply(From, {error, gone}),
             State;
@@ -272,8 +288,7 @@ fail(State, StreamId, Reason) ->
             State;
         #ws_state{} ->
             {Code, ReasonBin} = nhttp_conn_ws:decode_error_close(Reason),
-            State1 = send_close(State, StreamId, Code, ReasonBin),
-            finish(State1, StreamId, {fail, Code, ReasonBin})
+            close_session(State, StreamId, Code, ReasonBin, {fail, Code, ReasonBin})
     end.
 
 -spec feed(#state{}, nhttp_lib:stream_id(), binary(), nhttp_ws:ws_decoder()) -> #state{}.
@@ -305,13 +320,18 @@ set_decoder(State, StreamId, Dec) ->
 interpret(State, _StreamId, []) ->
     State;
 interpret(State, StreamId, [{send_frame, Msg} | Rest]) ->
-    State1 = send_frame(State, StreamId, Msg),
-    interpret(State1, StreamId, Rest);
+    interpret_next(send_frame(State, StreamId, Msg), StreamId, Rest);
 interpret(State, StreamId, [{send_close, Code, Reason} | Rest]) ->
-    State1 = send_close(State, StreamId, Code, Reason),
-    interpret(State1, StreamId, Rest);
+    interpret_next(send_close(State, StreamId, Code, Reason), StreamId, Rest);
 interpret(State, StreamId, [{close_session, WsReason} | _Rest]) ->
     finish(State, StreamId, WsReason).
+
+-spec interpret_next(nhttp_conn_h3:offer_result(), nhttp_lib:stream_id(), nhttp_conn_ws:actions()) ->
+    #state{}.
+interpret_next({error, Reason, State}, StreamId, _Rest) ->
+    abort(State, StreamId, Reason);
+interpret_next({_SentOrStashed, State}, StreamId, Rest) ->
+    interpret(State, StreamId, Rest).
 
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - STREAM MAP HELPERS
@@ -354,17 +374,44 @@ put_ws(#state{h3_streams = Streams} = State, StreamId, Ws) ->
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - SEND HELPERS
 %%%-----------------------------------------------------------------------------
--spec send_close(#state{}, nhttp_lib:stream_id(), no_code | nhttp_ws:close_code(), binary()) ->
-    #state{}.
-send_close(State, StreamId, Code, Reason) ->
-    CloseFrame =
-        case Code of
-            no_code -> nhttp_ws:encode(close);
-            _ -> nhttp_ws:encode({close, Code, Reason})
-        end,
-    nhttp_conn_h3:send_h3_data(State, StreamId, CloseFrame, fin).
+-doc """
+End a session whose frame QUIC refused for another reason than flow
+control. The stream is reset and the close lifecycle runs with
+`{transport, Reason}`.
+""".
+-spec abort(#state{}, nhttp_lib:stream_id(), nhttp_conn_h3:send_error()) -> #state{}.
+abort(State, StreamId, Reason) ->
+    nhttp_log:ws_send_failed(nhttp_conn_h3:log_ctx(State), Reason),
+    State1 = nhttp_conn_h3:reset_stream(
+        State, StreamId, nhttp_conn_h3:h3_error_to_code(h3_internal_error)
+    ),
+    finish(State1, StreamId, {transport, Reason}).
 
--spec send_frame(#state{}, nhttp_lib:stream_id(), nhttp_ws:ws_message()) -> #state{}.
+-doc """
+Write the CLOSE frame with FIN and run the close lifecycle. The CLOSE
+leaves after the frames already buffered for the stream.
+""".
+-spec close_session(
+    #state{},
+    nhttp_lib:stream_id(),
+    no_code | nhttp_ws:close_code(),
+    binary(),
+    nhttp_handler:ws_close_reason()
+) -> #state{}.
+close_session(State, StreamId, Code, Reason, WsReason) ->
+    case send_close(State, StreamId, Code, Reason) of
+        {error, SendError, State1} -> abort(State1, StreamId, SendError);
+        {_SentOrStashed, State1} -> finish(State1, StreamId, WsReason)
+    end.
+
+-spec send_close(#state{}, nhttp_lib:stream_id(), no_code | nhttp_ws:close_code(), binary()) ->
+    nhttp_conn_h3:offer_result().
+send_close(State, StreamId, no_code, _Reason) ->
+    nhttp_conn_h3:send_h3_data(State, StreamId, nhttp_ws:encode(close), fin);
+send_close(State, StreamId, Code, Reason) ->
+    nhttp_conn_h3:send_h3_data(State, StreamId, nhttp_ws:encode({close, Code, Reason}), fin).
+
+-spec send_frame(#state{}, nhttp_lib:stream_id(), nhttp_ws:ws_message()) ->
+    nhttp_conn_h3:offer_result().
 send_frame(State, StreamId, Message) ->
-    Frame = nhttp_ws:encode(Message),
-    nhttp_conn_h3:send_h3_data(State, StreamId, Frame, nofin).
+    nhttp_conn_h3:send_h3_data(State, StreamId, nhttp_ws:encode(Message), nofin).

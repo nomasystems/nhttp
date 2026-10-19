@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.3.0] - 2026-10-19
 
 ### Added
 
@@ -14,13 +14,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - A connection hibernates after the `hibernate` timeout of quiet, not after every request or WebSocket frame. The idle timeout still fires on time: the quiet wait consumes part of the idle budget and the hibernation timer gets the rest
-- Requires `nhttp_lib` 1.3.0
+- Requires `nhttp_lib` 2.0.0
 - WebSocket frames on HTTP/1.1, HTTP/2 and HTTP/3 are decoded with `nhttp_ws:feed/2`. The decoder keeps the partial frame, so the server holds no WebSocket buffer of its own
 - A WebSocket session on HTTP/1.1 reads with `{active, 100}` instead of `{active, once}`, and sends the replies to all frames of one read in one socket write. A 64 B echo costs about 30% fewer reductions
 - A WebSocket session checks which optional `handle_ws_*` callbacks the handler exports once, when it opens. A callback added by a code reload applies to sessions opened after the reload
 
 ### Fixed
 
+- HTTP/3: a WebSocket frame or push chunk that QUIC flow control refuses waits per stream and leaves in order on `stream_writable`. A Close+FIN waits in the same queue. Before, it was dropped and the send returned `ok`
+- A WebSocket handler reply that holds a CLOSE ends the session, and the frames after it are not sent. A reply or close with a reserved close code, a reason over 123 bytes or a control payload over 125 bytes closes the session with 1011
+- HTTP/1.1: `nhttp_ws:send/2` on a closed socket returns `{error, gone}`, not `{error, closed}`
 - The `opts()` type declares the request limit options (`max_body_size`, `max_headers`, `max_header_size`, `max_header_name_length`, `max_header_value_length`, `max_uri_length`). The listener already read them, but a caller that set one failed dialyzer
 - `get_port/1`, `get_port/2` and `get_ports/1` took about one second to return the TCP port on an idle listener, because they waited for an acceptor to leave `accept`. The server now reads the port that the listener registers at startup
 

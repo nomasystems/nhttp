@@ -390,6 +390,17 @@ flush(#state{socket = Socket} = State, Out) ->
 send_close(State, Code, Reason) ->
     nhttp_conn:sock_send(State, nhttp_ws:encode({close, Code, Reason})).
 
--spec send_msg(#state{}, nhttp_ws:ws_message()) -> ok | {error, term()}.
-send_msg(#state{socket = Socket}, Msg) ->
-    nhttp_sock:send(Socket, nhttp_ws:encode(Msg)).
+-doc """
+Write one frame for the session API and name the outcome. A socket that
+refuses the write no longer carries the session, so the caller sees
+`gone`, the same answer it gets once the connection process is down.
+""".
+-spec send_msg(#state{}, nhttp_ws:ws_message()) -> ok | {error, gone}.
+send_msg(#state{socket = Socket} = State, Msg) ->
+    case nhttp_sock:send(Socket, nhttp_ws:encode(Msg)) of
+        ok ->
+            ok;
+        {error, Reason} ->
+            nhttp_log:ws_send_failed(nhttp_conn:log_ctx(State), Reason),
+            {error, gone}
+    end.

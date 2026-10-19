@@ -54,6 +54,8 @@ Reuses the transport-agnostic `nhttp_h1_ws_async_handler` test handler.
     unknown_cast_ignored/1,
     stream_reset_handler_closed_crash/1,
     stream_reset_no_closed_callback/1,
+    handler_reply_close/1,
+    handler_reply_invalid_close/1,
     ws_h2_frame_above_window_delivered_after_credit/1,
     ws_h2_close_queued_behind_frame/1,
     ws_h2_send_buffer_full_resets_frame/1,
@@ -111,7 +113,9 @@ groups() ->
             ws_h2_frame_above_window_delivered_after_credit,
             ws_h2_close_queued_behind_frame,
             ws_h2_send_buffer_full_resets_frame,
-            ws_h2_send_buffer_full_resets_close
+            ws_h2_send_buffer_full_resets_close,
+            handler_reply_close,
+            handler_reply_invalid_close
         ]}
     ].
 
@@ -388,6 +392,28 @@ stream_reset_no_closed_callback(Config) ->
     Ctx = open_extra_stream(Ctx0, 3),
     Session3 = pick_session(ctx_sessions(Ctx), 3),
     ?assertEqual(3, nhttp_ws:stream_id(Session3)),
+    teardown_ws(Ctx).
+
+handler_reply_close(Config) ->
+    Ctx = setup_ws(Config, reply_close, 1),
+    ok = h2_ws_send_frame(Ctx, 1, {text, <<"go">>}),
+    ?assertEqual({text, <<"before">>}, h2_ws_recv_frame(Ctx, 1)),
+    ?assertEqual({close, 4003, <<"reply close">>}, h2_ws_recv_frame(Ctx, 1)),
+    ?assertMatch({closed, {local, 4003, <<"reply close">>}}, recv_observer_event(closed)),
+    Frames = nhttp_test_helpers:h2_recv(ctx_sock(Ctx), ?RECV_MS),
+    ?assertEqual(0, nhttp_test_helpers:stream_data_size(Frames, 1)),
+    teardown_ws(Ctx).
+
+handler_reply_invalid_close(Config) ->
+    Ctx = setup_ws(Config, reply_bad_close, 1),
+    ok = h2_ws_send_frame(Ctx, 1, {text, <<"go">>}),
+    ?assertEqual(
+        {close, ?WS_CLOSE_INTERNAL_ERROR, <<"Internal Server Error">>}, h2_ws_recv_frame(Ctx, 1)
+    ),
+    ?assertMatch(
+        {closed, {handler_crash, {error, {invalid_ws_message, {close, 1005, <<>>}, _}}}},
+        recv_observer_event(closed)
+    ),
     teardown_ws(Ctx).
 
 ws_h2_frame_above_window_delivered_after_credit(Config) ->

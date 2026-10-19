@@ -31,6 +31,7 @@
     emit_stream_start/2,
     h3_error_to_code/1,
     log_ctx/1,
+    offer_h3_data/4,
     reset_stream/3,
     send_h3_data/4,
     send_h3_error_response/3,
@@ -52,13 +53,25 @@
 %%%-----------------------------------------------------------------------------
 %% TYPES
 %%%-----------------------------------------------------------------------------
--export_type([handler_opts/0]).
+-export_type([
+    handler_opts/0,
+    offer_result/0,
+    send_buffer/0,
+    send_error/0
+]).
 
 -type handler_opts() :: #{
     opts := nhttp:opts(),
     name := term(),
     registry := nhttp_registry:tab()
 }.
+
+-doc "Frames of one stream that wait for QUIC flow control, newest first.".
+-type send_buffer() :: [{iodata(), nhttp_h3:fin()}, ...].
+
+-type send_error() :: {h3, nhttp_h3:h3_error()} | {quic, term()}.
+
+-type offer_result() :: {sent | stashed, #state{}} | {error, send_error(), #state{}}.
 
 -type h3_init_args() :: #{
     name := term(),
@@ -225,30 +238,102 @@ track(Tab) ->
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - ACTION EXECUTION
 %%%-----------------------------------------------------------------------------
+-doc """
+Execute the actions of the H3 codec. Each send goes through
+`offer_h3_data/4`. A send that QUIC refuses for another reason than flow
+control is logged: the stream it belongs to no longer takes data.
+""".
 -spec execute_h3_actions(#state{}, [nhttp_h3:action()]) -> #state{}.
 execute_h3_actions(State, []) ->
     State;
 execute_h3_actions(State, [{send, StreamId, Data} | Rest]) ->
-    case nquic_lib:send(State#state.ctx, StreamId, Data) of
-        {ok, Ctx1} ->
-            execute_h3_actions(State#state{ctx = Ctx1}, Rest);
-        {error, _, Ctx1} ->
-            execute_h3_actions(State#state{ctx = Ctx1}, Rest);
-        {error, _} ->
-            execute_h3_actions(State, Rest)
-    end;
+    execute_h3_actions(settle_offer(offer_h3_data(State, StreamId, Data, nofin)), Rest);
 execute_h3_actions(State, [{send_fin, StreamId, Data} | Rest]) ->
-    case nquic_lib:send_fin_noflush(State#state.ctx, StreamId, Data) of
-        {ok, Ctx1} ->
-            execute_h3_actions(State#state{ctx = Ctx1}, Rest);
-        {error, _, Ctx1} ->
-            execute_h3_actions(State#state{ctx = Ctx1}, Rest);
-        {error, _} ->
-            execute_h3_actions(State, Rest)
-    end;
+    execute_h3_actions(settle_offer(offer_h3_data(State, StreamId, Data, fin)), Rest);
 execute_h3_actions(State, [{close_connection, Code, _Reason} | _]) ->
     ok = nquic_lib:shutdown(State#state.ctx, Code, <<>>),
     terminate({h3_connection_error, Code}, State#state{closing = true}).
+
+-doc """
+Write the buffered frames of a stream that QUIC reports writable again,
+oldest first, and hand the outcome to the owner of the stream.
+""".
+-spec flush_h3_send_buffer(#state{}, nhttp_lib:stream_id()) -> #state{}.
+flush_h3_send_buffer(#state{h3_send_buffers = Buffers} = State, StreamId) ->
+    case maps:take(StreamId, Buffers) of
+        error ->
+            State;
+        {Buffer, Buffers1} ->
+            Outcome = drain_send_buffer(
+                State#state{h3_send_buffers = Buffers1}, StreamId, lists:reverse(Buffer)
+            ),
+            flushed(Outcome, StreamId)
+    end.
+
+-spec drain_send_buffer(#state{}, nhttp_lib:stream_id(), [{iodata(), nhttp_h3:fin()}]) ->
+    offer_result().
+drain_send_buffer(State, _StreamId, []) ->
+    {sent, State};
+drain_send_buffer(State, StreamId, [{Data, Fin} | Rest] = Pending) ->
+    case quic_send(State, StreamId, Data, Fin) of
+        {sent, State1} -> drain_send_buffer(State1, StreamId, Rest);
+        {blocked, State1} -> {stashed, put_send_buffer(State1, StreamId, lists:reverse(Pending))};
+        {error, _Reason, _State1} = Error -> Error
+    end.
+
+-spec flushed(offer_result(), nhttp_lib:stream_id()) -> #state{}.
+flushed(Outcome, StreamId) ->
+    #state{h3_streams = Streams} = offer_state(Outcome),
+    case maps:get(StreamId, Streams, undefined) of
+        #h3_stream{type = push} -> nhttp_conn_h3_push:handle_h3_push_flushed(StreamId, Outcome);
+        #h3_stream{type = websocket} -> nhttp_conn_ws_h3:handle_flushed(StreamId, Outcome);
+        #h3_stream{type = http} -> settle_offer(Outcome);
+        undefined -> settle_offer(Outcome)
+    end.
+
+-spec offer_state(offer_result()) -> #state{}.
+offer_state({sent, State}) -> State;
+offer_state({stashed, State}) -> State;
+offer_state({error, _Reason, State}) -> State.
+
+-spec put_send_buffer(#state{}, nhttp_lib:stream_id(), send_buffer()) -> #state{}.
+put_send_buffer(#state{h3_send_buffers = Buffers} = State, StreamId, Buffer) ->
+    State#state{h3_send_buffers = Buffers#{StreamId => Buffer}}.
+
+-doc """
+Hand `Data` to QUIC, or reply which flow control limit refused it. nquic
+refuses a blocked send whole and tells the peer with a DATA_BLOCKED or
+STREAM_DATA_BLOCKED frame.
+""".
+-spec quic_send(#state{}, nhttp_lib:stream_id(), iodata(), nhttp_h3:fin()) ->
+    {sent | blocked, #state{}} | {error, send_error(), #state{}}.
+quic_send(#state{ctx = Ctx} = State, StreamId, Data, Fin) ->
+    case quic_send_ctx(Ctx, StreamId, Data, Fin) of
+        {ok, Ctx1} ->
+            {sent, State#state{ctx = Ctx1}};
+        {error, {stream_flow_control_blocked, _Limit}, Ctx1} ->
+            {blocked, State#state{ctx = Ctx1}};
+        {error, {conn_flow_control_blocked, _Limit}, Ctx1} ->
+            {blocked, State#state{ctx = Ctx1}};
+        {error, Reason} ->
+            {error, {quic, Reason}, State}
+    end.
+
+-spec quic_send_ctx(nquic:ctx(), nhttp_lib:stream_id(), iodata(), nhttp_h3:fin()) ->
+    {ok, nquic:ctx()} | {error, term(), nquic:ctx()} | {error, term()}.
+quic_send_ctx(Ctx, StreamId, Data, nofin) ->
+    nquic_lib:send(Ctx, StreamId, Data);
+quic_send_ctx(Ctx, StreamId, Data, fin) ->
+    nquic_lib:send_fin_noflush(Ctx, StreamId, Data).
+
+-spec settle_offer(offer_result()) -> #state{}.
+settle_offer({sent, State}) ->
+    State;
+settle_offer({stashed, State}) ->
+    State;
+settle_offer({error, Reason, State}) ->
+    nhttp_log:sock_send_failed(log_ctx(State), Reason),
+    State.
 
 -spec execute_init_actions(nquic:ctx(), [nhttp_h3:action()]) -> nquic:ctx().
 execute_init_actions(Ctx, []) ->
@@ -328,8 +413,10 @@ connection_loop_receive(#state{idle_timeout = IdleTimeout} = State) ->
     h3_receive(State, nhttp_conn:idle_deadline(IdleTimeout)).
 
 -spec stream_idle(#state{}) -> boolean().
-stream_idle(#state{closing = false, h3_streams = Streams, h3_push_workers = Workers}) ->
-    map_size(Streams) =:= 0 andalso map_size(Workers) =:= 0;
+stream_idle(#state{
+    closing = false, h3_streams = Streams, h3_push_workers = Workers, h3_send_buffers = Buffers
+}) ->
+    map_size(Streams) =:= 0 andalso map_size(Workers) =:= 0 andalso map_size(Buffers) =:= 0;
 stream_idle(#state{}) ->
     false.
 
@@ -921,7 +1008,10 @@ process_quic_event(#state{h3_streams = Streams} = State, {stream_reset, StreamId
         _ ->
             handle_stream_reset(State, StreamId, ErrorCode)
     end;
-process_quic_event(#state{h3_streams = Streams} = State, {stop_sending, StreamId, ErrorCode}) ->
+process_quic_event(
+    #state{h3_streams = Streams} = State0, {stop_sending, StreamId, ErrorCode}
+) ->
+    State = drop_send_buffer(State0, StreamId),
     case maps:get(StreamId, Streams, undefined) of
         #h3_stream{type = websocket} ->
             nhttp_conn_ws_h3:handle_stream_reset(State, StreamId, ErrorCode);
@@ -929,7 +1019,7 @@ process_quic_event(#state{h3_streams = Streams} = State, {stop_sending, StreamId
             nhttp_conn_h3_push:handle_h3_push_stop_sending(State, StreamId, ErrorCode)
     end;
 process_quic_event(State, {stream_writable, StreamId}) ->
-    nhttp_conn_h3_push:flush_h3_stream_buffer(State, StreamId);
+    flush_h3_send_buffer(State, StreamId);
 process_quic_event(State, connection_closed) ->
     State1 = nhttp_conn_ws_h3:notify_connection_close(State, 0),
     terminate(quic_closed, State1#state{closing = true});
@@ -943,8 +1033,13 @@ process_quic_events(State, [Event | Rest]) ->
     State1 = process_quic_event(State, Event),
     process_quic_events(State1, Rest).
 
+-spec drop_send_buffer(#state{}, nhttp_lib:stream_id()) -> #state{}.
+drop_send_buffer(#state{h3_send_buffers = Buffers} = State, StreamId) ->
+    State#state{h3_send_buffers = maps:remove(StreamId, Buffers)}.
+
 -spec reset_stream(#state{}, nhttp_lib:stream_id(), non_neg_integer()) -> #state{}.
-reset_stream(State, StreamId, ErrorCode) ->
+reset_stream(State0, StreamId, ErrorCode) ->
+    State = drop_send_buffer(State0, StreamId),
     case nquic_lib:reset_stream(State#state.ctx, StreamId, ErrorCode) of
         {ok, Ctx1} ->
             State#state{ctx = Ctx1};
@@ -1005,13 +1100,44 @@ handle_stream_reset(State, StreamId, ErrorCode) ->
 response_to_h3_headers(#{status := Status, headers := Headers}) ->
     [{<<":status">>, integer_to_binary(Status)} | Headers].
 
--spec send_h3_data(#state{}, nhttp_lib:stream_id(), iodata(), nhttp_h3:fin()) -> #state{}.
+-doc """
+Offer one encoded frame for `StreamId` to QUIC, and name the outcome:
+
+- `sent`: QUIC took the frame.
+- `stashed`: flow control refused it, or older frames of the stream still
+  wait. The frame waits in `h3_send_buffers` behind them and leaves on
+  `{stream_writable, StreamId}`, in order.
+- `{error, Reason, State}`: QUIC refused it for another reason. Nothing
+  was queued.
+""".
+-spec offer_h3_data(#state{}, nhttp_lib:stream_id(), iodata(), nhttp_h3:fin()) ->
+    offer_result().
+offer_h3_data(#state{h3_send_buffers = Buffers} = State, StreamId, Data, Fin) ->
+    case maps:find(StreamId, Buffers) of
+        {ok, Buffer} ->
+            {stashed, put_send_buffer(State, StreamId, [{Data, Fin} | Buffer])};
+        error ->
+            case quic_send(State, StreamId, Data, Fin) of
+                {sent, State1} -> {sent, State1};
+                {blocked, State1} -> {stashed, put_send_buffer(State1, StreamId, [{Data, Fin}])};
+                {error, _Reason, _State1} = Error -> Error
+            end
+    end.
+
+-doc """
+Frame `Data` as an HTTP/3 DATA frame and offer it with `offer_h3_data/4`.
+The codec refuses a stream that is not open for sending with
+`{error, {h3, Reason}, State}`.
+""".
+-spec send_h3_data(#state{}, nhttp_lib:stream_id(), iodata(), nhttp_h3:fin()) -> offer_result().
 send_h3_data(State, StreamId, Data, Fin) ->
     case nhttp_h3:send_data(State#state.h3_conn, StreamId, Data, Fin) of
-        {ok, NewH3, Actions} ->
-            execute_h3_actions(State#state{h3_conn = NewH3}, Actions);
-        {error, _} ->
-            State
+        {ok, NewH3, [{send, StreamId, Frame}]} ->
+            offer_h3_data(State#state{h3_conn = NewH3}, StreamId, Frame, nofin);
+        {ok, NewH3, [{send_fin, StreamId, Frame}]} ->
+            offer_h3_data(State#state{h3_conn = NewH3}, StreamId, Frame, fin);
+        {error, Reason} ->
+            {error, {h3, Reason}, State}
     end.
 
 -spec send_h3_error_response(#state{}, nhttp_lib:stream_id(), nhttp_lib:status()) -> #state{}.

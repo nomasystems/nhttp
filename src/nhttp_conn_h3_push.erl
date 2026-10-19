@@ -13,7 +13,7 @@
 %%%-----------------------------------------------------------------------------
 -export([
     dispatch_h3_stream_push/8,
-    flush_h3_stream_buffer/2,
+    handle_h3_push_flushed/2,
     handle_h3_push_send_chunk/5,
     handle_h3_push_send_trailers/4,
     handle_h3_push_stop_sending/3,
@@ -68,48 +68,26 @@ dispatch_h3_stream_push(
             )
     end.
 
--spec flush_h3_stream_buffer(#state{}, nhttp_lib:stream_id()) -> #state{}.
-flush_h3_stream_buffer(#state{h3_streams = Streams} = State, StreamId) ->
-    case maps:get(StreamId, Streams, undefined) of
-        #h3_stream{
-            type = push,
-            push =
-                #h3_push_ctx{
-                    send_buffer = Buf,
-                    send_end_stream = EndStream,
-                    worker = WPid,
-                    ref = Ref0,
-                    pending_ack = PendingRef
-                } = Ctx
-        } = Stream when Buf =/= <<>> ->
-            Ref =
-                case PendingRef of
-                    undefined -> Ref0;
-                    _ -> PendingRef
-                end,
-            Fin =
-                case EndStream of
-                    true -> fin;
-                    false -> nofin
-                end,
-            Stream1 = Stream#h3_stream{
-                push = Ctx#h3_push_ctx{
-                    send_buffer = <<>>,
-                    send_end_stream = false,
-                    pending_ack = undefined
-                }
-            },
-            Streams1 = Streams#{StreamId => Stream1},
-            State1 = State#state{h3_streams = Streams1},
-            Action =
-                case Fin of
-                    fin -> {send_fin, StreamId, Buf};
-                    nofin -> {send, StreamId, Buf}
-                end,
-            execute_h3_push_action(State1, StreamId, WPid, Ref, Action, Fin);
-        _ ->
-            State
-    end.
+-doc """
+Settle a push stream after its send buffer drained or failed. A drained
+buffer pays the pending chunk ack, and finishes the stream when that
+chunk carried FIN. A failed flush resets the stream.
+""".
+-spec handle_h3_push_flushed(nhttp_lib:stream_id(), nhttp_conn_h3:offer_result()) -> #state{}.
+handle_h3_push_flushed(_StreamId, {stashed, State}) ->
+    State;
+handle_h3_push_flushed(StreamId, {sent, #state{h3_streams = Streams} = State}) ->
+    case maps:get(StreamId, Streams) of
+        #h3_stream{push = #h3_push_ctx{pending = undefined}} ->
+            State;
+        #h3_stream{push = #h3_push_ctx{worker = WPid, pending = {Ref, Fin}} = Ctx} = Stream ->
+            Stream1 = Stream#h3_stream{push = Ctx#h3_push_ctx{pending = undefined}},
+            State1 = State#state{h3_streams = Streams#{StreamId => Stream1}},
+            finalize_h3_push_send(State1, StreamId, WPid, Ref, Fin)
+    end;
+handle_h3_push_flushed(StreamId, {error, Reason, #state{h3_streams = Streams} = State}) ->
+    #h3_stream{push = #h3_push_ctx{worker = WPid} = Ctx} = maps:get(StreamId, Streams),
+    handle_h3_push_send_fatal(State, StreamId, WPid, ack_ref(Ctx), Reason).
 
 -spec handle_h3_push_send_chunk(
     #state{}, pid(), reference(), iodata(), nhttp_h3:fin()
@@ -186,19 +164,8 @@ handle_h3_push_stop_sending(
 handle_h3_push_stream_reset(
     #state{h3_streams = Streams, h3_push_workers = Workers} = State, StreamId, Stream
 ) ->
-    #h3_stream{
-        push = #h3_push_ctx{
-            worker = WPid,
-            ref = Ref0,
-            mref = MRef,
-            pending_ack = PendingRef
-        }
-    } = Stream,
-    Ref =
-        case PendingRef of
-            undefined -> Ref0;
-            _ -> PendingRef
-        end,
+    #h3_stream{push = #h3_push_ctx{worker = WPid, mref = MRef} = Ctx} = Stream,
+    Ref = ack_ref(Ctx),
     emit_h3_stream_complete(State, StreamId, Stream, peer_reset),
     WPid ! {chunk_ack, Ref, {error, closed}},
     _ = erlang:demonitor(MRef, [flush]),
@@ -275,38 +242,9 @@ emit_h3_stream_complete(State, _StreamId, #h3_stream{push = Ctx}, _Reason) ->
     #h3_push_ctx{status = Status, req_span = ReqSpan, bytes = Bytes} = Ctx,
     nhttp_conn_h3:emit_request_stop_with_size(State, Status, ReqSpan, Bytes).
 
--spec execute_h3_push_action(
-    #state{},
-    nhttp_lib:stream_id(),
-    pid(),
-    reference(),
-    nhttp_h3:action(),
-    nhttp_h3:fin()
-) -> #state{}.
-execute_h3_push_action(State, StreamId, WPid, Ref, {send, StreamId, Frame}, Fin) ->
-    case nquic_lib:send(State#state.ctx, StreamId, Frame) of
-        {ok, Ctx1} ->
-            State1 = State#state{ctx = Ctx1},
-            finalize_h3_push_send(State1, StreamId, WPid, Ref, Fin);
-        {error, _BlockedReason, Ctx1} ->
-            stash_h3_push_frame(
-                State#state{ctx = Ctx1}, StreamId, Ref, Frame, Fin
-            );
-        {error, Reason} ->
-            handle_h3_push_send_fatal(State, StreamId, WPid, Ref, Reason)
-    end;
-execute_h3_push_action(State, StreamId, WPid, Ref, {send_fin, StreamId, Frame}, Fin) ->
-    case nquic_lib:send_fin_noflush(State#state.ctx, StreamId, Frame) of
-        {ok, Ctx1} ->
-            State1 = State#state{ctx = Ctx1},
-            finalize_h3_push_send(State1, StreamId, WPid, Ref, Fin);
-        {error, _BlockedReason, Ctx1} ->
-            stash_h3_push_frame(
-                State#state{ctx = Ctx1}, StreamId, Ref, Frame, Fin
-            );
-        {error, Reason} ->
-            handle_h3_push_send_fatal(State, StreamId, WPid, Ref, Reason)
-    end.
+-spec ack_ref(#h3_push_ctx{}) -> reference().
+ack_ref(#h3_push_ctx{ref = Ref, pending = undefined}) -> Ref;
+ack_ref(#h3_push_ctx{pending = {Ref, _Fin}}) -> Ref.
 
 -spec finalize_h3_push_send(
     #state{}, nhttp_lib:stream_id(), pid(), reference(), nhttp_h3:fin()
@@ -338,7 +276,7 @@ finalize_h3_push_send(State, _StreamId, WPid, Ref, nofin) ->
     nhttp_h3:fin()
 ) -> #state{}.
 h3_push_send_chunk(
-    #state{h3_streams = Streams, h3_conn = H3Conn} = State,
+    #state{h3_streams = Streams} = State,
     StreamId,
     WPid,
     Ref,
@@ -353,16 +291,17 @@ h3_push_send_chunk(
             Stream2 = Stream1#h3_stream{
                 push = Ctx1#h3_push_ctx{bytes = Ctx1#h3_push_ctx.bytes + BytesAdded}
             },
-            case nhttp_h3:send_data(H3Conn, StreamId, Data, Fin) of
-                {ok, NewH3Conn, [Action]} ->
-                    State1 = State#state{
-                        h3_conn = NewH3Conn,
-                        h3_streams = Streams#{StreamId => Stream2}
-                    },
-                    execute_h3_push_action(State1, StreamId, WPid, Ref, Action, Fin);
-                {error, _} ->
+            State1 = State#state{h3_streams = Streams#{StreamId => Stream2}},
+            case nhttp_conn_h3:send_h3_data(State1, StreamId, Data, Fin) of
+                {sent, State2} ->
+                    finalize_h3_push_send(State2, StreamId, WPid, Ref, Fin);
+                {stashed, State2} ->
+                    set_pending(State2, StreamId, {Ref, Fin});
+                {error, {h3, _Reason}, State2} ->
                     WPid ! {chunk_ack, Ref, {error, closed}},
-                    cleanup_h3_push_stream(State, StreamId, WPid)
+                    cleanup_h3_push_stream(State2, StreamId, WPid);
+                {error, {quic, _} = Reason, State2} ->
+                    handle_h3_push_send_fatal(State2, StreamId, WPid, Ref, Reason)
             end;
         _ ->
             WPid ! {chunk_ack, Ref, {error, closed}},
@@ -370,9 +309,10 @@ h3_push_send_chunk(
     end.
 
 -spec handle_h3_push_send_fatal(
-    #state{}, nhttp_lib:stream_id(), pid(), reference(), term()
+    #state{}, nhttp_lib:stream_id(), pid(), reference(), nhttp_conn_h3:send_error()
 ) -> #state{}.
-handle_h3_push_send_fatal(State, StreamId, WPid, Ref, _Reason) ->
+handle_h3_push_send_fatal(State, StreamId, WPid, Ref, Reason) ->
+    nhttp_log:sock_send_failed(nhttp_conn_h3:log_ctx(State), Reason),
     WPid ! {chunk_ack, Ref, {error, closed}},
     State1 = nhttp_conn_h3:reset_stream(
         State, StreamId, nhttp_conn_h3:h3_error_to_code(h3_internal_error)
@@ -388,10 +328,29 @@ maybe_emit_h3_stream_start(
     nhttp_conn_h3:emit_stream_start(State, ReqSpan),
     Stream#h3_stream{push = Ctx#h3_push_ctx{started = true}}.
 
+-doc """
+End a push stream whose producer returned. A FIN that flow control holds
+leaves from the send buffer after the stream entry is gone.
+""".
 -spec send_h3_push_empty_fin(#state{}, nhttp_lib:stream_id()) -> #state{}.
-send_h3_push_empty_fin(#state{h3_streams = Streams} = State, StreamId) ->
-    State1 = nhttp_conn_h3:send_h3_data(State, StreamId, <<>>, fin),
-    State1#state{h3_streams = maps:remove(StreamId, Streams)}.
+send_h3_push_empty_fin(State, StreamId) ->
+    State1 =
+        case nhttp_conn_h3:send_h3_data(State, StreamId, <<>>, fin) of
+            {sent, S} ->
+                S;
+            {stashed, S} ->
+                S;
+            {error, Reason, S} ->
+                nhttp_log:sock_send_failed(nhttp_conn_h3:log_ctx(S), Reason),
+                S
+        end,
+    State1#state{h3_streams = maps:remove(StreamId, State1#state.h3_streams)}.
+
+-spec set_pending(#state{}, nhttp_lib:stream_id(), {reference(), nhttp_h3:fin()}) -> #state{}.
+set_pending(#state{h3_streams = Streams} = State, StreamId, Pending) ->
+    #h3_stream{push = Ctx} = Stream = maps:get(StreamId, Streams),
+    Stream1 = Stream#h3_stream{push = Ctx#h3_push_ctx{pending = Pending}},
+    State#state{h3_streams = Streams#{StreamId => Stream1}}.
 
 -spec start_h3_stream_push(
     #state{},
@@ -424,30 +383,6 @@ start_h3_stream_push(State, StreamId, Status, Headers, Producer, NewHState, ReqS
         h3_push_workers = (State1#state.h3_push_workers)#{WorkerPid => StreamId},
         requests_count = State#state.requests_count + 1
     }.
-
--spec stash_h3_push_frame(
-    #state{},
-    nhttp_lib:stream_id(),
-    reference(),
-    iodata(),
-    nhttp_h3:fin()
-) -> #state{}.
-stash_h3_push_frame(
-    #state{h3_streams = Streams} = State, StreamId, Ref, Frame, Fin
-) ->
-    case maps:get(StreamId, Streams, undefined) of
-        #h3_stream{type = push, push = #h3_push_ctx{} = Ctx} = Stream ->
-            Stream1 = Stream#h3_stream{
-                push = Ctx#h3_push_ctx{
-                    send_buffer = iolist_to_binary(Frame),
-                    send_end_stream = Fin =:= fin,
-                    pending_ack = Ref
-                }
-            },
-            State#state{h3_streams = Streams#{StreamId => Stream1}};
-        _ ->
-            State
-    end.
 
 -spec validate_h3_stream_push(nhttp_lib:request(), nhttp_lib:status()) ->
     ok | ok_head | {reject, term()}.
