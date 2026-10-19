@@ -827,6 +827,7 @@ terminate(
         handler_state = HState
     } = State
 ) ->
+    ok = write_pending_out(State),
     ok = nhttp_stream_worker:reap(worker_pids(State)),
     emit_connection_stop(State, Reason),
     case erlang:function_exported(Handler, terminate, 2) of
@@ -854,3 +855,9 @@ worker_pids(#state{protocol_state = #h2_state{h2_workers = Workers}}) ->
     maps:keys(Workers);
 worker_pids(#state{}) ->
     [].
+
+-spec write_pending_out(#state{}) -> ok.
+write_pending_out(#state{protocol_state = #h2_state{out = [_ | _] = Out}} = State) ->
+    sock_send(State, Out);
+write_pending_out(#state{}) ->
+    ok.

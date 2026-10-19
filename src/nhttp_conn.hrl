@@ -63,6 +63,8 @@
     ws_decoder :: nhttp_ws:ws_decoder() | undefined,
     h1_ws :: undefined | #ws_state{},
     keep_alive = true :: boolean(),
+    out = [] :: iodata(),
+    out_bytes = 0 :: non_neg_integer(),
     body_timeout = ?DEFAULT_BODY_TIMEOUT :: timeout(),
     request_timeout = ?DEFAULT_REQUEST_TIMEOUT :: timeout(),
     body_deadline = infinity :: timeout(),
@@ -92,7 +94,9 @@
     conn_credit = eager :: h2_conn_credit(),
     credit_timer :: {reference(), integer()} | undefined,
     response_delay = 0 :: nhttp:h2_response_delay(),
-    stream_credit = eager :: h2_stream_credit()
+    stream_credit = eager :: h2_stream_credit(),
+    out = [] :: iodata(),
+    out_bytes = 0 :: non_neg_integer()
 }).
 
 -record(state, {
