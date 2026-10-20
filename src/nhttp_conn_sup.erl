@@ -31,18 +31,14 @@ Start a connection child.
 The `Args` list is appended to the child spec's args. For `nhttp_conn`
 it must be `[Name, Socket, Opts]`, for `nhttp_conn_h3` `[Name, Ctx, Opts]`.
 `Name` is the listener name (or `undefined`), carried only for diagnostics.
-On success the conn is registered with the listener's tracker so its
-counter slot is released when it exits.
+The conn is registered with the tracker, which releases its counter slot
+on `DOWN`. The start does not wait for the handler `init/1`.
 """.
--spec start_conn(pid(), pid(), [term()]) -> {ok, pid()} | {error, term()}.
+-spec start_conn(pid(), pid(), [term()]) -> {ok, pid()}.
 start_conn(ConnSupPid, TrackerPid, Args) ->
-    case supervisor:start_child(ConnSupPid, Args) of
-        {ok, Pid} ->
-            ok = nhttp_conn_tracker:track(TrackerPid, Pid),
-            {ok, Pid};
-        {error, _} = Error ->
-            Error
-    end.
+    {ok, Pid} = supervisor:start_child(ConnSupPid, Args),
+    ok = nhttp_conn_tracker:track(TrackerPid, Pid),
+    {ok, Pid}.
 
 -spec start_link(nhttp_registry:tab(), module()) -> {ok, pid()} | ignore | {error, term()}.
 start_link(Tab, ConnModule) ->

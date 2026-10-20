@@ -514,7 +514,7 @@ h2_stuck_producer_reaped(Config) ->
     end.
 
 h2_stuck_handler_reaped(Config) ->
-    {Pid, Port} = start_h2_server(Config, #{}),
+    {Pid, Port} = start_h2_server(Config, #{h2_dispatch => worker}),
     try
         {ok, Sock} = h2_connect(Port),
         h2_send_request(Sock, 1, <<"/block/forever">>),

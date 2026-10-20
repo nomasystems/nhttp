@@ -65,25 +65,18 @@ reject(Socket) ->
 -spec spawn_conn(nhttp_sock:t(), nhttp_acceptor_core:spawn_ctx()) -> ok.
 spawn_conn(Socket, #{
     name := Name,
-    counter := Counter,
     opts := Opts,
     conn := ConnCtx,
     conn_sup := ConnSup,
     tracker := Tracker
 }) ->
-    case nhttp_conn_sup:start_conn(ConnSup, Tracker, [Name, Socket, Opts, ConnCtx]) of
-        {ok, Pid} ->
-            case nhttp_sock:controlling_process(Socket, Pid) of
-                ok ->
-                    Pid ! {socket_ready, Socket},
-                    ok;
-                {error, _Reason} ->
-                    nhttp_conn:drain(Pid),
-                    nhttp_sock:close(Socket),
-                    ok
-            end;
+    {ok, Pid} = nhttp_conn_sup:start_conn(ConnSup, Tracker, [Name, Socket, Opts, ConnCtx]),
+    case nhttp_sock:controlling_process(Socket, Pid) of
+        ok ->
+            Pid ! {socket_ready, Socket},
+            ok;
         {error, _Reason} ->
-            nhttp_listener_counter:release(Counter),
+            nhttp_conn:drain(Pid),
             nhttp_sock:close(Socket),
             ok
     end.

@@ -85,6 +85,11 @@ ws_wake(Parent, Debug, State, Timer) ->
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - WEBSOCKET LOOP
 %%%-----------------------------------------------------------------------------
+-spec hibernate(pid(), [sys:debug_option()], #state{}, timeout()) -> no_return().
+hibernate(Parent, Debug, State, IdleRemaining) ->
+    Timer = nhttp_conn:start_hibernate_timer(IdleRemaining),
+    proc_lib:hibernate(?MODULE, ws_wake, [Parent, Debug, State, Timer]).
+
 -doc """
 Frame-wait block point. The receive waits the `hibernate` timeout, capped
 by the idle deadline. A session that is exchanging frames re-enters here
@@ -96,11 +101,6 @@ Incoming frames (including ping/pong) and async-API casts wake it.
 -spec loop(pid(), [sys:debug_option()], #state{}) -> no_return().
 loop(Parent, Debug, #state{idle_timeout = IdleTimeout} = State) ->
     ws_receive(Parent, Debug, State, nhttp_conn:idle_deadline(IdleTimeout)).
-
--spec hibernate(pid(), [sys:debug_option()], #state{}, timeout()) -> no_return().
-hibernate(Parent, Debug, State, IdleRemaining) ->
-    Timer = nhttp_conn:start_hibernate_timer(IdleRemaining),
-    proc_lib:hibernate(?MODULE, ws_wake, [Parent, Debug, State, Timer]).
 
 -spec quiescent(pid(), [sys:debug_option()], #state{}, nhttp_conn:deadline()) -> no_return().
 quiescent(Parent, Debug, State, IdleDeadline) ->

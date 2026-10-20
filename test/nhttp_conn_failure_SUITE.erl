@@ -95,9 +95,7 @@ end_per_testcase(_TestCase, _Config) ->
 conn_sys_lifecycle(_Config) ->
     Opts = #{handler => ?MODULE, handler_args => []},
     Ctx = #{ssl_opts => [], versions => [http1_1, http2], alt_svc_advertise => disabled},
-    {ok, ConnPid} = proc_lib:start_link(
-        nhttp_conn, init, [{my_ref, {tcp, fake_socket}, Opts, Ctx, self()}]
-    ),
+    {ok, ConnPid} = nhttp_conn:start_link_supervised(my_ref, {tcp, fake_socket}, Opts, Ctx),
     ?assertMatch({status, ConnPid, _, _}, sys:get_status(ConnPid)),
     ok = sys:suspend(ConnPid),
     ok = sys:change_code(ConnPid, nhttp_conn, undefined, []),
@@ -358,9 +356,7 @@ run_close_before_init(Versions) ->
     ok = gen_tcp:close(LSock),
     Opts = #{handler => ?MODULE, handler_args => []},
     Ctx = #{ssl_opts => [], versions => Versions, alt_svc_advertise => disabled},
-    {ok, ConnPid} = proc_lib:start_link(
-        nhttp_conn, init, [{my_ref, {tcp, SSock}, Opts, Ctx, self()}]
-    ),
+    {ok, ConnPid} = nhttp_conn:start_link_supervised(my_ref, {tcp, SSock}, Opts, Ctx),
     Ref = monitor(process, ConnPid),
     ConnPid ! {socket_ready, {tcp, SSock}},
     receive

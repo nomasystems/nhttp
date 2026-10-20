@@ -11,6 +11,7 @@
     h1_push_idle_timeout/2,
     h1_push_worker_stuck/2,
     handler_crashed/4,
+    handler_init_failed/2,
     request_ctx/3,
     request_id/0,
     response_encode_failed/2,
@@ -97,6 +98,11 @@ handler_crashed(Ctx, Callback, Class, Reason) ->
         class => Class,
         crash_reason => Reason
     }).
+
+-doc "A handler `init/1` returned `{error, Reason}`.".
+-spec handler_init_failed(ctx(), term()) -> ok.
+handler_init_failed(Ctx, Reason) ->
+    logger:error(Ctx#{event => handler_init_failed, reason => Reason}).
 
 -doc """
 Enrich a connection ctx with per-request fields for log correlation.

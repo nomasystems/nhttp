@@ -19,11 +19,15 @@
 %%% TEST CASES
 %%%-----------------------------------------------------------------------------
 -export([
+    accept_does_not_wait_for_conn_init/1,
+    accept_does_not_wait_for_tracker/1,
     conn_crash_does_not_kill_acceptor/1,
     conn_crash_releases_counter_slot/1,
     drain_completes_in_flight_and_rejects_new/1,
+    handler_init_failure_exits_shutdown/1,
     handler_init_failure_releases_slot/1,
-    track_is_synchronous_when_tracker_down/1,
+    track_during_drain_gets_shutdown/1,
+    track_of_dead_pid_releases_slot/1,
     wait_for_socket_runs_handler_terminate/1
 ]).
 
@@ -40,6 +44,12 @@
 
 init({notify, Pid}) ->
     {ok, {notify, Pid}};
+init({block_init, Pid}) ->
+    Pid ! {init_blocked, self()},
+    receive
+        release_init -> {ok, undefined}
+    after 5000 -> {error, init_not_released}
+    end;
 init(_) ->
     {ok, undefined}.
 
@@ -58,11 +68,15 @@ terminate(_Reason, _State) ->
 
 all() ->
     [
+        accept_does_not_wait_for_conn_init,
+        accept_does_not_wait_for_tracker,
         conn_crash_does_not_kill_acceptor,
         conn_crash_releases_counter_slot,
         drain_completes_in_flight_and_rejects_new,
+        handler_init_failure_exits_shutdown,
         handler_init_failure_releases_slot,
-        track_is_synchronous_when_tracker_down,
+        track_during_drain_gets_shutdown,
+        track_of_dead_pid_releases_slot,
         wait_for_socket_runs_handler_terminate
     ].
 
@@ -85,6 +99,53 @@ end_per_testcase(_TestCase, _Config) ->
 %%%-----------------------------------------------------------------------------
 %%% TEST CASES
 %%%-----------------------------------------------------------------------------
+
+accept_does_not_wait_for_conn_init(_Config) ->
+    {ok, ListenerPid} = nhttp:start_link(#{
+        port => 0,
+        handler => ?MODULE,
+        handler_args => {block_init, self()},
+        versions => [http1_1],
+        acceptor_count => 1
+    }),
+    put(listener_pid, ListenerPid),
+    {ok, Port} = nhttp:get_port(ListenerPid),
+    Socks = [nhttp_test_helpers:tcp_connect(Port) || _ <- [1, 2]],
+    Blocked = [
+        receive
+            {init_blocked, ConnPid} -> ConnPid
+        after 2000 -> ct:fail(init_not_started)
+        end
+     || _ <- Socks
+    ],
+    lists:foreach(fun(ConnPid) -> ConnPid ! release_init end, Blocked),
+    lists:foreach(fun(Sock) -> ok = gen_tcp:close(Sock) end, Socks),
+    ok.
+
+accept_does_not_wait_for_tracker(_Config) ->
+    {ok, ListenerPid} = nhttp:start_link(#{
+        port => 0,
+        handler => ?MODULE,
+        handler_args => {block_init, self()},
+        versions => [http1_1],
+        acceptor_count => 1
+    }),
+    put(listener_pid, ListenerPid),
+    {ok, Port} = nhttp:get_port(ListenerPid),
+    Tracker = tracker_of(ListenerPid),
+    ok = sys:suspend(Tracker),
+    Socks = [nhttp_test_helpers:tcp_connect(Port) || _ <- [1, 2]],
+    Blocked = [
+        receive
+            {init_blocked, ConnPid} -> ConnPid
+        after 2000 -> ct:fail(accept_waited_for_tracker)
+        end
+     || _ <- Socks
+    ],
+    ok = sys:resume(Tracker),
+    lists:foreach(fun(ConnPid) -> ConnPid ! release_init end, Blocked),
+    lists:foreach(fun(Sock) -> ok = gen_tcp:close(Sock) end, Socks),
+    ok.
 
 conn_crash_does_not_kill_acceptor(_Config) ->
     {ok, ListenerPid} = nhttp:start_link(#{
@@ -177,6 +238,17 @@ drain_completes_in_flight_and_rejects_new(_Config) ->
     lists:foreach(fun(S) -> gen_tcp:close(S) end, Socks),
     ok.
 
+handler_init_failure_exits_shutdown(_Config) ->
+    Opts = #{handler => nhttp_supervision_failing_handler, handler_args => []},
+    Ctx = #{ssl_opts => [], versions => [http1_1], alt_svc_advertise => disabled},
+    {ok, ConnPid} = nhttp_conn:start_link_supervised(my_ref, {tcp, fake_socket}, Opts, Ctx),
+    receive
+        {'EXIT', ConnPid, Reason} ->
+            ?assertEqual({shutdown, {handler_init, intentional_failure}}, Reason)
+    after 2000 -> ct:fail(conn_did_not_exit)
+    end,
+    ok.
+
 handler_init_failure_releases_slot(_Config) ->
     {ok, ListenerPid} = nhttp:start_link(#{
         port => 0,
@@ -193,7 +265,8 @@ handler_init_failure_releases_slot(_Config) ->
             spawn(fun() ->
                 case gen_tcp:connect("127.0.0.1", Port, [binary, {active, false}], 1000) of
                     {ok, S} ->
-                        gen_tcp:send(S, get_request()),
+                        ok = gen_tcp:send(S, get_request()),
+                        ok = expect_closed_or_503(gen_tcp:recv(S, 0, 2000)),
                         gen_tcp:close(S);
                     _ ->
                         ok
@@ -213,30 +286,43 @@ handler_init_failure_releases_slot(_Config) ->
     ok = wait_for_conn_count_zero(ListenerPid, 2000),
     ok.
 
-track_is_synchronous_when_tracker_down(_Config) ->
-    DeadTracker = spawn(fun() -> ok end),
-    MRef = erlang:monitor(process, DeadTracker),
-    receive
-        {'DOWN', MRef, process, DeadTracker, _} -> ok
-    after 1000 ->
-        ct:fail(dead_tracker_didnt_die)
-    end,
-    DummyPid = spawn(fun() ->
+track_during_drain_gets_shutdown(_Config) ->
+    Tracker = start_tracker(infinity),
+    ok = nhttp_conn_tracker:drain_all(Tracker),
+    Self = self(),
+    Conn = spawn(fun() ->
         receive
-            stop -> ok
+            shutdown -> Self ! {got_shutdown, self()}
         end
     end),
-    ?assertExit({noproc, _}, nhttp_conn_tracker:track(DeadTracker, DummyPid)),
-    DummyPid ! stop,
+    ok = nhttp_conn_tracker:track(Tracker, Conn),
+    receive
+        {got_shutdown, Conn} -> ok
+    after 2000 -> ct:fail(late_track_not_drained)
+    end,
+    ?assertEqual(ok, nhttp_conn_tracker:wait_for_drained(Tracker, 2000)),
+    ok = gen_server:stop(Tracker),
+    ok.
+
+track_of_dead_pid_releases_slot(_Config) ->
+    Tracker = start_tracker(1),
+    Counter = get(counter),
+    ok = nhttp_listener_counter:acquire(Counter),
+    Dead = spawn(fun() -> ok end),
+    {ok, _} = nhttp_test_helpers:wait_until_down(Dead),
+    ok = nhttp_conn_tracker:track(Tracker, Dead),
+    ok = nhttp_test_helpers:wait_until(
+        fun() -> nhttp_listener_counter:count(Counter) =:= 0 end, 2000
+    ),
+    ok = gen_server:stop(Tracker),
     ok.
 
 wait_for_socket_runs_handler_terminate(_Config) ->
     Self = self(),
     Opts = #{handler => ?MODULE, handler_args => {notify, Self}},
     Ctx = #{ssl_opts => [], versions => [http1_1, http2], alt_svc_advertise => disabled},
-    {ok, ConnPid} = proc_lib:start_link(
-        nhttp_conn, init, [{my_ref, {tcp, fake_socket}, Opts, Ctx, Self}]
-    ),
+    {ok, ConnPid} = nhttp_conn:start_link_supervised(my_ref, {tcp, fake_socket}, Opts, Ctx),
+    {status, ConnPid, _, _} = sys:get_status(ConnPid),
     ConnMon = monitor(process, ConnPid),
     exit(ConnPid, shutdown),
     receive
@@ -258,6 +344,9 @@ wait_for_socket_runs_handler_terminate(_Config) ->
 get_request() ->
     <<"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n">>.
 
+expect_closed_or_503({error, closed}) -> ok;
+expect_closed_or_503({ok, <<"HTTP/1.1 503 ", _/binary>>}) -> ok.
+
 open_idle_conn(Port) ->
     {ok, Sock} = gen_tcp:connect("127.0.0.1", Port, [binary, {active, false}]),
     ok = gen_tcp:send(Sock, <<"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n">>),
@@ -266,6 +355,20 @@ open_idle_conn(Port) ->
 
 conn_pids(ListenerPid) ->
     nhttp_test_helpers:conn_pids(ListenerPid).
+
+tracker_of(ListenerPid) ->
+    [TransportSup] = nhttp_test_helpers:transport_sups(ListenerPid),
+    {nhttp_conn_tracker, Tracker, _, _} =
+        lists:keyfind(nhttp_conn_tracker, 1, supervisor:which_children(TransportSup)),
+    Tracker.
+
+start_tracker(MaxConnections) ->
+    Tab = nhttp_registry:new(),
+    Counter = nhttp_listener_counter:new(MaxConnections),
+    ok = nhttp_registry:register_counter(Tab, Counter),
+    put(counter, Counter),
+    {ok, Tracker} = nhttp_conn_tracker:start_link(Tab, undefined),
+    Tracker.
 
 wait_for_conn_count(ListenerPid, N, Timeout) ->
     ok = nhttp_test_helpers:wait_until(

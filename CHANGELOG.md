@@ -9,10 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `h2_dispatch => inline | worker`: where `handle_request/2` runs on HTTP/2. Default `inline`
 - `timeouts => #{hibernate => timeout()}`: the quiet time after which a connection with nothing in flight hibernates. Default 1000 ms. `0` hibernates on every quiet moment, `infinity` never
 
 ### Changed
 
+- HTTP/2 runs `handle_request/2` in the connection process, in stream order, as HTTP/1.1 and HTTP/3 do. `h2_dispatch => worker` keeps one worker per stream
+- The acceptor does not wait for the connection process to start. A handler `init/1` that returns `{error, Reason}` logs `handler_init_failed` and ends the connection with `{shutdown, {handler_init, Reason}}`
 - A connection hibernates after the `hibernate` timeout of quiet, not after every request or WebSocket frame. The idle timeout still fires on time: the quiet wait consumes part of the idle budget and the hibernation timer gets the rest
 - Requires `nhttp_lib` 2.0.0
 - WebSocket frames on HTTP/1.1, HTTP/2 and HTTP/3 are decoded with `nhttp_ws:feed/2`. The decoder keeps the partial frame, so the server holds no WebSocket buffer of its own
@@ -21,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Under load, new connections waited seconds in the accept queue behind the handler `init/1` and the tracker call of the previous connection
 - HTTP/3: a WebSocket frame or push chunk that QUIC flow control refuses waits per stream and leaves in order on `stream_writable`. A Close+FIN waits in the same queue. Before, it was dropped and the send returned `ok`
 - A WebSocket handler reply that holds a CLOSE ends the session, and the frames after it are not sent. A reply or close with a reserved close code, a reason over 123 bytes or a control payload over 125 bytes closes the session with 1011
 - HTTP/1.1: `nhttp_ws:send/2` on a closed socket returns `{error, gone}`, not `{error, closed}`

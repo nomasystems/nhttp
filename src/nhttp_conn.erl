@@ -108,15 +108,12 @@ drain(Pid) ->
     ok.
 
 -doc """
-Start a connection under `nhttp_conn_sup`.
-Uses `proc_lib:start_link/3` semantics: the caller (the conn supervisor)
-blocks until init_ack is received, so `supervisor:start_child/2` correctly
-reports init failures.
+Start a connection under `nhttp_conn_sup` without waiting for `init/1`.
+A failed handler `init/1` ends the process with `{shutdown, _}`.
 """.
--spec start_link_supervised(term(), nhttp_sock:t(), nhttp:opts(), ctx()) ->
-    {ok, pid()} | {error, term()}.
+-spec start_link_supervised(term(), nhttp_sock:t(), nhttp:opts(), ctx()) -> {ok, pid()}.
 start_link_supervised(Name, Socket, Opts, Ctx) ->
-    proc_lib:start_link(?MODULE, init, [{Name, Socket, Opts, Ctx, self()}]).
+    {ok, proc_lib:spawn_link(?MODULE, init, [{Name, Socket, Opts, Ctx, self()}])}.
 
 %%%-----------------------------------------------------------------------------
 %% PROC_LIB CALLBACKS
@@ -138,7 +135,6 @@ init({Name, Socket, Opts, Ctx, Parent}) ->
     CompressMimeTypes = maps:get(compress_mime_types, Opts, nhttp_compress:default_mime_types()),
     case nhttp_handler:safe_init(Handler, HandlerArgs) of
         {ok, HandlerState} ->
-            proc_lib:init_ack(Parent, {ok, self()}),
             ok = nhttp_stats:incr_connection(),
             Debug = sys:debug_options([]),
             State = #state{
@@ -161,11 +157,13 @@ init({Name, Socket, Opts, Ctx, Parent}) ->
             },
             wait_for_socket(Parent, Debug, State);
         {error, Reason} ->
-            proc_lib:init_ack(Parent, {error, {handler_init, Reason}});
+            InitCtx = #{listener_name => Name, transport => Transport, handler => Handler},
+            nhttp_log:handler_init_failed(InitCtx, Reason),
+            exit({shutdown, {handler_init, Reason}});
         {nhttp_handler_exception, Class, Reason} ->
             InitCtx = #{listener_name => Name, transport => Transport, handler => Handler},
             nhttp_log:handler_crashed(InitCtx, init, Class, Reason),
-            proc_lib:init_ack(Parent, {error, {handler_init_exception, Class, Reason}})
+            exit({shutdown, {handler_init_exception, Class, Reason}})
     end.
 
 -doc """
@@ -231,6 +229,12 @@ quic_advertise_ready(Tab) ->
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - COMPRESSION
 %%%-----------------------------------------------------------------------------
+-spec build_log_ctx(#state{}) -> nhttp_log:ctx().
+build_log_ctx(#state{
+    name = Name, transport = Transport, family = Family, peer = Peer, handler = Handler
+}) ->
+    nhttp_log:conn_ctx(Name, Transport, family_to_version(Family), Peer, Handler).
+
 -spec compress_config(#state{}) -> nhttp_conn_compress:config().
 compress_config(#state{
     compression_enabled = Enabled,
@@ -239,12 +243,6 @@ compress_config(#state{
     compress_mime_types = MimeTypes
 }) ->
     nhttp_conn_compress:config(Enabled, Level, Threshold, MimeTypes).
-
--spec build_log_ctx(#state{}) -> nhttp_log:ctx().
-build_log_ctx(#state{
-    name = Name, transport = Transport, family = Family, peer = Peer, handler = Handler
-}) ->
-    nhttp_log:conn_ctx(Name, Transport, family_to_version(Family), Peer, Handler).
 
 -doc """
 The structured-logging context map consumed by `nhttp_log`. After
@@ -337,29 +335,6 @@ cancel_hibernate_timer({TimerRef, Ref}) ->
             ok
     end.
 
--doc """
-Whether the process mailbox is empty. Protocol loops hibernate only on
-an empty mailbox: with a message already queued the wake-up would be
-immediate and the full-sweep GC pure overhead.
-""".
--spec mailbox_empty() -> boolean().
-mailbox_empty() ->
-    {message_queue_len, Len} = erlang:process_info(self(), message_queue_len),
-    Len =:= 0.
-
--doc """
-Arm the idle timer that bounds a hibernation wait. `receive ... after`
-deadlines do not survive `proc_lib:hibernate/3`, so the idle timeout is
-carried by a timer message instead; any message (including this one)
-wakes the process, which must then call `cancel_hibernate_timer/1`.
-""".
--spec start_hibernate_timer(timeout()) -> hibernate_timer().
-start_hibernate_timer(infinity) ->
-    none;
-start_hibernate_timer(IdleTimeout) ->
-    Ref = make_ref(),
-    {erlang:send_after(IdleTimeout, self(), {conn_hibernate_timeout, Ref}), Ref}.
-
 -doc "Milliseconds left to `Deadline`, `0` once it passed.".
 -spec deadline_remaining(deadline()) -> timeout().
 deadline_remaining(infinity) ->
@@ -381,6 +356,16 @@ idle_deadline(IdleTimeout) when is_integer(IdleTimeout) ->
     erlang:monotonic_time(millisecond) + IdleTimeout.
 
 -doc """
+Whether the process mailbox is empty. Protocol loops hibernate only on
+an empty mailbox: with a message already queued the wake-up would be
+immediate and the full-sweep GC pure overhead.
+""".
+-spec mailbox_empty() -> boolean().
+mailbox_empty() ->
+    {message_queue_len, Len} = erlang:process_info(self(), message_queue_len),
+    Len =:= 0.
+
+-doc """
 Receive wait of a protocol loop with nothing in flight: the `hibernate`
 timeout, capped by the time left to the idle deadline. When it elapses
 the loop hibernates for the rest of the idle budget, or stops on idle
@@ -389,6 +374,19 @@ timeout when none is left.
 -spec quiescence_wait(timeout(), deadline()) -> timeout().
 quiescence_wait(HibernateAfter, IdleDeadline) ->
     min(HibernateAfter, deadline_remaining(IdleDeadline)).
+
+-doc """
+Arm the idle timer that bounds a hibernation wait. `receive ... after`
+deadlines do not survive `proc_lib:hibernate/3`, so the idle timeout is
+carried by a timer message instead; any message (including this one)
+wakes the process, which must then call `cancel_hibernate_timer/1`.
+""".
+-spec start_hibernate_timer(timeout()) -> hibernate_timer().
+start_hibernate_timer(infinity) ->
+    none;
+start_hibernate_timer(IdleTimeout) ->
+    Ref = make_ref(),
+    {erlang:send_after(IdleTimeout, self(), {conn_hibernate_timeout, Ref}), Ref}.
 
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - HANDLER SAFETY
@@ -472,19 +470,6 @@ detect_protocol(Socket, Versions) ->
     AllowedFamilies = [version_to_family(V) || V <- Versions],
     select_family(nhttp_sock:negotiated_protocol(Socket), AllowedFamilies).
 
--spec select_family({ok, binary()} | {error, no_alpn}, [http1 | http2 | http3]) ->
-    {ok, http1 | http2} | {error, {unsupported_alpn, binary()}}.
-select_family({ok, <<"h2">> = Protocol}, AllowedFamilies) ->
-    family_if_allowed(http2, Protocol, AllowedFamilies);
-select_family({ok, <<"http/1.1">> = Protocol}, AllowedFamilies) ->
-    family_if_allowed(http1, Protocol, AllowedFamilies);
-select_family({ok, Protocol}, _AllowedFamilies) ->
-    {error, {unsupported_alpn, Protocol}};
-select_family({error, no_alpn}, [http2 | _]) ->
-    {ok, http2};
-select_family({error, no_alpn}, _AllowedFamilies) ->
-    {ok, http1}.
-
 -spec family_if_allowed(http1 | http2, binary(), [http1 | http2 | http3]) ->
     {ok, http1 | http2} | {error, {unsupported_alpn, binary()}}.
 family_if_allowed(Family, Protocol, AllowedFamilies) ->
@@ -549,7 +534,8 @@ init_protocol(#state{family = http2, socket = Socket, peer = Peer, opts = Opts} 
                     maps:get(h2_credit_batch, Opts, 0)
                 ),
                 response_delay = maps:get(h2_response_delay, Opts, 0),
-                stream_credit = h2_stream_credit(maps:get(h2_stream_window_policy, Opts, eager))
+                stream_credit = h2_stream_credit(maps:get(h2_stream_window_policy, Opts, eager)),
+                dispatch = maps:get(h2_dispatch, Opts, inline)
             }
         }}
     end;
@@ -570,6 +556,19 @@ put_h2_max_frame_size(#{h2_max_frame_size := Size}, Settings) ->
     Settings#{max_frame_size => Size};
 put_h2_max_frame_size(#{}, Settings) ->
     Settings.
+
+-spec select_family({ok, binary()} | {error, no_alpn}, [http1 | http2 | http3]) ->
+    {ok, http1 | http2} | {error, {unsupported_alpn, binary()}}.
+select_family({ok, <<"h2">> = Protocol}, AllowedFamilies) ->
+    family_if_allowed(http2, Protocol, AllowedFamilies);
+select_family({ok, <<"http/1.1">> = Protocol}, AllowedFamilies) ->
+    family_if_allowed(http1, Protocol, AllowedFamilies);
+select_family({ok, Protocol}, _AllowedFamilies) ->
+    {error, {unsupported_alpn, Protocol}};
+select_family({error, no_alpn}, [http2 | _]) ->
+    {ok, http2};
+select_family({error, no_alpn}, _AllowedFamilies) ->
+    {ok, http1}.
 
 -spec version_to_family(nhttp_lib:version()) -> http1 | http2 | http3.
 version_to_family(http1_0) -> http1;
