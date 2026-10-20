@@ -26,6 +26,7 @@ process, in stream order, and every result shape works there. With
 %%%-----------------------------------------------------------------------------
 -export([
     accept_body_on_empty_body/1,
+    conn_spawn_opts_apply_to_workers/1,
     handler_crash_sends_500_and_conn_survives/1,
     handler_state_is_sequential/1,
     invalid_dispatch_option_rejected/1,
@@ -67,6 +68,15 @@ handle_request(#{path := <<"/accept">>}, State) ->
     {accept_body, [], State};
 handle_request(#{path := <<"/echo">>}, State) ->
     {accept_body, [], State};
+handle_request(#{path := <<"/gc_body">>}, #{test := TestPid} = State) ->
+    TestPid ! {fullsweep_after, request_worker, fullsweep_after()},
+    {accept_body, [], State};
+handle_request(#{path := <<"/gc_stream">>}, #{test := TestPid} = State) ->
+    Producer = fun(Send) ->
+        TestPid ! {fullsweep_after, producer, fullsweep_after()},
+        Send(<<"a">>)
+    end,
+    {stream, {producer, 200, [], Producer}, State};
 handle_request(#{path := <<"/crash">>}, _State) ->
     error(boom).
 
@@ -87,7 +97,8 @@ all() ->
         post_body_runs_through_worker,
         handler_crash_sends_500_and_conn_survives,
         invalid_dispatch_option_rejected,
-        worker_option_runs_outside_connection_process
+        worker_option_runs_outside_connection_process,
+        conn_spawn_opts_apply_to_workers
     ].
 
 init_per_testcase(invalid_dispatch_option_rejected, Config) ->
@@ -95,6 +106,12 @@ init_per_testcase(invalid_dispatch_option_rejected, Config) ->
 init_per_testcase(worker_option_runs_outside_connection_process, Config) ->
     {Pid, Port} = nhttp_test_helpers:h2_start_server(?MODULE, #{
         handler_args => self(), h2_dispatch => worker
+    }),
+    {ok, Sock} = nhttp_test_helpers:h2_connect(Port),
+    [{server, Pid}, {sock, Sock} | Config];
+init_per_testcase(conn_spawn_opts_apply_to_workers, Config) ->
+    {Pid, Port} = nhttp_test_helpers:h2_start_server(?MODULE, #{
+        handler_args => self(), conn_spawn_opts => [{fullsweep_after, 7}]
     }),
     {ok, Sock} = nhttp_test_helpers:h2_connect(Port),
     [{server, Pid}, {sock, Sock} | Config];
@@ -182,6 +199,18 @@ worker_option_runs_outside_connection_process(Config) ->
     end,
     ok.
 
+conn_spawn_opts_apply_to_workers(Config) ->
+    Sock = ?config(sock, Config),
+    ok = nhttp_test_helpers:h2_send_post(Sock, 1, <<"/gc_body">>, <<"hello">>),
+    Frames1 = nhttp_test_helpers:h2_recv_stream(Sock, 1, ?RECV_TIMEOUT),
+    ?assertEqual(<<"FIN:hello">>, nhttp_test_helpers:h2_response_body(Frames1, 1)),
+    ok = nhttp_test_helpers:h2_send_request(Sock, 3, <<"/gc_stream">>),
+    Frames3 = nhttp_test_helpers:h2_recv_stream(Sock, 3, ?RECV_TIMEOUT),
+    ?assertEqual(<<"a">>, nhttp_test_helpers:h2_response_body(Frames3, 3)),
+    ?assertEqual(7, receive_fullsweep_after(request_worker)),
+    ?assertEqual(7, receive_fullsweep_after(producer)),
+    ok.
+
 invalid_dispatch_option_rejected(_Config) ->
     {CertFile, KeyFile} = nhttp_test_helpers:certs(),
     ?assertMatch(
@@ -196,3 +225,16 @@ invalid_dispatch_option_rejected(_Config) ->
         })
     ),
     ok.
+
+%%%-----------------------------------------------------------------------------
+%%% HELPERS
+%%%-----------------------------------------------------------------------------
+fullsweep_after() ->
+    {garbage_collection, GC} = process_info(self(), garbage_collection),
+    proplists:get_value(fullsweep_after, GC).
+
+receive_fullsweep_after(Kind) ->
+    receive
+        {fullsweep_after, Kind, N} -> N
+    after ?RECV_TIMEOUT -> ct:fail({no_fullsweep_after, Kind})
+    end.

@@ -57,6 +57,7 @@
     select_family/2,
     sock_send/2,
     sock_stop_reason/1,
+    spawn_opts/1,
     start_hibernate_timer/1,
     stop/2,
     stop_parent/2,
@@ -113,7 +114,13 @@ A failed handler `init/1` ends the process with `{shutdown, _}`.
 """.
 -spec start_link_supervised(term(), nhttp_sock:t(), nhttp:opts(), ctx()) -> {ok, pid()}.
 start_link_supervised(Name, Socket, Opts, Ctx) ->
-    {ok, proc_lib:spawn_link(?MODULE, init, [{Name, Socket, Opts, Ctx, self()}])}.
+    Args = [{Name, Socket, Opts, Ctx, self()}],
+    {ok, proc_lib:spawn_opt(?MODULE, init, Args, [link | spawn_opts(Opts)])}.
+
+-doc "The spawn options of the processes that run handler code.".
+-spec spawn_opts(nhttp:opts()) -> [nhttp:conn_spawn_opt()].
+spawn_opts(Opts) ->
+    maps:get(conn_spawn_opts, Opts, ?DEFAULT_CONN_SPAWN_OPTS).
 
 %%%-----------------------------------------------------------------------------
 %% PROC_LIB CALLBACKS

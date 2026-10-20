@@ -228,9 +228,9 @@ release_h1_worker(#h1_push_ctx{worker = WPid, ref = Ref, mref = MRef}) ->
     term(),
     {nhttp_otel:span_ctx(), integer()}
 ) -> {stream_push, #state{}, h1_push_ctx()}.
-start_h1_stream_push(State, Status, Producer, NewHState, ReqSpan) ->
+start_h1_stream_push(#state{opts = Opts} = State, Status, Producer, NewHState, ReqSpan) ->
     Ref = make_ref(),
-    WorkerPid = nhttp_stream_worker:start(self(), Ref, Producer),
+    WorkerPid = nhttp_stream_worker:start(self(), Ref, Producer, nhttp_conn:spawn_opts(Opts)),
     MRef = erlang:monitor(process, WorkerPid),
     Ctx = #h1_push_ctx{
         worker = WorkerPid,

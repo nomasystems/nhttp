@@ -27,6 +27,7 @@
 -export([
     acceptor_sys_lifecycle/1,
     acceptor_sys_terminate/1,
+    listener_conn_spawn_opts_invalid/1,
     listener_h2_alias_conflicts_with_settings/1,
     listener_h2_alias_out_of_range/1,
     listener_h2_credit_batch_invalid/1,
@@ -46,6 +47,7 @@ all() ->
     [
         acceptor_sys_lifecycle,
         acceptor_sys_terminate,
+        listener_conn_spawn_opts_invalid,
         listener_h2_alias_conflicts_with_settings,
         listener_h2_alias_out_of_range,
         listener_h2_credit_batch_invalid,
@@ -83,6 +85,40 @@ handle_request(_Request, State) ->
 %%%-----------------------------------------------------------------------------
 %%% TEST CASES
 %%%-----------------------------------------------------------------------------
+
+listener_conn_spawn_opts_invalid(_Config) ->
+    Base = #{port => 0, handler => ?MODULE, versions => [http1_1]},
+    Invalid = [
+        not_a_list,
+        [link],
+        [monitor],
+        [{monitor, []}],
+        [{fullsweep_after, -1}],
+        [{min_heap_size, big}],
+        [bogus],
+        [{fullsweep_after, 0} | improper]
+    ],
+    Valid = [
+        [],
+        [{fullsweep_after, 0}],
+        [{min_heap_size, 233}, {min_bin_vheap_size, 46422}, {message_queue_data, off_heap}]
+    ],
+    lists:foreach(
+        fun(SpawnOpts) ->
+            assert_error_contains(
+                "invalid_conn_spawn_opts", nhttp:start_link(Base#{conn_spawn_opts => SpawnOpts})
+            )
+        end,
+        Invalid
+    ),
+    lists:foreach(
+        fun(SpawnOpts) ->
+            {ok, Pid} = nhttp:start_link(Base#{conn_spawn_opts => SpawnOpts}),
+            nhttp:stop(Pid)
+        end,
+        Valid
+    ),
+    ok.
 
 listener_h2_alias_conflicts_with_settings(_Config) ->
     assert_error_contains(

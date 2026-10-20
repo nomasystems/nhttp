@@ -36,6 +36,10 @@ handle_request(#{path := <<"/crash-exit">>}, _State) ->
     exit(intentional_handler_exit);
 handle_request(#{path := <<"/crash-throw">>}, _State) ->
     throw(intentional_handler_throw);
+handle_request(#{path := <<"/fullsweep-after">>}, State) ->
+    {garbage_collection, GC} = process_info(self(), garbage_collection),
+    Body = integer_to_binary(proplists:get_value(fullsweep_after, GC)),
+    {reply, nhttp_resp:ok(Body), State};
 handle_request(#{path := <<"/empty">>}, State) ->
     {reply, #{status => 200, headers => [], body => <<>>}, State};
 handle_request(#{path := <<"/large">>}, State) ->

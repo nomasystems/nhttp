@@ -29,6 +29,7 @@
 %%%-----------------------------------------------------------------------------
 -export([
     h3_basic_get/1,
+    h3_conn_spawn_opts/1,
     h3_post_with_body/1,
     h3_handler_error/1,
     h3_handler_crash_isolates_stream/1,
@@ -94,6 +95,7 @@ groups() ->
     [
         {h3_requests, [sequence], [
             h3_basic_get,
+            h3_conn_spawn_opts,
             h3_post_with_body,
             h3_handler_error,
             h3_handler_crash_isolates_stream,
@@ -210,6 +212,15 @@ h3_basic_get(Config) ->
     {ok, 200, _Headers, Body, _H3_1} = h3_request(QConn, H3, <<"GET">>, <<"/hello">>, <<>>),
     ?assertEqual(<<"Hello!">>, Body),
 
+    close_h3(QConn),
+    ok.
+
+h3_conn_spawn_opts(Config) ->
+    {_, _, Port} = start_h3_server(Config, #{conn_spawn_opts => [{fullsweep_after, 7}]}),
+    {QConn, H3} = connect_h3(Port),
+    {ok, 200, _Headers, Body, _H3_1} =
+        h3_request(QConn, H3, <<"GET">>, <<"/fullsweep-after">>, <<>>),
+    ?assertEqual(<<"7">>, Body),
     close_h3(QConn),
     ok.
 

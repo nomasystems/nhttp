@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `conn_spawn_opts => [nhttp:conn_spawn_opt()]`: spawn options for the connection processes of HTTP/1.1, HTTP/2 and HTTP/3 and for the stream workers, for example `{fullsweep_after, 0}` or `{min_heap_size, Words}`. The listener rejects `link`, `monitor` and a value that `erlang:spawn_opt/4` does not accept. Default `[]`
+
 ## [1.3.0] - 2026-10-19
 
 ### Added

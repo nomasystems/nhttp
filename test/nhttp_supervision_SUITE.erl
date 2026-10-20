@@ -23,6 +23,9 @@
     accept_does_not_wait_for_tracker/1,
     conn_crash_does_not_kill_acceptor/1,
     conn_crash_releases_counter_slot/1,
+    conn_default_spawn_keeps_system_gc/1,
+    conn_start_failure_releases_slot/1,
+    conn_spawn_opts_apply_to_conn/1,
     drain_completes_in_flight_and_rejects_new/1,
     handler_init_failure_exits_shutdown/1,
     handler_init_failure_releases_slot/1,
@@ -41,6 +44,8 @@
     init/1,
     terminate/2
 ]).
+
+-export([start_link_supervised/4]).
 
 init({notify, Pid}) ->
     {ok, {notify, Pid}};
@@ -62,6 +67,9 @@ terminate(_Reason, {notify, Pid}) ->
 terminate(_Reason, _State) ->
     ok.
 
+start_link_supervised(_Name, _Socket, _Opts, _Ctx) ->
+    {error, start_refused}.
+
 %%%-----------------------------------------------------------------------------
 %%% SUITE CALLBACKS
 %%%-----------------------------------------------------------------------------
@@ -72,6 +80,9 @@ all() ->
         accept_does_not_wait_for_tracker,
         conn_crash_does_not_kill_acceptor,
         conn_crash_releases_counter_slot,
+        conn_default_spawn_keeps_system_gc,
+        conn_start_failure_releases_slot,
+        conn_spawn_opts_apply_to_conn,
         drain_completes_in_flight_and_rejects_new,
         handler_init_failure_exits_shutdown,
         handler_init_failure_releases_slot,
@@ -204,6 +215,69 @@ conn_crash_releases_counter_slot(_Config) ->
     {ok, _} = gen_tcp:recv(Sock2, 0, 5000),
     gen_tcp:close(Sock2),
     lists:foreach(fun(S) -> gen_tcp:close(S) end, Socks),
+    ok.
+
+conn_start_failure_releases_slot(_Config) ->
+    Tab = nhttp_registry:new(),
+    {ok, ConnSup} = nhttp_conn_sup:start_link(Tab, ?MODULE),
+    Tracker = start_tracker(1),
+    Counter = get(counter),
+    {ok, LSock} = gen_tcp:listen(0, [binary, {active, false}]),
+    {ok, Port} = inet:port(LSock),
+    {ok, Client} = gen_tcp:connect("127.0.0.1", Port, [binary, {active, false}]),
+    {ok, Server} = gen_tcp:accept(LSock, 1000),
+    ok = nhttp_listener_counter:acquire(Counter),
+    Ctx = #{
+        name => my_ref,
+        counter => Counter,
+        opts => #{handler => ?MODULE},
+        conn => #{ssl_opts => [], versions => [http1_1], alt_svc_advertise => disabled},
+        conn_sup => ConnSup,
+        tracker => Tracker
+    },
+    ?assertEqual(ok, nhttp_acceptor:spawn_conn({tcp, Server}, Ctx)),
+    ?assertEqual(0, nhttp_listener_counter:count(Counter)),
+    ?assertEqual({error, closed}, gen_tcp:recv(Client, 0, 1000)),
+    ok = gen_tcp:close(Client),
+    ok = gen_tcp:close(LSock),
+    ok = gen_server:stop(Tracker),
+    ok.
+
+conn_default_spawn_keeps_system_gc(_Config) ->
+    {ok, ListenerPid} = nhttp:start_link(#{
+        port => 0,
+        handler => ?MODULE,
+        versions => [http1_1],
+        acceptor_count => 1
+    }),
+    put(listener_pid, ListenerPid),
+    {ok, Port} = nhttp:get_port(ListenerPid),
+    Sock = open_idle_conn(Port),
+    [ConnPid] = wait_for_conn_count(ListenerPid, 1, 2000),
+    {garbage_collection, GC} = process_info(ConnPid, garbage_collection),
+    {fullsweep_after, SystemDefault} = erlang:system_info(fullsweep_after),
+    ?assertEqual(SystemDefault, proplists:get_value(fullsweep_after, GC)),
+    ok = gen_tcp:close(Sock),
+    ok.
+
+conn_spawn_opts_apply_to_conn(_Config) ->
+    {ok, ListenerPid} = nhttp:start_link(#{
+        port => 0,
+        handler => ?MODULE,
+        versions => [http1_1],
+        acceptor_count => 1,
+        conn_spawn_opts => [{fullsweep_after, 7}, {min_heap_size, 1000}]
+    }),
+    put(listener_pid, ListenerPid),
+    {ok, Port} = nhttp:get_port(ListenerPid),
+    Sock = open_idle_conn(Port),
+    [ConnPid] = wait_for_conn_count(ListenerPid, 1, 2000),
+    {garbage_collection, GC} = process_info(ConnPid, garbage_collection),
+    ?assertEqual(7, proplists:get_value(fullsweep_after, GC)),
+    ?assert(proplists:get_value(min_heap_size, GC) >= 1000),
+    {links, Links} = process_info(ConnPid, links),
+    ?assert(lists:member(conn_sup_of(ListenerPid), Links)),
+    ok = gen_tcp:close(Sock),
     ok.
 
 drain_completes_in_flight_and_rejects_new(_Config) ->
@@ -352,6 +426,12 @@ open_idle_conn(Port) ->
     ok = gen_tcp:send(Sock, <<"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n">>),
     {ok, _} = gen_tcp:recv(Sock, 0, 5000),
     Sock.
+
+conn_sup_of(ListenerPid) ->
+    [TransportSup] = nhttp_test_helpers:transport_sups(ListenerPid),
+    {nhttp_conn_sup, ConnSup, _, _} =
+        lists:keyfind(nhttp_conn_sup, 1, supervisor:which_children(TransportSup)),
+    ConnSup.
 
 conn_pids(ListenerPid) ->
     nhttp_test_helpers:conn_pids(ListenerPid).
