@@ -27,7 +27,7 @@
 %%%-----------------------------------------------------------------------------
 %% LOCAL MACROS
 %%%-----------------------------------------------------------------------------
--define(NO_SIZE_LIMIT, 16#FFFFFFFF).
+-define(LIST_SEPARATORS, [<<",">>, <<" ">>, <<"\t">>]).
 
 %%%-----------------------------------------------------------------------------
 %% API
@@ -43,40 +43,33 @@ config(Enabled, Level, Threshold, MimeTypes) ->
     }.
 
 -doc """
-Potentially compress a response body based on the request `Accept-Encoding`.
-Returns the response unchanged when compression is disabled, no encoding
-is negotiated, the body is empty or smaller than the threshold, or the
-content type is not in the compressible list.
+Compress a response body with the coding that the request `Accept-Encoding`
+selects, and add `vary: accept-encoding` when the selection depends on it.
+
+The response is returned unchanged when compression is disabled, the status
+has no content or holds a range (1xx, 204, 206, 304), the body is empty,
+smaller than the threshold or of a type outside the compressible list, the
+handler already set `content-encoding`, or `cache-control` holds
+`no-transform`.
 """.
 -spec maybe_compress(nhttp_lib:response(), nhttp_lib:request(), config()) ->
     nhttp_lib:response().
 maybe_compress(Response, _Request, #{enabled := false}) ->
     Response;
+maybe_compress(#{status := Status} = Response, _Request, _Config) when
+    Status < 200; Status =:= 204; Status =:= 206; Status =:= 304
+->
+    Response;
 maybe_compress(#{body := <<>>} = Response, _Request, _Config) ->
     Response;
-maybe_compress(
-    #{headers := Headers} = Response,
-    #{headers := ReqHeaders},
-    #{
-        level := Level,
-        threshold := Threshold,
-        mime_types := MimeTypes
-    }
-) ->
+maybe_compress(#{headers := Headers} = Response, #{headers := ReqHeaders}, Config) ->
     Body = maps:get(body, Response, <<>>),
-    Encoding = nhttp_compress:negotiate_encoding(ReqHeaders),
-    case Encoding of
-        identity ->
+    case is_eligible(Headers, iolist_size(Body), Config) of
+        false ->
             Response;
-        _ ->
-            ContentType = nhttp_headers:get(<<"content-type">>, Headers),
-            BodySize = iolist_size(Body),
-            case should_compress(ContentType, BodySize, Threshold, MimeTypes) of
-                false ->
-                    Response;
-                true ->
-                    compress_response(Response, Body, Encoding, Level)
-            end
+        true ->
+            Encoding = nhttp_compress:negotiate_encoding(ReqHeaders),
+            encode_response(Response, Body, Encoding, Config)
     end.
 
 %%%-----------------------------------------------------------------------------
@@ -89,12 +82,22 @@ add_compression_headers(Headers, EncodingHeader, NewSize) ->
     [
         {<<"content-encoding">>, EncodingHeader},
         {<<"content-length">>, integer_to_binary(NewSize)}
-        | Filtered
+        | add_vary(Filtered)
     ].
 
--spec compress_response(nhttp_lib:response(), iodata(), nhttp_compress:encoding(), 1..9) ->
+-spec add_vary(nhttp_lib:headers()) -> nhttp_lib:headers().
+add_vary(Headers) ->
+    Members = list_members(<<"vary">>, Headers),
+    case lists:member(<<"accept-encoding">>, Members) orelse lists:member(<<"*">>, Members) of
+        true -> Headers;
+        false -> [{<<"vary">>, <<"accept-encoding">>} | Headers]
+    end.
+
+-spec encode_response(nhttp_lib:response(), iodata(), nhttp_compress:encoding(), config()) ->
     nhttp_lib:response().
-compress_response(#{headers := Headers} = Response, Body, Encoding, Level) ->
+encode_response(#{headers := Headers} = Response, _Body, identity, _Config) ->
+    Response#{headers := add_vary(Headers)};
+encode_response(#{headers := Headers} = Response, Body, Encoding, #{level := Level}) ->
     case nhttp_compress:compress(Body, Encoding, Level) of
         {ok, Compressed} ->
             EncodingHeader = nhttp_compress:encoding_header(Encoding),
@@ -104,15 +107,22 @@ compress_response(#{headers := Headers} = Response, Body, Encoding, Level) ->
             Response
     end.
 
--spec should_compress(
-    binary() | undefined,
-    non_neg_integer(),
-    non_neg_integer(),
-    [binary()]
-) -> boolean().
-should_compress(undefined, _Size, _Threshold, _MimeTypes) ->
-    false;
-should_compress(_ContentType, Size, Threshold, _MimeTypes) when Size < Threshold ->
-    false;
-should_compress(ContentType, _Size, _Threshold, MimeTypes) ->
-    nhttp_compress:should_compress(ContentType, ?NO_SIZE_LIMIT, MimeTypes).
+-spec is_eligible(nhttp_lib:headers(), non_neg_integer(), config()) -> boolean().
+is_eligible(Headers, Size, #{threshold := Threshold, mime_types := MimeTypes}) ->
+    ContentType = nhttp_headers:get(<<"content-type">>, Headers),
+    nhttp_compress:should_compress(ContentType, Size, MimeTypes, Threshold) andalso
+        not nhttp_headers:has(<<"content-encoding">>, Headers) andalso
+        not lists:member(<<"no-transform">>, list_members(<<"cache-control">>, Headers)).
+
+-doc """
+The lowercase members of every `Name` field, for a field whose value is a
+comma-separated list (RFC 9110 §5.6.1).
+""".
+-spec list_members(binary(), nhttp_lib:headers()) -> [binary()].
+list_members(Name, Headers) ->
+    [
+        Member
+     || {Field, Value} <- Headers,
+        nhttp_headers:name_eq(Field, Name),
+        Member <- binary:split(nhttp_headers:to_lower(Value), ?LIST_SEPARATORS, [global, trim_all])
+    ].

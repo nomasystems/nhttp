@@ -123,6 +123,18 @@ clients drop the cached alternative rather than waste a UDP attempt and
 fall back (RFC 7838 §4). Draining a mixed listener stops advertising
 before it stops accepting.
 
+## Response compression
+
+A `reply` body of a type in `compress_mime_types` and at least
+`compression_threshold` bytes is gzip or deflate compressed when
+`Accept-Encoding` allows it. Each such response gets
+`vary: accept-encoding`, merged with any `vary` from the handler.
+
+The body is sent unchanged when the handler set `content-encoding`, when
+`cache-control` holds `no-transform`, or when the status is 1xx, 204, 206
+or 304. Streamed bodies are never compressed. HEAD gets the same headers
+as GET.
+
 ## 0-RTT
 
 QUIC 0-RTT (early data) is not enabled: nquic refuses early data unless a
