@@ -99,17 +99,20 @@ drain(Pid) ->
 
 -doc """
 `conn_handler` entry point.
-nquic starts this process under its partition supervisor for each new
-connection (owner-from-first-packet) and forwards the first packet. The
-process is the connection owner from packet 1: it seeds the server
-context with `nquic_lib:server_accept_init/1`, registers its own CIDs,
-and drives the handshake itself before entering the H3 connection loop.
+nquic calls it under its partition supervisor for each new connection
+(owner-from-first-packet) and forwards the first packet. The process
+spawns with the `conn_spawn_opts` of the listener. It is the connection
+owner from packet 1: it seeds the server context with
+`nquic_lib:server_accept_init/1`, registers its own CIDs, and drives the
+handshake itself before entering the H3 connection loop.
 There is no accept queue or `takeover/1`, so the connection's CID never
 resolves to a non-owner.
 """.
 -spec start_link(map()) -> {ok, pid()}.
 start_link(NquicOpts) ->
-    proc_lib:start_link(?MODULE, init_handler, [NquicOpts]).
+    #{opts := Opts} = maps:get(conn_handler_opts, NquicOpts),
+    SpawnOpts = nhttp_conn:spawn_opts(Opts),
+    proc_lib:start_link(?MODULE, init_handler, [NquicOpts], infinity, SpawnOpts).
 
 %%%-----------------------------------------------------------------------------
 %% PROC_LIB CALLBACKS

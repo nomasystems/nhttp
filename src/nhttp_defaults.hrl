@@ -40,4 +40,9 @@
 -define(DEFAULT_COMPRESSION_LEVEL, 6).
 -define(DEFAULT_COMPRESSION_THRESHOLD, 1024).
 
+%%%-----------------------------------------------------------------------------
+%%% Spawn options of the processes that run handler code.
+%%%-----------------------------------------------------------------------------
+-define(DEFAULT_CONN_SPAWN_OPTS, []).
+
 -endif.

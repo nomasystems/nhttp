@@ -34,11 +34,15 @@ it must be `[Name, Socket, Opts]`, for `nhttp_conn_h3` `[Name, Ctx, Opts]`.
 The conn is registered with the tracker, which releases its counter slot
 on `DOWN`. The start does not wait for the handler `init/1`.
 """.
--spec start_conn(pid(), pid(), [term()]) -> {ok, pid()}.
+-spec start_conn(pid(), pid(), [term()]) -> {ok, pid()} | {error, term()}.
 start_conn(ConnSupPid, TrackerPid, Args) ->
-    {ok, Pid} = supervisor:start_child(ConnSupPid, Args),
-    ok = nhttp_conn_tracker:track(TrackerPid, Pid),
-    {ok, Pid}.
+    case supervisor:start_child(ConnSupPid, Args) of
+        {ok, Pid} ->
+            ok = nhttp_conn_tracker:track(TrackerPid, Pid),
+            {ok, Pid};
+        {error, _} = Error ->
+            Error
+    end.
 
 -spec start_link(nhttp_registry:tab(), module()) -> {ok, pid()} | ignore | {error, term()}.
 start_link(Tab, ConnModule) ->

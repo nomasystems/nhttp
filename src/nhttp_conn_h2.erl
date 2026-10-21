@@ -342,13 +342,13 @@ apply_inline_body_result(State, StreamId, Result, HState) ->
     term()
 ) -> #state{}.
 apply_inline_result(
-    #state{protocol_state = #h2_state{h2_workers = Workers} = H2} = State,
+    #state{opts = Opts, protocol_state = #h2_state{h2_workers = Workers} = H2} = State,
     StreamId,
     {stream, {producer, _Status, _Headers, Producer} = Spec, NewHState},
     _HState
 ) ->
     Ref = make_ref(),
-    WorkerPid = nhttp_stream_worker:start(self(), Ref, Producer),
+    WorkerPid = nhttp_stream_worker:start(self(), Ref, Producer, nhttp_conn:spawn_opts(Opts)),
     MRef = erlang:monitor(process, WorkerPid),
     Stream = stream(State, StreamId),
     State1 = put_h2_stream(
@@ -540,6 +540,7 @@ spawn_h2_request_worker(
     #state{
         handler = Handler,
         handler_state = HState,
+        opts = Opts,
         protocol_state = #h2_state{h2_streams = Streams, h2_workers = Workers} = H2
     } = State,
     StreamId,
@@ -549,7 +550,7 @@ spawn_h2_request_worker(
     ReqSpan = nhttp_conn:emit_request_start(State, StreamId, Request),
     WorkerRef = make_ref(),
     WorkerPid = nhttp_stream_worker:start_request(
-        self(), StreamId, WorkerRef, Handler, Request, HState
+        self(), StreamId, WorkerRef, Handler, Request, HState, nhttp_conn:spawn_opts(Opts)
     ),
     MRef = erlang:monitor(process, WorkerPid),
     StoredRequest =

@@ -7,8 +7,8 @@
 %%%-----------------------------------------------------------------------------
 -export([
     reap/1,
-    start/3,
-    start_request/6,
+    start/4,
+    start_request/7,
     stop/1
 ]).
 
@@ -53,7 +53,7 @@ Spawn a worker to run `Producer(SendChunk)`.
 The worker process owns the producer's execution. The connection process
 (`ConnPid`) owns the socket and applies wire-level flow control. Messages
 between worker and conn are tagged with `Ref`.
-The worker is spawned with `proc_lib:spawn/3` (no link): a producer crash
+The worker is spawned with `proc_lib:spawn_opt/4` and `SpawnOpts` (no link): a producer crash
 does not propagate to the connection. The connection should monitor the
 returned pid to learn when the worker exits.
 Monitoring alone only reaps a worker that is parked at a `receive` (it
@@ -66,9 +66,9 @@ are dropped, while stuck survivors are `kill`ed. See
 `nhttp_conn:terminate/2`, `nhttp_conn_h3:terminate/2`, and the h1 push
 teardown.
 """.
--spec start(pid(), reference(), nhttp_stream:producer()) -> pid().
-start(ConnPid, Ref, Producer) ->
-    proc_lib:spawn(?MODULE, run, [ConnPid, Ref, Producer]).
+-spec start(pid(), reference(), nhttp_stream:producer(), [nhttp:conn_spawn_opt()]) -> pid().
+start(ConnPid, Ref, Producer, SpawnOpts) ->
+    spawn_worker(run, [ConnPid, Ref, Producer], SpawnOpts).
 
 -doc """
 Spawn a worker to run `Handler:handle_request(Request, HState)` and post
@@ -86,11 +86,18 @@ exit reason. The conn monitors the pid and emits the appropriate
 response.
 """.
 -spec start_request(
-    pid(), nhttp_lib:stream_id(), reference(), module(), nhttp_lib:request(), term()
+    pid(),
+    nhttp_lib:stream_id(),
+    reference(),
+    module(),
+    nhttp_lib:request(),
+    term(),
+    [nhttp:conn_spawn_opt()]
 ) ->
     pid().
-start_request(ConnPid, StreamId, Ref, Handler, Request, HState) ->
-    proc_lib:spawn(?MODULE, run_request, [ConnPid, StreamId, Ref, Handler, Request, HState]).
+start_request(ConnPid, StreamId, Ref, Handler, Request, HState, SpawnOpts) ->
+    Args = [ConnPid, StreamId, Ref, Handler, Request, HState],
+    spawn_worker(run_request, Args, SpawnOpts).
 
 -doc """
 Unconditionally `kill` a single worker.
@@ -305,4 +312,10 @@ send_trailers(ConnPid, Ref, MRef, TrailerHeaders) ->
                 {'DOWN', MRef, process, ConnPid, _Reason} ->
                     ok
             end
+    end.
+
+-spec spawn_worker(run | run_request, [term()], [nhttp:conn_spawn_opt()]) -> pid().
+spawn_worker(Fun, Args, SpawnOpts) ->
+    case proc_lib:spawn_opt(?MODULE, Fun, Args, SpawnOpts) of
+        Pid when is_pid(Pid) -> Pid
     end.

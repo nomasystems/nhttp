@@ -361,11 +361,13 @@ set_pending(#state{h3_streams = Streams} = State, StreamId, Pending) ->
     term(),
     {nhttp_otel:span_ctx(), integer()}
 ) -> #state{}.
-start_h3_stream_push(State, StreamId, Status, Headers, Producer, NewHState, ReqSpan) ->
+start_h3_stream_push(
+    #state{opts = Opts} = State, StreamId, Status, Headers, Producer, NewHState, ReqSpan
+) ->
     RespHeaders = [{<<":status">>, integer_to_binary(Status)} | Headers],
     State1 = nhttp_conn_h3:send_h3_headers(State, StreamId, RespHeaders, nofin),
     Ref = make_ref(),
-    WorkerPid = nhttp_stream_worker:start(self(), Ref, Producer),
+    WorkerPid = nhttp_stream_worker:start(self(), Ref, Producer, nhttp_conn:spawn_opts(Opts)),
     MRef = erlang:monitor(process, WorkerPid),
     PushStream = #h3_stream{
         type = push,

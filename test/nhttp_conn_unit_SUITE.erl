@@ -286,7 +286,7 @@ stream_worker_trailers_after_close_test(_Config) ->
         {error, closed} = SendChunk(<<"data">>),
         {trailers, [{<<"x">>, <<"y">>}]}
     end,
-    WPid = nhttp_stream_worker:start(Self, Ref, Producer),
+    WPid = nhttp_stream_worker:start(Self, Ref, Producer, []),
     receive
         {send_chunk, WPid, Ref, <<"data">>} ->
             WPid ! {chunk_ack, Ref, {error, closed}}
@@ -307,7 +307,7 @@ stream_worker_trailers_after_close_test(_Config) ->
 start_body_worker(Mode) ->
     Ref = make_ref(),
     WPid = nhttp_stream_worker:start_request(
-        self(), 1, Ref, nhttp_stream_worker_test_handler, #{}, Mode
+        self(), 1, Ref, nhttp_stream_worker_test_handler, #{}, Mode, []
     ),
     ?assertEqual({accept_body, body0, Mode}, expect_request_result(1, Ref)),
     {WPid, Ref}.

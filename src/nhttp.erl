@@ -164,6 +164,7 @@ RFC 9001 §9.2).
 %%%-----------------------------------------------------------------------------
 -export_type([
     authority/0,
+    conn_spawn_opt/0,
 
     h2_dispatch/0,
     h2_response_delay/0,
@@ -214,6 +215,7 @@ RFC 9001 §9.2).
     compression => boolean(),
     compression_level => 1..9,
     compression_threshold => non_neg_integer(),
+    conn_spawn_opts => [conn_spawn_opt()],
     max_connections => pos_integer() | infinity,
     max_header_name_length => pos_integer(),
     max_header_value_length => pos_integer(),
@@ -228,6 +230,26 @@ RFC 9001 §9.2).
     tls => tls(),
     proxy_protocol => boolean() | proxy_protocol_opts()
 }.
+
+-doc """
+An `erlang:spawn_opt/4` option for the processes that run handler code: the
+connection processes of HTTP/1.1, HTTP/2 and HTTP/3, and the stream workers.
+`link` and `monitor` are not allowed, because nhttp owns them. Default `[]`.
+
+Under load, old-generation garbage can hold most of the heap of a
+connection. `{fullsweep_after, 0}` collects it on every garbage collection.
+Each collection then shrinks the heap to the live data, and HTTP throughput
+drops. A `min_heap_size` that holds the allocations of one request restores
+the throughput, but every active connection then holds at least that heap.
+""".
+-type conn_spawn_opt() ::
+    {priority, erlang:priority_level()}
+    | {fullsweep_after, non_neg_integer()}
+    | {min_heap_size, non_neg_integer()}
+    | {min_bin_vheap_size, non_neg_integer()}
+    | {max_heap_size, erlang:max_heap_size()}
+    | {message_queue_data, erlang:message_queue_data()}
+    | {async_dist, boolean()}.
 
 -doc """
 Where `handle_request/2` runs on HTTP/2. `inline`: in the connection

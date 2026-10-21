@@ -299,6 +299,10 @@ has_tls(Opts) ->
 invalid_alt_svc_error(Reason) ->
     {error, {server, #{type => invalid_alt_svc, reason => Reason}}}.
 
+-spec invalid_conn_spawn_opts_error(term()) -> nhttp_error:t().
+invalid_conn_spawn_opts_error(Reason) ->
+    {error, {server, #{type => invalid_conn_spawn_opts, reason => Reason}}}.
+
 -spec invalid_proxy_protocol_error(term()) -> nhttp_error:t().
 invalid_proxy_protocol_error(Reason) ->
     {error, {server, #{type => invalid_proxy_protocol, reason => Reason}}}.
@@ -337,6 +341,14 @@ port_of_transport_sup(TransportSup, tcp) ->
     end;
 port_of_transport_sup(TransportSup, quic) ->
     tracker_port_in_transports([TransportSup]).
+
+-spec probe_spawn_opts([nhttp:conn_spawn_opt()]) -> ok | nhttp_error:t().
+probe_spawn_opts(SpawnOpts) ->
+    try erlang:spawn_opt(erlang, is_atom, [ok], SpawnOpts) of
+        Pid when is_pid(Pid) -> ok
+    catch
+        error:badarg -> invalid_conn_spawn_opts_error({badarg, SpawnOpts})
+    end.
 
 -spec reg_name(name()) ->
     {local, atom()} | {global, term()} | {via, module(), term()}.
@@ -453,6 +465,13 @@ validate_alt_svc(Map) when is_map(Map) ->
     end;
 validate_alt_svc(_Other) ->
     invalid_alt_svc_error(not_false_or_map).
+
+-spec validate_conn_spawn_opts(term()) -> ok | nhttp_error:t().
+validate_conn_spawn_opts(SpawnOpts) ->
+    maybe
+        ok ?= validate_spawn_opt_list(SpawnOpts),
+        ok ?= probe_spawn_opts(SpawnOpts)
+    end.
 
 -spec validate_h2_alias(
     h2_initial_window_size | h2_max_frame_size,
@@ -614,6 +633,7 @@ validate_opts(Opts) ->
         ok ?= validate_proxy_protocol(maps:get(proxy_protocol, Opts, false)),
         ok ?= validate_acceptor_count(maps:get(acceptor_count, Opts, undefined)),
         ok ?= validate_alt_svc(maps:get(alt_svc, Opts, #{})),
+        ok ?= validate_conn_spawn_opts(maps:get(conn_spawn_opts, Opts, [])),
         ok
     end.
 
@@ -656,6 +676,18 @@ validate_required_opts(Opts) ->
         false ->
             nhttp_error:missing_config(handler)
     end.
+
+-spec validate_spawn_opt_list(term()) -> ok | nhttp_error:t().
+validate_spawn_opt_list([]) ->
+    ok;
+validate_spawn_opt_list([Opt | _]) when Opt =:= link; Opt =:= monitor ->
+    invalid_conn_spawn_opts_error({owned_by_nhttp, Opt});
+validate_spawn_opt_list([{Tag, _} = Opt | _]) when Tag =:= link; Tag =:= monitor ->
+    invalid_conn_spawn_opts_error({owned_by_nhttp, Opt});
+validate_spawn_opt_list([_ | Rest]) ->
+    validate_spawn_opt_list(Rest);
+validate_spawn_opt_list(_) ->
+    invalid_conn_spawn_opts_error(not_a_list).
 
 -spec validate_tls_map(term()) -> ok | nhttp_error:t().
 validate_tls_map(Tls) when is_map(Tls) ->
