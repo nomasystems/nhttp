@@ -39,6 +39,7 @@
     activate_n/2,
     alt_svc_headers/2,
     cancel_hibernate_timer/1,
+    classify_preface/1,
     compress_config/1,
     deadline_remaining/1,
     emit_handler_exception/3,
@@ -91,6 +92,7 @@ Alt-Svc advertisement of the HTTP/3 endpoint.
 %% LOCAL MACROS
 %%%-----------------------------------------------------------------------------
 -define(ACTIVE_N, 100).
+-define(H2_PREFACE_LINE, <<"PRI * HTTP/2.0">>).
 -define(H2_SEND_QUEUE_BOUNDS, #{max_send_buffer => infinity, max_queued_streams => infinity}).
 -define(SOCKET_TRANSFER_TIMEOUT, 5000).
 
@@ -108,6 +110,11 @@ drain(Pid) ->
     Pid ! shutdown,
     ok.
 
+-doc "The spawn options of the processes that run handler code.".
+-spec spawn_opts(nhttp:opts()) -> [nhttp:conn_spawn_opt()].
+spawn_opts(Opts) ->
+    maps:get(conn_spawn_opts, Opts, ?DEFAULT_CONN_SPAWN_OPTS).
+
 -doc """
 Start a connection under `nhttp_conn_sup` without waiting for `init/1`.
 A failed handler `init/1` ends the process with `{shutdown, _}`.
@@ -116,11 +123,6 @@ A failed handler `init/1` ends the process with `{shutdown, _}`.
 start_link_supervised(Name, Socket, Opts, Ctx) ->
     Args = [{Name, Socket, Opts, Ctx, self()}],
     {ok, proc_lib:spawn_opt(?MODULE, init, Args, [link | spawn_opts(Opts)])}.
-
--doc "The spawn options of the processes that run handler code.".
--spec spawn_opts(nhttp:opts()) -> [nhttp:conn_spawn_opt()].
-spawn_opts(Opts) ->
-    maps:get(conn_spawn_opts, Opts, ?DEFAULT_CONN_SPAWN_OPTS).
 
 %%%-----------------------------------------------------------------------------
 %% PROC_LIB CALLBACKS
@@ -176,11 +178,14 @@ init({Name, Socket, Opts, Ctx, Parent}) ->
 -doc """
 `nhttp_protocol` entry point for the pre-classification phase: blocks on
 the acceptor's socket handoff, classifies the protocol, then tail-calls
-the selected protocol module's `loop/3`.
+the selected protocol module's `loop/3`. A cleartext listener that serves
+both HTTP/1.1 and HTTP/2 first reads until the bytes decide.
 """.
 -spec loop(pid(), [sys:debug_option()], #state{}) -> no_return().
-loop(Parent, Debug, #state{family = undefined} = State) ->
-    wait_for_socket(Parent, Debug, State).
+loop(Parent, Debug, #state{family = undefined, protocol_state = undefined} = State) ->
+    wait_for_socket(Parent, Debug, State);
+loop(Parent, Debug, #state{family = undefined, protocol_state = #sniff_state{}} = State) ->
+    sniff_loop(Parent, Debug, State).
 
 -spec system_code_change(#state{}, module(), term(), term()) -> {ok, #state{}}.
 ?NHTTP_SYSTEM_CODE_CHANGE_NOOP.
@@ -310,6 +315,12 @@ enter_protocol_loop(Parent, Debug, #state{family = http1} = State) ->
     nhttp_conn_h1:loop(Parent, Debug, State);
 enter_protocol_loop(Parent, Debug, #state{family = http2} = State) ->
     nhttp_conn_h2:loop(Parent, Debug, State).
+
+-spec enter_protocol_loop(pid(), [sys:debug_option()], #state{}, binary()) -> no_return().
+enter_protocol_loop(Parent, Debug, #state{family = http1} = State, Data) ->
+    nhttp_conn_h1:loop(Parent, Debug, State, Data);
+enter_protocol_loop(Parent, Debug, #state{family = http2} = State, Data) ->
+    nhttp_conn_h2:loop(Parent, Debug, State, Data).
 
 -spec set_active(nhttp_sock:t(), [gen_tcp:option() | ssl:tls_option()]) -> ok | {stop, term()}.
 set_active(Socket, Opts) ->
@@ -471,11 +482,29 @@ transport_to_scheme(ssl) -> https.
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - PROTOCOL DETECTION
 %%%-----------------------------------------------------------------------------
--spec detect_protocol(nhttp_sock:t(), [nhttp:version()]) ->
-    {ok, http1 | http2} | {error, {unsupported_alpn, binary()}}.
-detect_protocol(Socket, Versions) ->
+-doc """
+Classify a cleartext connection from its first bytes (RFC 9113 §3.4).
+The HTTP/2 preface starts with `PRI * HTTP/2.0`, and no HTTP/1.x request
+does, so its 14 bytes decide, or the first byte that differs from them.
+`more` means that the bytes are a strict prefix of them.
+""".
+-spec classify_preface(binary()) -> {ok, http1 | http2} | more.
+classify_preface(Bytes) ->
+    Line = ?H2_PREFACE_LINE,
+    case binary:longest_common_prefix([Bytes, Line]) of
+        Common when Common =:= byte_size(Line) -> {ok, http2};
+        Common when Common =:= byte_size(Bytes) -> more;
+        _ -> {ok, http1}
+    end.
+
+-spec detect_protocol(#state{}) ->
+    {ok, http1 | http2} | sniff | {error, {unsupported_alpn, binary()}}.
+detect_protocol(#state{socket = Socket, transport = Transport, ctx = #{versions := Versions}}) ->
     AllowedFamilies = [version_to_family(V) || V <- Versions],
-    select_family(nhttp_sock:negotiated_protocol(Socket), AllowedFamilies).
+    case sniffs(Transport, AllowedFamilies) of
+        true -> sniff;
+        false -> select_family(nhttp_sock:negotiated_protocol(Socket), AllowedFamilies)
+    end.
 
 -spec family_if_allowed(http1 | http2, binary(), [http1 | http2 | http3]) ->
     {ok, http1 | http2} | {error, {unsupported_alpn, binary()}}.
@@ -490,7 +519,7 @@ h1_state_from_opts(Opts) ->
     Timeouts = maps:get(timeouts, Opts, #{}),
     #h1_state{
         body_timeout = maps:get(body, Timeouts, ?DEFAULT_BODY_TIMEOUT),
-        request_timeout = maps:get(request, Timeouts, ?DEFAULT_REQUEST_TIMEOUT),
+        request_timeout = request_timeout(Opts),
         body_deadline = maps:get(body_deadline, Timeouts, infinity)
     }.
 
@@ -526,13 +555,25 @@ h2_stream_credit({delay, Ms}) -> {delay, Ms, queue:new()};
 h2_stream_credit(on_response) -> on_response.
 
 -spec init_protocol(#state{}) -> {ok, #state{}} | {error, nhttp_sock:socket_error()}.
-init_protocol(#state{family = http2, socket = Socket, peer = Peer, opts = Opts} = State) ->
+init_protocol(#state{socket = Socket} = State) ->
+    maybe
+        {ok, State1} ?= open_protocol(State),
+        ok ?= nhttp_sock:setopts(Socket, [{active, once}]),
+        {ok, State1}
+    end.
+
+-doc """
+Build the protocol state of the classified family and send what the
+server sends first: the SETTINGS frame of the HTTP/2 preface, nothing for
+HTTP/1.1. The socket stays passive.
+""".
+-spec open_protocol(#state{}) -> {ok, #state{}} | {error, nhttp_sock:socket_error()}.
+open_protocol(#state{family = http2, socket = Socket, peer = Peer, opts = Opts} = State) ->
     H2Conn0 = nhttp_h2:new(server, h2_settings_from_opts(Opts)),
     H2Conn = nhttp_h2:set_peer(H2Conn0, Peer),
     Preface = nhttp_h2:preface(H2Conn),
     maybe
         ok ?= nhttp_sock:send(Socket, Preface),
-        ok ?= nhttp_sock:setopts(Socket, [{active, once}]),
         {ok, State#state{
             protocol_state = #h2_state{
                 h2_conn = H2Conn,
@@ -546,11 +587,8 @@ init_protocol(#state{family = http2, socket = Socket, peer = Peer, opts = Opts} 
             }
         }}
     end;
-init_protocol(#state{family = http1, socket = Socket, opts = Opts} = State) ->
-    case nhttp_sock:setopts(Socket, [{active, once}]) of
-        ok -> {ok, State#state{protocol_state = h1_state_from_opts(Opts)}};
-        {error, _} = Error -> Error
-    end.
+open_protocol(#state{family = http1, opts = Opts} = State) ->
+    {ok, State#state{protocol_state = h1_state_from_opts(Opts)}}.
 
 -spec put_h2_initial_window_size(nhttp:opts(), nhttp_h2:settings()) -> nhttp_h2:settings().
 put_h2_initial_window_size(#{h2_initial_window_size := Size}, Settings) ->
@@ -564,6 +602,10 @@ put_h2_max_frame_size(#{h2_max_frame_size := Size}, Settings) ->
 put_h2_max_frame_size(#{}, Settings) ->
     Settings.
 
+-spec request_timeout(nhttp:opts()) -> timeout().
+request_timeout(Opts) ->
+    maps:get(request, maps:get(timeouts, Opts, #{}), ?DEFAULT_REQUEST_TIMEOUT).
+
 -spec select_family({ok, binary()} | {error, no_alpn}, [http1 | http2 | http3]) ->
     {ok, http1 | http2} | {error, {unsupported_alpn, binary()}}.
 select_family({ok, <<"h2">> = Protocol}, AllowedFamilies) ->
@@ -576,6 +618,16 @@ select_family({error, no_alpn}, [http2 | _]) ->
     {ok, http2};
 select_family({error, no_alpn}, _AllowedFamilies) ->
     {ok, http1}.
+
+-doc """
+Whether the protocol comes from the first bytes: on a cleartext socket
+that serves both HTTP/1.1 and HTTP/2. With TLS, ALPN decides.
+""".
+-spec sniffs(tcp | ssl, [http1 | http2 | http3]) -> boolean().
+sniffs(tcp, AllowedFamilies) ->
+    lists:member(http1, AllowedFamilies) andalso lists:member(http2, AllowedFamilies);
+sniffs(ssl, _AllowedFamilies) ->
+    false.
 
 -spec version_to_family(nhttp_lib:version()) -> http1 | http2 | http3.
 version_to_family(http1_0) -> http1;
@@ -735,8 +787,8 @@ sock_stop_reason(Reason) ->
     end.
 
 -spec start_protocol(pid(), [sys:debug_option()], #state{}) -> no_return().
-start_protocol(Parent, Debug, #state{socket = Socket, ctx = #{versions := Versions}} = State) ->
-    case detect_protocol(Socket, Versions) of
+start_protocol(Parent, Debug, State) ->
+    case detect_protocol(State) of
         {ok, Family} ->
             State1 = put_log_ctx(finalize_peer(State#state{family = Family})),
             case init_protocol(State1) of
@@ -746,6 +798,8 @@ start_protocol(Parent, Debug, #state{socket = Socket, ctx = #{versions := Versio
                 {error, Reason} ->
                     wait_for_socket_terminate(Reason, State1)
             end;
+        sniff ->
+            start_sniff(Parent, Debug, State);
         {error, Reason} ->
             wait_for_socket_terminate(Reason, State)
     end.
@@ -782,6 +836,86 @@ wait_for_socket_terminate(Reason, #state{socket = undefined} = State) ->
 wait_for_socket_terminate(Reason, State) ->
     ok = terminate(Reason, State),
     exit(init_exit_reason(Reason)).
+
+%%%-----------------------------------------------------------------------------
+%% INTERNAL FUNCTIONS - PREFACE SNIFFING (RFC 9113 §3.3)
+%%%-----------------------------------------------------------------------------
+-spec enter_sniffed(pid(), [sys:debug_option()], #state{}, binary()) -> no_return().
+enter_sniffed(Parent, Debug, State, Bytes) ->
+    State1 = put_log_ctx(finalize_peer(State)),
+    case open_protocol(State1) of
+        {ok, State2} ->
+            enter_protocol_loop(Parent, Debug, emit_connection_start(State2), Bytes);
+        {error, Reason} ->
+            wait_for_socket_terminate(Reason, State1)
+    end.
+
+-spec handle_sniff_data(pid(), [sys:debug_option()], #state{}, binary()) -> no_return().
+handle_sniff_data(
+    Parent, Debug, #state{protocol_state = #sniff_state{buffer = Buffer} = Sniff} = State, Data
+) ->
+    Bytes = sniff_bytes(Buffer, Data),
+    case classify_preface(Bytes) of
+        {ok, Family} ->
+            enter_sniffed(Parent, Debug, State#state{family = Family}, Bytes);
+        more ->
+            Sniffing = State#state{protocol_state = Sniff#sniff_state{buffer = Bytes}},
+            case activate(Sniffing) of
+                ok -> sniff_loop(Parent, Debug, Sniffing);
+                {stop, Reason} -> stop(Reason, Sniffing)
+            end
+    end.
+
+-spec sniff_bytes(binary(), binary()) -> binary().
+sniff_bytes(<<>>, Data) ->
+    Data;
+sniff_bytes(Buffer, Data) ->
+    <<Buffer/binary, Data/binary>>.
+
+-doc """
+Wait for the bytes that decide the protocol of a cleartext connection.
+The wait ends at the `request` deadline, counted from the socket handoff,
+or after the `idle` timeout, whichever comes first. Nothing is sent to a
+connection that ends here, because its protocol is not known.
+""".
+-spec sniff_loop(pid(), [sys:debug_option()], #state{}) -> no_return().
+sniff_loop(
+    Parent,
+    Debug,
+    #state{idle_timeout = IdleTimeout, protocol_state = #sniff_state{request_deadline = Deadline}} =
+        State
+) ->
+    receive
+        {tcp, _Socket, Data} ->
+            handle_sniff_data(Parent, Debug, State, Data);
+        {tcp_closed, _Socket} ->
+            stop(normal, State);
+        {tcp_error, _Socket, Reason} ->
+            stop({socket_error, Reason}, State);
+        {system, From, Request} ->
+            sys:handle_system_msg(Request, From, Parent, ?MODULE, Debug, State);
+        shutdown ->
+            stop(normal, State);
+        {'EXIT', Parent, Reason} ->
+            stop_parent(Reason, State)
+    after min(IdleTimeout, deadline_remaining(Deadline)) ->
+        stop(sniff_timeout_reason(Deadline), State)
+    end.
+
+-spec sniff_timeout_reason(deadline()) -> request_timeout | idle_timeout.
+sniff_timeout_reason(Deadline) ->
+    case deadline_remaining(Deadline) of
+        0 -> request_timeout;
+        _ -> idle_timeout
+    end.
+
+-spec start_sniff(pid(), [sys:debug_option()], #state{}) -> no_return().
+start_sniff(Parent, Debug, #state{socket = Socket, opts = Opts} = State) ->
+    Sniff = #sniff_state{request_deadline = idle_deadline(request_timeout(Opts))},
+    case nhttp_sock:setopts(Socket, [{active, once}]) of
+        ok -> sniff_loop(Parent, Debug, State#state{protocol_state = Sniff});
+        {error, Reason} -> wait_for_socket_terminate(Reason, State)
+    end.
 
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - TERMINATION

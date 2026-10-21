@@ -12,9 +12,10 @@
 %%% `#state{}` holds only protocol-agnostic fields. Protocol-specific
 %%% state lives under `protocol_state`: `#h1_state{}` for `family`
 %%% `http1` and `websocket` (the H1 upgrade keeps its record, ws fields
-%%% included), `#h2_state{}` for `http2`, and `undefined` before
-%%% classification in `nhttp_conn`. H3 has its own `#state{}` in
-%%% `nhttp_conn_h3.hrl`.
+%%% included), `#h2_state{}` for `http2`, `undefined` before the socket
+%%% arrives, and `#sniff_state{}` while `nhttp_conn` reads the first bytes
+%%% of a cleartext connection that can be either. H3 has its own
+%%% `#state{}` in `nhttp_conn_h3.hrl`.
 %%%-----------------------------------------------------------------------------
 
 -ifndef(NHTTP_CONN_HRL).
@@ -55,6 +56,11 @@
     req_span :: {nhttp_otel:span_ctx(), integer()},
     bytes = 0 :: non_neg_integer(),
     started = false :: boolean()
+}).
+
+-record(sniff_state, {
+    buffer = <<>> :: binary(),
+    request_deadline :: nhttp_conn:deadline()
 }).
 
 -record(h1_state, {
@@ -109,7 +115,7 @@
     handler :: module(),
     handler_state :: term(),
     family :: http1 | http2 | websocket | undefined,
-    protocol_state :: undefined | #h1_state{} | #h2_state{},
+    protocol_state :: undefined | #sniff_state{} | #h1_state{} | #h2_state{},
     opts :: nhttp:opts(),
     ctx :: nhttp_conn:ctx(),
     log_ctx :: nhttp_log:ctx() | undefined,

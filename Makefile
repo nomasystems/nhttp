@@ -1,5 +1,6 @@
 .PHONY: all compile clean check test cover doc binopt certs compliance \
-        h1-compliance h2-compliance h2c-compliance h3-compliance ws-compliance \
+        h1-compliance h2-compliance h2c-compliance mixed-compliance \
+        h3-compliance ws-compliance \
         h1spec-image h2spec-image h3spec-image autobahn-image help
 
 # Tools
@@ -13,6 +14,10 @@ H1SPEC_VERSION := 0.2.0-f0a5650
 H1SPEC_IMAGE := nhttp/h1spec:$(H1SPEC_VERSION)
 H1SPEC_DOCKERFILE := priv/Dockerfile.h1spec
 H2SPEC_IMAGE := summerwind/h2spec:2.6.0
+# Every h2spec case except http2/3.5/2. On a port that also serves HTTP/1.1
+# its invalid preface gets an HTTP/1.1 400, which h2spec reads as a frame.
+# https://github.com/summerwind/h2spec/issues/112
+H2SPEC_MIXED_SPECS := generic hpack http2/3.5/1 http2/4 http2/5 http2/6 http2/7 http2/8
 H3SPEC_VERSION := 0.1.12
 H3SPEC_IMAGE := nhttp/h3spec:$(H3SPEC_VERSION)
 H3SPEC_DOCKERFILE := priv/Dockerfile.h3spec
@@ -134,6 +139,20 @@ h2c-compliance: h2spec-image
 			-v $(CURDIR)/$(COMPLIANCE_REPORTS):/reports $(H2SPEC_IMAGE) \
 			-k -h $(COMPLIANCE_TARGET) -p $$PORT -o 5 -j /reports/h2spec-h2c.xml'
 
+mixed-compliance: h1spec-image h2spec-image
+	@echo "=== HTTP/1.1 and h2c on one cleartext port: h2spec and h1spec (Docker) ==="
+	@$(REBAR3) as test compile
+	@mkdir -p $(COMPLIANCE_REPORTS)
+	@$(COMPLIANCE_RUN) nhttp_compliance:start_mixed \
+		'docker run --rm $(DOCKER_NET_ARGS) $(DOCKER_USER) \
+			-v $(CURDIR)/$(COMPLIANCE_REPORTS):/reports $(H2SPEC_IMAGE) \
+			-k -h $(COMPLIANCE_TARGET) -p $$PORT -o 5 -j /reports/h2spec-mixed.xml \
+			$(H2SPEC_MIXED_SPECS); \
+		h2=$$?; \
+		docker run --rm $(DOCKER_NET_ARGS) $(H1SPEC_IMAGE) $(COMPLIANCE_TARGET) $$PORT; \
+		h1=$$?; \
+		test $$h2 -eq 0 -a $$h1 -eq 0'
+
 h2spec-image:
 	@command -v docker >/dev/null 2>&1 || { \
 		echo "Error: docker not found in PATH. Install Docker to run compliance tests."; \
@@ -185,7 +204,8 @@ autobahn-image:
 		docker build -t $(AUTOBAHN_IMAGE) -f $(AUTOBAHN_DOCKERFILE) priv; \
 	}
 
-compliance: h1-compliance h2-compliance h2c-compliance h3-compliance ws-compliance
+compliance: h1-compliance h2-compliance h2c-compliance mixed-compliance h3-compliance \
+            ws-compliance
 
 #==============================================================================
 # Help
@@ -215,11 +235,12 @@ help:
 	@echo "    make h1-compliance   - Run HTTP/1.1 tests (Docker: $(H1SPEC_IMAGE))"
 	@echo "    make h2-compliance   - Run HTTP/2 RFC 9113 tests (Docker: $(H2SPEC_IMAGE))"
 	@echo "    make h2c-compliance  - Run HTTP/2 RFC 9113 tests in cleartext (Docker: $(H2SPEC_IMAGE))"
+	@echo "    make mixed-compliance - Run h2spec and h1spec on one cleartext HTTP/1.1 + h2c port"
 	@echo "    make h3-compliance   - Run HTTP/3 tests (Docker: $(H3SPEC_IMAGE))"
 	@echo "    make ws-compliance   - Run WebSocket RFC 6455 tests (Docker: $(AUTOBAHN_IMAGE))"
 	@echo ""
 	@echo "  Each target exits with the status of its runner. Reports land in"
-	@echo "  $(COMPLIANCE_REPORTS)/: h2spec.xml and h2spec-h2c.xml (JUnit), and autobahn/index.html."
+	@echo "  $(COMPLIANCE_REPORTS)/: h2spec.xml, h2spec-h2c.xml and h2spec-mixed.xml (JUnit), and autobahn/index.html."
 	@echo "  make -k compliance runs every suite before it reports a failure."
 	@echo ""
 	@echo "  Requirement: Docker daemon running. On macOS/Windows, Docker Desktop."

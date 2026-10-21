@@ -12,6 +12,8 @@
 -include("../src/nhttp_conn_ws.hrl").
 -include("../src/nhttp_ws_codes.hrl").
 
+-define(H2_PREFACE, <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>).
+
 -compile([export_all, nowarn_export_all]).
 
 %%%-----------------------------------------------------------------------------
@@ -25,6 +27,8 @@ all() ->
         sock_stop_reason_test,
         exit_reason_test,
         select_family_test,
+        classify_preface_test,
+        classify_preface_split_test,
         version_family_mapping_test,
         route_silent_test,
         ws_str_or_atom_test,
@@ -116,6 +120,33 @@ select_family_test(_Config) ->
     ?assertEqual({ok, http2}, nhttp_conn:select_family({error, no_alpn}, [http2, http1])),
     ?assertEqual({ok, http1}, nhttp_conn:select_family({error, no_alpn}, [http1, http2])),
     ?assertEqual({ok, http1}, nhttp_conn:select_family({error, no_alpn}, [http3])).
+
+classify_preface_test(_Config) ->
+    ?assertEqual(more, nhttp_conn:classify_preface(<<>>)),
+    ?assertEqual(more, nhttp_conn:classify_preface(<<"PRI * HTTP/2">>)),
+    ?assertEqual({ok, http2}, nhttp_conn:classify_preface(<<"PRI * HTTP/2.0">>)),
+    ?assertEqual({ok, http2}, nhttp_conn:classify_preface(?H2_PREFACE)),
+    ?assertEqual({ok, http1}, nhttp_conn:classify_preface(<<"G">>)),
+    ?assertEqual({ok, http1}, nhttp_conn:classify_preface(<<"PRI / HTTP/1.1\r\n">>)),
+    ?assertEqual({ok, http1}, nhttp_conn:classify_preface(<<"PRI * HTTP/1.1\r\n">>)).
+
+classify_preface_split_test(_Config) ->
+    lists:foreach(
+        fun(Input) ->
+            Whole = nhttp_conn:classify_preface(Input),
+            lists:foreach(
+                fun(Chunks) -> ?assertEqual(Whole, feed_classify(Chunks, <<>>)) end,
+                chunkings(Input)
+            )
+        end,
+        [
+            <<"PRI * HTTP/2.0\r\n">>,
+            <<"GET / HTTP/1.1\r\n">>,
+            <<"PRI / HTTP/1.1\r\n">>,
+            <<"PRI * HTTP/1.1\r\n">>,
+            <<"PRI * HTTP/2">>
+        ]
+    ).
 
 version_family_mapping_test(_Config) ->
     ?assertEqual(http1, nhttp_conn:version_to_family(http1_0)),
@@ -333,3 +364,21 @@ await_exit(WPid) ->
     after 1000 ->
         ct:fail(worker_did_not_exit)
     end.
+
+feed_classify([], Acc) ->
+    nhttp_conn:classify_preface(Acc);
+feed_classify([Chunk | Rest], Acc) ->
+    Bytes = <<Acc/binary, Chunk/binary>>,
+    case nhttp_conn:classify_preface(Bytes) of
+        more -> feed_classify(Rest, Bytes);
+        Result -> Result
+    end.
+
+chunkings(<<>>) ->
+    [[]];
+chunkings(Bin) ->
+    [
+        [binary:part(Bin, 0, N) | Rest]
+     || N <- lists:seq(1, byte_size(Bin)),
+        Rest <- chunkings(binary:part(Bin, N, byte_size(Bin) - N))
+    ].

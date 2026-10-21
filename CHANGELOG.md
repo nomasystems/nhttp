@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `conn_spawn_opts => [nhttp:conn_spawn_opt()]`: spawn options for the connection processes of HTTP/1.1, HTTP/2 and HTTP/3 and for the stream workers, for example `{fullsweep_after, 0}` or `{min_heap_size, Words}`. The listener rejects `link`, `monitor` and a value that `erlang:spawn_opt/4` does not accept. Default `[]`
 - Response compression adds `vary: accept-encoding` to every response whose coding depends on `Accept-Encoding`. A `vary` field that the handler set is kept
 - HTTP/2 in cleartext with prior knowledge (h2c, RFC 9113 §3.3): `versions => [http2]` without `tls` starts. Only `http3` needs `tls`
+- HTTP/1.1 and h2c on one cleartext port: `versions => [http1_1, http2]` without `tls` picks the protocol of each connection from its first bytes, HTTP/2 when they are the connection preface. A connection that sends no deciding bytes before the `request` timeout is closed
 
 ### Fixed
 

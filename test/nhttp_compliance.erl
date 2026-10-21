@@ -2,8 +2,9 @@
 %%% @doc HTTP/2 RFC 9113 compliance test server.
 %%%
 %%% This module provides a minimal HTTP/2 server for running h2spec compliance
-%%% tests. It starts an HTTP/2 over TLS server and prints the port in a
-%%% parseable format for use by the Makefile.
+%%% tests. It starts an HTTP/2 over TLS server, or a cleartext server with
+%%% HTTP/1.1 and h2c on one port, and prints the port in a parseable format
+%%% for use by the Makefile.
 %%%
 %%% Usage from Makefile:
 %%%   erl -noinput -pa ebin -eval 'nhttp_compliance:start().'
@@ -16,7 +17,8 @@
 -export([
     start/0,
     start/1,
-    start_h2c/0
+    start_h2c/0,
+    start_mixed/0
 ]).
 
 -export([
@@ -36,6 +38,15 @@ start() ->
 start_h2c() ->
     start(#{tls => false}).
 
+-doc """
+Start the server in cleartext with HTTP/1.1 and h2c on one port.
+HTTP/1.x requests go to the `nhttp_h1_compliance` handler, so h2spec and
+h1spec run against the same port.
+""".
+-spec start_mixed() -> no_return().
+start_mixed() ->
+    start(#{tls => false, versions => [http1_1, http2]}).
+
 -spec start(map()) -> no_return().
 start(Opts) ->
     {ok, _} = application:ensure_all_started(crypto),
@@ -46,7 +57,10 @@ start(Opts) ->
     {ok, _} = application:ensure_all_started(nhttp),
 
     {ok, Pid} = nhttp:start_link(
-        maps:merge(#{port => 0, versions => [http2], handler => ?MODULE}, tls_opts(Opts))
+        maps:merge(
+            #{port => 0, versions => maps:get(versions, Opts, [http2]), handler => ?MODULE},
+            tls_opts(Opts)
+        )
     ),
 
     {ok, Port} = nhttp:get_port(Pid),
@@ -84,13 +98,19 @@ connection reset the stream with NO_ERROR (RFC 9113 Section 8.1), and the
 codec then discards the frames that h2spec sends to provoke a stream error.
 """.
 -spec handle_request(nhttp_lib:request(), #{}) -> nhttp_handler:request_result(#{}).
+handle_request(#{version := Version} = Req, State) when
+    Version =:= http1_0; Version =:= http1_1
+->
+    nhttp_h1_compliance:handle_request(Req, State);
 handle_request(#{body := streaming}, State) ->
     {accept_body, unread, State};
 handle_request(_Req, State) ->
     {reply, nhttp_resp:ok(<<"hello">>), State}.
 
--spec handle_request_body(nhttp_handler:body_event(), unread, #{}) ->
+-spec handle_request_body(nhttp_handler:body_event(), unread | [binary()], #{}) ->
     nhttp_handler:request_result(#{}).
+handle_request_body(Event, Acc, State) when is_list(Acc) ->
+    nhttp_h1_compliance:handle_request_body(Event, Acc, State);
 handle_request_body({data, _Chunk}, unread, State) ->
     {accept_body, unread, State};
 handle_request_body({fin, _Trailers}, unread, State) ->
