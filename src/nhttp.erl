@@ -80,6 +80,26 @@ end,
 `sni_hosts` and `sni_fun` may be combined and are TCP/TLS only. HTTP/3
 listeners ignore them.
 
+## HTTP/2 in cleartext (h2c)
+
+`versions => [http2]` without `tls` serves HTTP/2 over plain TCP with
+prior knowledge (RFC 9113 §3.3). The client sends the HTTP/2 connection
+preface first, as `curl --http2-prior-knowledge` and gRPC clients do.
+`Upgrade: h2c` is not supported. Requests carry the `:scheme` that the
+client sends.
+
+```erlang
+{ok, Pid} = nhttp:start_link(my_srv, #{
+    port     => 8080,
+    handler  => my_handler,
+    versions => [http2]
+}).
+```
+
+Use cleartext HTTP/2 only behind a TLS terminator or inside a trusted
+network. A cleartext listener serves one protocol: the first of
+`http1_1` and `http2` in `versions`. `http3` always needs `tls`.
+
 ## Mixed h1/h2/h3 listeners
 
 `versions => [http1_1, http2, http3]` serves all three from one call. h1

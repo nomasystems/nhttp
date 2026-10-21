@@ -50,6 +50,18 @@ responses, WebSocket, SSE, CORS, and chunked uploads.
 }).
 ```
 
+### HTTP/2 in cleartext (h2c)
+
+Without `tls`, `versions => [http2]` serves HTTP/2 with prior knowledge (RFC 9113 §3.3), for example to `curl --http2-prior-knowledge`. Use it only behind a TLS terminator or inside a trusted network.
+
+```erlang
+{ok, Pid} = nhttp:start_link(my_server, #{
+    port => 8080,
+    versions => [http2],
+    handler => my_handler
+}).
+```
+
 ### HTTP/3 over QUIC
 
 HTTP/3 runs over QUIC on a UDP socket. HTTP/1.1 and HTTP/2 run over TCP on their own socket. List all three versions and a single listener opens both sockets for you, and sets Alt-Svc on the TCP side so clients know where to find HTTP/3.
@@ -67,7 +79,7 @@ HTTP/3 runs over QUIC on a UDP socket. HTTP/1.1 and HTTP/2 run over TCP on their
 
 ## Features
 
-- **HTTP/1.1** ([RFC 9112](https://www.rfc-editor.org/rfc/rfc9112)) and **HTTP/2** ([RFC 9113](https://www.rfc-editor.org/rfc/rfc9113)) with automatic protocol selection via TLS ALPN
+- **HTTP/1.1** ([RFC 9112](https://www.rfc-editor.org/rfc/rfc9112)) and **HTTP/2** ([RFC 9113](https://www.rfc-editor.org/rfc/rfc9113)) with automatic protocol selection via TLS ALPN, and HTTP/2 in cleartext with prior knowledge
 - **HTTP/3** over QUIC ([RFC 9114](https://www.rfc-editor.org/rfc/rfc9114)), in-process `nquic` library mode
 - **WebSocket** over HTTP/1.1 ([RFC 6455](https://www.rfc-editor.org/rfc/rfc6455)), HTTP/2 ([RFC 8441](https://www.rfc-editor.org/rfc/rfc8441)), and HTTP/3 ([RFC 9220](https://www.rfc-editor.org/rfc/rfc9220)) with one callback set
 - **Server-Sent Events** helpers ([W3C SSE](https://html.spec.whatwg.org/multipage/server-sent-events.html))

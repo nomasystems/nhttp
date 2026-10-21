@@ -33,6 +33,8 @@
     listener_h2_credit_batch_invalid/1,
     listener_h2_response_delay_invalid/1,
     listener_h2_window_policy_invalid/1,
+    listener_h2c_without_tls_starts/1,
+    listener_http3_requires_tls/1,
     listener_invalid_tls/1,
     listener_invalid_versions/1,
     listener_listen_failed/1,
@@ -53,6 +55,8 @@ all() ->
         listener_h2_credit_batch_invalid,
         listener_h2_response_delay_invalid,
         listener_h2_window_policy_invalid,
+        listener_h2c_without_tls_starts,
+        listener_http3_requires_tls,
         listener_invalid_tls,
         listener_invalid_versions,
         listener_listen_failed,
@@ -262,6 +266,21 @@ listener_h2_window_policy_invalid(_Config) ->
         [{Key, Policy} || Key <- policy_keys(), Policy <- Valid]
     ),
     ok.
+
+listener_h2c_without_tls_starts(_Config) ->
+    {ok, Pid} = nhttp:start_link(#{port => 0, handler => ?MODULE, versions => [http2]}),
+    ok = nhttp:stop(Pid).
+
+listener_http3_requires_tls(_Config) ->
+    lists:foreach(
+        fun(Versions) ->
+            assert_error_contains(
+                "key => tls",
+                nhttp:start_link(#{port => 0, handler => ?MODULE, versions => Versions})
+            )
+        end,
+        [[http3], [http2, http3], [http1_1, http3]]
+    ).
 
 listener_invalid_versions(_Config) ->
     assert_error_contains(

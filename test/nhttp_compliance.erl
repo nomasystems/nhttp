@@ -15,7 +15,8 @@
 
 -export([
     start/0,
-    start/1
+    start/1,
+    start_h2c/0
 ]).
 
 -export([
@@ -30,6 +31,11 @@
 start() ->
     start(#{}).
 
+-doc "Start the server in cleartext, HTTP/2 with prior knowledge (h2c).".
+-spec start_h2c() -> no_return().
+start_h2c() ->
+    start(#{tls => false}).
+
 -spec start(map()) -> no_return().
 start(Opts) ->
     {ok, _} = application:ensure_all_started(crypto),
@@ -39,24 +45,9 @@ start(Opts) ->
     {ok, _} = application:ensure_all_started(nhttp_lib),
     {ok, _} = application:ensure_all_started(nhttp),
 
-    CertDir = maps:get(cert_dir, Opts, ?DEFAULT_CERT_DIR),
-    CertFile = maps:get(certfile, Opts, filename:join(CertDir, "server.pem")),
-    KeyFile = maps:get(keyfile, Opts, filename:join(CertDir, "server.key")),
-
-    case filelib:is_file(CertFile) of
-        false ->
-            io:format(standard_error, "Error: Certificate not found: ~s~n", [CertFile]),
-            halt(1);
-        true ->
-            ok
-    end,
-
-    {ok, Pid} = nhttp:start_link(#{
-        port => 0,
-        tls => #{certfile => CertFile, keyfile => KeyFile},
-        versions => [http2],
-        handler => ?MODULE
-    }),
+    {ok, Pid} = nhttp:start_link(
+        maps:merge(#{port => 0, versions => [http2], handler => ?MODULE}, tls_opts(Opts))
+    ),
 
     {ok, Port} = nhttp:get_port(Pid),
 
@@ -66,6 +57,21 @@ start(Opts) ->
         stop ->
             nhttp:stop(Pid),
             halt(0)
+    end.
+
+-spec tls_opts(map()) -> #{tls => nhttp:tls()}.
+tls_opts(#{tls := false}) ->
+    #{};
+tls_opts(Opts) ->
+    CertDir = maps:get(cert_dir, Opts, ?DEFAULT_CERT_DIR),
+    CertFile = maps:get(certfile, Opts, filename:join(CertDir, "server.pem")),
+    KeyFile = maps:get(keyfile, Opts, filename:join(CertDir, "server.key")),
+    case filelib:is_file(CertFile) of
+        false ->
+            io:format(standard_error, "Error: Certificate not found: ~s~n", [CertFile]),
+            halt(1);
+        true ->
+            #{tls => #{certfile => CertFile, keyfile => KeyFile}}
     end.
 
 -spec init(term()) -> {ok, #{}}.

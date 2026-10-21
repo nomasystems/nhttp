@@ -44,6 +44,8 @@
     h2_server_settings/1,
     h2_start_server/2,
     h2_stream_done/2,
+    h2c_connect/1,
+    h2c_start_server/2,
     stream_data_size/2,
     tcp_connect/1
 ]).
@@ -53,6 +55,9 @@
 -define(POLL_INTERVAL, 25).
 -define(SETTINGS_RECV_MS, 1000).
 -define(STREAM_TAIL_MS, 200).
+-define(H2_PREFACE, <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>).
+
+-type h2_sock() :: ssl:sslsocket() | gen_tcp:socket().
 
 -type h2_frame() ::
     {data, non_neg_integer(), binary(), fin | nofin}
@@ -63,7 +68,7 @@
     | {window_update, non_neg_integer(), non_neg_integer()}
     | {other, non_neg_integer(), non_neg_integer(), binary()}.
 
--export_type([h2_frame/0]).
+-export_type([h2_frame/0, h2_sock/0]).
 
 %%%-----------------------------------------------------------------------------
 %%% API
@@ -152,6 +157,21 @@ h2_start_server(Handler, Extra) ->
     ),
     {Pid, Port}.
 
+-doc "Start an HTTP/2-only cleartext listener (h2c with prior knowledge) on a free port.".
+-spec h2c_start_server(module(), nhttp:opts()) -> {pid(), inet:port_number()}.
+h2c_start_server(Handler, Extra) ->
+    {ok, Pid, Port} = start(
+        maps:merge(
+            #{
+                handler => Handler,
+                versions => [http2],
+                timeouts => #{idle => ?H2_IDLE_TIMEOUT}
+            },
+            Extra
+        )
+    ),
+    {Pid, Port}.
+
 -spec conn_pids(pid()) -> [pid()].
 conn_pids(ListenerPid) ->
     lists:append([conns_in(TSup) || TSup <- transport_sups(ListenerPid)]).
@@ -205,6 +225,15 @@ h2_connect(Port) ->
     ok = ssl:send(Sock, <<0, 0, 0, 4, 1, 0, 0, 0, 0>>),
     {ok, Sock}.
 
+-doc "Open a cleartext HTTP/2 connection with prior knowledge and finish the SETTINGS exchange.".
+-spec h2c_connect(inet:port_number()) -> {ok, gen_tcp:socket()}.
+h2c_connect(Port) ->
+    {ok, Sock} = gen_tcp:connect("127.0.0.1", Port, [binary, {active, false}], 5000),
+    ok = gen_tcp:send(Sock, [?H2_PREFACE, <<0, 0, 0, 4, 0, 0, 0, 0, 0>>]),
+    _ = gen_tcp:recv(Sock, 0, 2000),
+    ok = gen_tcp:send(Sock, <<0, 0, 0, 4, 1, 0, 0, 0, 0>>),
+    {ok, Sock}.
+
 -doc """
 Open a connection and return the parameters of the SETTINGS frame the
 server sends in its preface, as `{Identifier, Value}` pairs.
@@ -216,36 +245,36 @@ h2_server_settings(Port) ->
     ok = ssl:close(Sock),
     [{Id, Value} || {settings, 0, Payload} <- Frames, <<Id:16, Value:32>> <= Payload].
 
--spec h2_send_request(ssl:sslsocket(), non_neg_integer(), binary()) -> ok.
+-spec h2_send_request(h2_sock(), non_neg_integer(), binary()) -> ok.
 h2_send_request(Sock, StreamId, Path) ->
-    Header = h2_header_block(Path),
+    Header = h2_header_block(Sock, Path),
     Frame = <<(byte_size(Header)):24, 1, 5, 0:1, StreamId:31, Header/binary>>,
-    ssl:send(Sock, Frame).
+    sock_send(Sock, Frame).
 
--spec h2_open_stream(ssl:sslsocket(), non_neg_integer(), binary()) -> ok.
+-spec h2_open_stream(h2_sock(), non_neg_integer(), binary()) -> ok.
 h2_open_stream(Sock, StreamId, Path) ->
-    Header = h2_header_block(Path),
+    Header = h2_header_block(Sock, Path),
     Frame = <<(byte_size(Header)):24, 1, 4, 0:1, StreamId:31, Header/binary>>,
-    ssl:send(Sock, Frame).
+    sock_send(Sock, Frame).
 
--spec h2_send_raw(ssl:sslsocket(), iodata()) -> ok.
+-spec h2_send_raw(h2_sock(), iodata()) -> ok.
 h2_send_raw(Sock, Bytes) ->
-    ssl:send(Sock, Bytes).
+    sock_send(Sock, Bytes).
 
--spec h2_send_rst_stream(ssl:sslsocket(), non_neg_integer(), non_neg_integer()) -> ok.
+-spec h2_send_rst_stream(h2_sock(), non_neg_integer(), non_neg_integer()) -> ok.
 h2_send_rst_stream(Sock, StreamId, ErrorCode) ->
-    ssl:send(Sock, <<4:24, 3, 0, 0:1, StreamId:31, ErrorCode:32>>).
+    sock_send(Sock, <<4:24, 3, 0, 0:1, StreamId:31, ErrorCode:32>>).
 
--spec h2_send_settings(ssl:sslsocket(), [{non_neg_integer(), non_neg_integer()}]) -> ok.
+-spec h2_send_settings(h2_sock(), [{non_neg_integer(), non_neg_integer()}]) -> ok.
 h2_send_settings(Sock, Settings) ->
     Payload = <<<<Id:16, Value:32>> || {Id, Value} <- Settings>>,
-    ssl:send(Sock, <<(byte_size(Payload)):24, 4, 0, 0:1, 0:31, Payload/binary>>).
+    sock_send(Sock, <<(byte_size(Payload)):24, 4, 0, 0:1, 0:31, Payload/binary>>).
 
--spec h2_send_window_update(ssl:sslsocket(), non_neg_integer(), non_neg_integer()) -> ok.
+-spec h2_send_window_update(h2_sock(), non_neg_integer(), non_neg_integer()) -> ok.
 h2_send_window_update(Sock, StreamId, Increment) ->
-    ssl:send(Sock, <<4:24, 8, 0, 0:1, StreamId:31, 0:1, Increment:31>>).
+    sock_send(Sock, <<4:24, 8, 0, 0:1, StreamId:31, 0:1, Increment:31>>).
 
--spec h2_recv(ssl:sslsocket(), timeout()) -> [h2_frame()].
+-spec h2_recv(h2_sock(), timeout()) -> [h2_frame()].
 h2_recv(Sock, Timeout) ->
     h2_recv(Sock, Timeout, <<>>, []).
 
@@ -253,7 +282,7 @@ h2_recv(Sock, Timeout) ->
 Receive frames until the stream ends (END_STREAM or RST_STREAM), then
 drain the socket for a short tail so frames sent right after are seen.
 """.
--spec h2_recv_stream(ssl:sslsocket(), non_neg_integer(), timeout()) -> [h2_frame()].
+-spec h2_recv_stream(h2_sock(), non_neg_integer(), timeout()) -> [h2_frame()].
 h2_recv_stream(Sock, StreamId, Timeout) ->
     Frames = recv_stream_until_done(Sock, StreamId, Timeout, <<>>, []),
     Frames ++ recv_stream_tail(Sock, <<>>, []).
@@ -289,7 +318,7 @@ h2_stream_done(Frames, StreamId) ->
         Frames
     ).
 
--spec h2_send_data(ssl:sslsocket(), non_neg_integer(), binary(), boolean()) ->
+-spec h2_send_data(h2_sock(), non_neg_integer(), binary(), boolean()) ->
     ok | {error, term()}.
 h2_send_data(Sock, StreamId, Data, EndStream) ->
     Flags =
@@ -298,17 +327,17 @@ h2_send_data(Sock, StreamId, Data, EndStream) ->
             false -> 16#00
         end,
     Frame = <<(byte_size(Data)):24, 0, Flags, 0:1, StreamId:31, Data/binary>>,
-    ssl:send(Sock, Frame).
+    sock_send(Sock, Frame).
 
 -doc "Send a POST HEADERS frame with `content-length` set to `Length`.".
 -spec h2_send_headers(
-    ssl:sslsocket(), non_neg_integer(), binary(), non_neg_integer(), boolean()
+    h2_sock(), non_neg_integer(), binary(), non_neg_integer(), boolean()
 ) -> ok | {error, term()}.
 h2_send_headers(Sock, StreamId, Path, Length, EndStream) ->
     {ok, Enc} = nhttp_hpack:new(),
     Headers = [
         {<<":method">>, <<"POST">>},
-        {<<":scheme">>, <<"https">>},
+        {<<":scheme">>, scheme(Sock)},
         {<<":authority">>, <<"localhost">>},
         {<<":path">>, Path},
         {<<"content-length">>, integer_to_binary(Length)}
@@ -321,9 +350,9 @@ h2_send_headers(Sock, StreamId, Path, Length, EndStream) ->
             false -> 16#04
         end,
     Frame = <<(byte_size(Block)):24, 1, Flags, 0:1, StreamId:31, Block/binary>>,
-    ssl:send(Sock, Frame).
+    sock_send(Sock, Frame).
 
--spec h2_send_post(ssl:sslsocket(), non_neg_integer(), binary(), binary()) ->
+-spec h2_send_post(h2_sock(), non_neg_integer(), binary(), binary()) ->
     ok | {error, term()}.
 h2_send_post(Sock, StreamId, Path, Body) ->
     ok = h2_send_headers(Sock, StreamId, Path, byte_size(Body), false),
@@ -342,18 +371,39 @@ stream_data_size(Frames, StreamId) ->
 %%% INTERNAL
 %%%-----------------------------------------------------------------------------
 
--spec h2_header_block(binary()) -> binary().
-h2_header_block(Path) ->
+-doc "GET with the `:scheme` of the transport, from the HPACK static table.".
+-spec h2_header_block(h2_sock(), binary()) -> binary().
+h2_header_block(Sock, Path) ->
     PathLen = byte_size(Path),
-    <<16#82, 16#87, 16#44, PathLen, Path/binary>>.
+    <<16#82, (scheme_index(Sock)), 16#44, PathLen, Path/binary>>.
 
--spec h2_recv(ssl:sslsocket(), timeout(), binary(), [h2_frame()]) -> [h2_frame()].
+-spec scheme(h2_sock()) -> binary().
+scheme(Sock) when is_port(Sock) -> <<"http">>;
+scheme(_Sock) -> <<"https">>.
+
+-spec scheme_index(h2_sock()) -> byte().
+scheme_index(Sock) when is_port(Sock) -> 16#86;
+scheme_index(_Sock) -> 16#87.
+
+-spec sock_recv(h2_sock(), non_neg_integer(), timeout()) -> {ok, binary()} | {error, term()}.
+sock_recv(Sock, Length, Timeout) when is_port(Sock) ->
+    gen_tcp:recv(Sock, Length, Timeout);
+sock_recv(Sock, Length, Timeout) ->
+    ssl:recv(Sock, Length, Timeout).
+
+-spec sock_send(h2_sock(), iodata()) -> ok | {error, term()}.
+sock_send(Sock, Data) when is_port(Sock) ->
+    gen_tcp:send(Sock, Data);
+sock_send(Sock, Data) ->
+    ssl:send(Sock, Data).
+
+-spec h2_recv(h2_sock(), timeout(), binary(), [h2_frame()]) -> [h2_frame()].
 h2_recv(_Sock, Timeout, Buf, Acc) when Timeout =< 0 ->
     {Frames, _Rest} = decode_h2_frames(Buf),
     Acc ++ Frames;
 h2_recv(Sock, Timeout, Buf, Acc) ->
     T0 = erlang:monotonic_time(millisecond),
-    case ssl:recv(Sock, 0, Timeout) of
+    case sock_recv(Sock, 0, Timeout) of
         {ok, Data} ->
             {Frames, Rest} = decode_h2_frames(<<Buf/binary, Data/binary>>),
             Elapsed = erlang:monotonic_time(millisecond) - T0,
@@ -401,7 +451,7 @@ h2_connect_preface(Port) ->
         ],
         5000
     ),
-    ok = ssl:send(Sock, <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>),
+    ok = ssl:send(Sock, ?H2_PREFACE),
     ok = ssl:send(Sock, <<0, 0, 0, 4, 0, 0, 0, 0, 0>>),
     {ok, Sock}.
 
@@ -410,14 +460,14 @@ h2_fin(Flags) when Flags band 1 =:= 1 -> fin;
 h2_fin(_Flags) -> nofin.
 
 -spec recv_stream_until_done(
-    ssl:sslsocket(), non_neg_integer(), timeout(), binary(), [h2_frame()]
+    h2_sock(), non_neg_integer(), timeout(), binary(), [h2_frame()]
 ) -> [h2_frame()].
 recv_stream_until_done(Sock, StreamId, Timeout, Buf, Acc) ->
     case h2_stream_done(Acc, StreamId) of
         true ->
             Acc;
         false ->
-            case ssl:recv(Sock, 0, Timeout) of
+            case sock_recv(Sock, 0, Timeout) of
                 {ok, Data} ->
                     {Frames, Rest} = decode_h2_frames(<<Buf/binary, Data/binary>>),
                     recv_stream_until_done(Sock, StreamId, Timeout, Rest, Acc ++ Frames);
@@ -426,9 +476,9 @@ recv_stream_until_done(Sock, StreamId, Timeout, Buf, Acc) ->
             end
     end.
 
--spec recv_stream_tail(ssl:sslsocket(), binary(), [h2_frame()]) -> [h2_frame()].
+-spec recv_stream_tail(h2_sock(), binary(), [h2_frame()]) -> [h2_frame()].
 recv_stream_tail(Sock, Buf, Acc) ->
-    case ssl:recv(Sock, 0, ?STREAM_TAIL_MS) of
+    case sock_recv(Sock, 0, ?STREAM_TAIL_MS) of
         {ok, Data} ->
             {Frames, Rest} = decode_h2_frames(<<Buf/binary, Data/binary>>),
             recv_stream_tail(Sock, Rest, Acc ++ Frames);
