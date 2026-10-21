@@ -420,11 +420,7 @@ emit_handler_exception(ReqSpan, Class, Reason) ->
 %%%-----------------------------------------------------------------------------
 -spec conn_attrs(#state{}) -> nhttp_conn_otel:conn_attrs().
 conn_attrs(#state{transport = Transport, family = Family}) ->
-    #{
-        transport => Transport,
-        version => family_to_version(Family),
-        scheme => nhttp_lib:encode_scheme(transport_to_scheme(Transport))
-    }.
+    #{transport => Transport, version => family_to_version(Family)}.
 
 -spec emit_connection_start(#state{}) -> #state{}.
 emit_connection_start(#state{otel_config = OtelConfig, peer = Peer} = State) ->
@@ -439,9 +435,10 @@ emit_connection_stop(#state{conn_span = ConnSpan, requests_count = RequestsCount
 -spec emit_request_start(#state{}, nhttp_lib:stream_id(), nhttp_lib:request()) ->
     {nhttp_otel:span_ctx(), integer()}.
 emit_request_start(
-    #state{otel_config = OtelConfig, conn_span = ConnSpan} = State, StreamId, Request
+    #state{otel_config = OtelConfig, conn_span = ConnSpan, transport = Transport}, StreamId, Request
 ) ->
-    nhttp_conn_otel:request_start(OtelConfig, ConnSpan, StreamId, Request, conn_attrs(State)).
+    Scheme = transport_to_scheme(Transport),
+    nhttp_conn_otel:request_start(OtelConfig, ConnSpan, StreamId, Request, Scheme).
 
 -spec emit_request_stop(#state{}, nhttp_lib:status(), {nhttp_otel:span_ctx(), integer()}) ->
     ok.
@@ -514,10 +511,11 @@ family_if_allowed(Family, Protocol, AllowedFamilies) ->
         false -> {error, {unsupported_alpn, Protocol}}
     end.
 
--spec h1_state_from_opts(nhttp:opts()) -> #h1_state{}.
-h1_state_from_opts(Opts) ->
+-spec h1_state_from_opts(nhttp:opts(), nhttp_h1:opts()) -> #h1_state{}.
+h1_state_from_opts(Opts, ParseOpts) ->
     Timeouts = maps:get(timeouts, Opts, #{}),
     #h1_state{
+        parse_opts = ParseOpts,
         body_timeout = maps:get(body, Timeouts, ?DEFAULT_BODY_TIMEOUT),
         request_timeout = request_timeout(Opts),
         body_deadline = maps:get(body_deadline, Timeouts, infinity)
@@ -587,8 +585,13 @@ open_protocol(#state{family = http2, socket = Socket, peer = Peer, opts = Opts} 
             }
         }}
     end;
-open_protocol(#state{family = http1, opts = Opts} = State) ->
-    {ok, State#state{protocol_state = h1_state_from_opts(Opts)}}.
+open_protocol(
+    #state{family = http1, opts = Opts, limits = Limits, transport = Transport, peer = Peer} = State
+) ->
+    ParseOpts = (nhttp_limits:h1_parse_opts(Limits))#{
+        scheme => transport_to_scheme(Transport), peer => Peer
+    },
+    {ok, State#state{protocol_state = h1_state_from_opts(Opts, ParseOpts)}}.
 
 -spec put_h2_initial_window_size(nhttp:opts(), nhttp_h2:settings()) -> nhttp_h2:settings().
 put_h2_initial_window_size(#{h2_initial_window_size := Size}, Settings) ->

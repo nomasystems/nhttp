@@ -60,6 +60,8 @@
     h1_pipeline_close_after/1,
     h1_pipeline_depth_limit/1,
     h1_pipeline_shutdown_mid_batch/1,
+    h1_keepalive_sequential_requests/1,
+    h1_pipeline_pair_then_next/1,
     h1_stream_iterator/1,
     h1_stream_iterator_fin_only/1,
     h1_limit_uri_too_long/1,
@@ -364,7 +366,9 @@ groups() ->
             h1_pipeline_mixed_methods,
             h1_pipeline_close_after,
             h1_pipeline_depth_limit,
-            h1_pipeline_shutdown_mid_batch
+            h1_pipeline_shutdown_mid_batch,
+            h1_keepalive_sequential_requests,
+            h1_pipeline_pair_then_next
         ]},
         {h1_streaming, [sequence], [
             h1_stream_iterator,
@@ -1441,6 +1445,60 @@ h1_pipeline_close_after(_Config) ->
     gen_tcp:close(Sock),
     nhttp:stop(Pid),
     ok.
+
+h1_keepalive_sequential_requests(_Config) ->
+    {ok, Pid} = nhttp:start_link(#{port => 0, handler => ?MODULE, versions => [http1_1]}),
+    {ok, Port} = nhttp:get_port(Pid),
+    {ok, Sock} = gen_tcp:connect("127.0.0.1", Port, [binary, {active, false}]),
+
+    ok = gen_tcp:send(Sock, <<"GET /small HTTP/1.1\r\nHost: localhost\r\n\r\n">>),
+    ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, recv_until_suffix(Sock, <<"tiny">>, <<>>)),
+
+    ok = gen_tcp:send(
+        Sock, <<"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\nabcd">>
+    ),
+    ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, recv_until_suffix(Sock, <<"abcd">>, <<>>)),
+
+    ok = gen_tcp:send(Sock, <<"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n">>),
+    ?assertMatch(
+        <<"HTTP/1.1 200 ", _/binary>>, recv_until_suffix(Sock, <<"Method: GET">>, <<>>)
+    ),
+    ?assertEqual({error, timeout}, gen_tcp:recv(Sock, 0, 100)),
+
+    gen_tcp:close(Sock),
+    nhttp:stop(Pid),
+    ok.
+
+h1_pipeline_pair_then_next(_Config) ->
+    {ok, Pid} = nhttp:start_link(#{port => 0, handler => ?MODULE, versions => [http1_1]}),
+    {ok, Port} = nhttp:get_port(Pid),
+    {ok, Sock} = gen_tcp:connect("127.0.0.1", Port, [binary, {active, false}]),
+
+    ok = gen_tcp:send(
+        Sock,
+        <<"GET /small HTTP/1.1\r\nHost: localhost\r\n\r\nGET / HTTP/1.1\r\nHost: localhost\r\n\r\n">>
+    ),
+    Pair = recv_until_suffix(Sock, <<"Method: GET">>, <<>>),
+    ?assertEqual(2, count_responses(Pair, <<"HTTP/1.1 200 ">>)),
+    {TinyPos, _} = binary:match(Pair, <<"tiny">>),
+    ?assert(TinyPos < byte_size(Pair) - byte_size(<<"Method: GET">>)),
+
+    ok = gen_tcp:send(Sock, <<"GET /small HTTP/1.1\r\nHost: localhost\r\n\r\n">>),
+    ?assertMatch(<<"HTTP/1.1 200 ", _/binary>>, recv_until_suffix(Sock, <<"tiny">>, <<>>)),
+    ?assertEqual({error, timeout}, gen_tcp:recv(Sock, 0, 100)),
+
+    gen_tcp:close(Sock),
+    nhttp:stop(Pid),
+    ok.
+
+recv_until_suffix(Sock, Suffix, Acc) ->
+    case binary:longest_common_suffix([Acc, Suffix]) =:= byte_size(Suffix) of
+        true ->
+            Acc;
+        false ->
+            {ok, Data} = gen_tcp:recv(Sock, 0, 5000),
+            recv_until_suffix(Sock, Suffix, <<Acc/binary, Data/binary>>)
+    end.
 
 recv_all(Sock, Acc, Timeout) ->
     case gen_tcp:recv(Sock, 0, Timeout) of

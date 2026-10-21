@@ -30,7 +30,9 @@
     body_size_default/1,
     body_size_under_limit/1,
     body_size_over_limit/1,
-    body_size_custom/1
+    body_size_custom/1,
+    first_failure_wins/1,
+    from_opts_resolves_defaults/1
 ]).
 
 %%%-----------------------------------------------------------------------------
@@ -56,7 +58,9 @@ groups() ->
             body_size_default,
             body_size_under_limit,
             body_size_over_limit,
-            body_size_custom
+            body_size_custom,
+            first_failure_wins,
+            from_opts_resolves_defaults
         ]}
     ].
 
@@ -205,3 +209,77 @@ body_size_over_limit(_Config) ->
 body_size_custom(_Config) ->
     ?assertEqual(ok, nhttp_limits:check_body_size(8 * 1024 * 1024, #{})),
     ?assertEqual({error, body_too_large}, nhttp_limits:check_body_size(8 * 1024 * 1024 + 1, #{})).
+
+first_failure_wins(_Config) ->
+    Limits = #{
+        max_uri_length => 4,
+        max_headers => 3,
+        max_header_name_length => 4,
+        max_header_value_length => 4,
+        max_header_size => 20
+    },
+    Cases = [
+        {Path, [kind_header(Kind) || Kind <- Kinds]}
+     || Path <- [<<"/ok">>, <<"/long">>], Kinds <- kind_lists(4)
+    ],
+    lists:foreach(
+        fun({Path, Headers}) ->
+            Req = #{method => get, path => Path, headers => Headers},
+            ?assertEqual(
+                {Path, Headers, expected_result(Path, Headers, Limits)},
+                {Path, Headers, nhttp_limits:validate_request(Req, Limits)}
+            )
+        end,
+        Cases
+    ).
+
+from_opts_resolves_defaults(_Config) ->
+    Defaults = nhttp_limits:default_limits(),
+    ?assertEqual(Defaults, nhttp_limits:from_opts(#{port => 0})),
+    ?assertEqual(
+        Defaults#{max_headers => 5, max_body_size => 10},
+        nhttp_limits:from_opts(#{port => 0, max_headers => 5, max_body_size => 10})
+    ).
+
+%%%-----------------------------------------------------------------------------
+%%% HELPERS
+%%%-----------------------------------------------------------------------------
+
+expected_result(Path, Headers, Limits) ->
+    #{
+        max_uri_length := MaxUri,
+        max_headers := MaxHeaders,
+        max_header_name_length := MaxName,
+        max_header_value_length := MaxValue,
+        max_header_size := MaxSize
+    } = Limits,
+    Failures = [
+        {byte_size(Path) > MaxUri, uri_too_long},
+        {length(Headers) > MaxHeaders, too_many_headers},
+        {lists:any(fun({N, _}) -> byte_size(N) > MaxName end, Headers), header_name_too_long},
+        {lists:any(fun({_, V}) -> byte_size(V) > MaxValue end, Headers), header_value_too_long},
+        {
+            lists:sum([byte_size(N) + byte_size(V) + 4 || {N, V} <- Headers]) > MaxSize,
+            header_too_large
+        }
+    ],
+    case [Reason || {true, Reason} <- Failures] of
+        [] -> ok;
+        [First | _] -> {error, First}
+    end.
+
+kind_header(ok) -> {<<"ab">>, <<"cd">>};
+kind_header(long_name) -> {<<"abcde">>, <<"cd">>};
+kind_header(long_value) -> {<<"ab">>, <<"cdefg">>};
+kind_header(long_both) -> {<<"abcde">>, <<"cdefg">>}.
+
+kind_lists(0) ->
+    [[]];
+kind_lists(N) ->
+    [
+        []
+        | [
+            [Kind | Rest]
+         || Kind <- [ok, long_name, long_value, long_both], Rest <- kind_lists(N - 1)
+        ]
+    ].

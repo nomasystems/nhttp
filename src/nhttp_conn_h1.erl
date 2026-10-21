@@ -24,6 +24,7 @@
 %%%-----------------------------------------------------------------------------
 -export([
     add_chunked_header/1,
+    await_h1_request/3,
     h1_loop/3,
     process_h1_pipeline/4,
     send_h1_chunk/2,
@@ -255,16 +256,11 @@ process_h1_pipeline(
     Parent,
     Debug,
     #state{
-        protocol_state = #h1_state{buffer = Buffer} = H1, opts = Opts
+        protocol_state = #h1_state{buffer = Buffer, parse_opts = ParseOpts} = H1, opts = Opts
     } = State,
     PipelineDepth
 ) ->
     MaxPipelineDepth = maps:get(max_pipeline_depth, Opts, ?DEFAULT_MAX_PIPELINE_DEPTH),
-    Limits = State#state.limits,
-    ParseOpts = (nhttp_limits:h1_parse_opts(Limits))#{
-        scheme => nhttp_conn:transport_to_scheme(State#state.transport),
-        peer => State#state.peer
-    },
     case nhttp_h1:parse_request_headers(Buffer, ParseOpts) of
         {ok, Request, BodyStream, Consumed} ->
             Rest = nhttp_h1:split_at(Buffer, Consumed),
@@ -522,6 +518,18 @@ await_h1_body_data(
         deliver_h1_body_abort(Parent, Debug, State, Request, BodyState, ReqSpan, Reason)
     end.
 
+-doc """
+Wait for the next request head once the buffer is empty: send what is
+queued, arm the socket and block in `h1_loop/3`.
+""".
+-spec await_h1_request(pid(), [sys:debug_option()], #state{}) -> no_return().
+await_h1_request(Parent, Debug, State0) ->
+    State = flush_h1_out(State0),
+    case nhttp_conn:activate(State) of
+        ok -> h1_loop(Parent, Debug, State);
+        {stop, Reason} -> nhttp_conn:stop(Reason, State)
+    end.
+
 -spec clear_body_stream_or_close(#state{}) -> #state{}.
 clear_body_stream_or_close(#state{protocol_state = #h1_state{body_stream = undefined}} = State) ->
     State;
@@ -640,6 +648,14 @@ finalize_h1_body_terminal(#state{protocol_state = #h1_state{} = H1} = State, {da
 -spec finish_h1_request(
     pid(), [sys:debug_option()], #state{}, non_neg_integer(), pos_integer()
 ) -> no_return().
+finish_h1_request(
+    Parent,
+    Debug,
+    #state{protocol_state = #h1_state{keep_alive = true, buffer = <<>>}} = State,
+    _PipelineDepth,
+    _MaxPipelineDepth
+) ->
+    await_h1_request(Parent, Debug, State);
 finish_h1_request(
     Parent,
     Debug,

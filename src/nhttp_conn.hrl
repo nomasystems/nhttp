@@ -65,6 +65,7 @@
 
 -record(h1_state, {
     buffer = <<>> :: binary(),
+    parse_opts :: nhttp_h1:opts(),
     body_stream :: nhttp_h1:body_stream() | undefined,
     ws_decoder :: nhttp_ws:ws_decoder() | undefined,
     h1_ws :: undefined | #ws_state{},

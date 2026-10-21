@@ -929,7 +929,7 @@ handle_h3_events(State, [Event | Rest]) ->
 %%%-----------------------------------------------------------------------------
 -spec conn_attrs() -> nhttp_conn_otel:conn_attrs().
 conn_attrs() ->
-    #{transport => udp, version => http3, scheme => <<"https">>}.
+    #{transport => udp, version => http3}.
 
 -spec emit_connection_start(#state{}) -> #state{}.
 emit_connection_start(#state{otel_config = OtelConfig, peer = Peer} = State) ->
@@ -946,7 +946,7 @@ emit_connection_stop(#state{conn_span = ConnSpan, requests_count = RequestsCount
 emit_request_start(
     #state{otel_config = OtelConfig, conn_span = ConnSpan}, StreamId, Request
 ) ->
-    nhttp_conn_otel:request_start(OtelConfig, ConnSpan, StreamId, Request, conn_attrs()).
+    nhttp_conn_otel:request_start(OtelConfig, ConnSpan, StreamId, Request, https).
 
 -spec emit_request_stop(#state{}, nhttp_lib:status(), {nhttp_otel:span_ctx(), integer()}) ->
     ok.

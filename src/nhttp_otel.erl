@@ -59,7 +59,8 @@ in-flight requests across all connections.
 %% METRICS
 %%%-----------------------------------------------------------------------------
 -export([
-    record_request_duration/3
+    record_request_duration/3,
+    request_start_time/1
 ]).
 
 %%%-----------------------------------------------------------------------------
@@ -254,7 +255,7 @@ request_span_error(SpanCtx, Kind, Reason) ->
 -spec request_span_start(config(), span_ctx(), req_attrs()) ->
     {span_ctx(), integer()}.
 request_span_start(Config, ParentSpanCtx, Attrs) ->
-    StartTime = erlang:monotonic_time(),
+    StartTime = request_start_time(Config),
     case traces_enabled(Config) of
         false ->
             {undefined, StartTime};
@@ -306,6 +307,14 @@ record_request_duration(Config, StartTime, Attrs) ->
             Meter = opentelemetry_experimental:get_meter(?METER_NAME),
             MetricAttrs = request_duration_attributes(Attrs),
             otel_record_histogram(Ctx, Meter, ?METRIC_REQUEST_DURATION, Duration, MetricAttrs)
+    end.
+
+-doc false.
+-spec request_start_time(config()) -> integer().
+request_start_time(Config) ->
+    case metrics_enabled(Config) of
+        true -> erlang:monotonic_time();
+        false -> 0
     end.
 
 %%%-----------------------------------------------------------------------------
