@@ -45,7 +45,6 @@ config(Enabled, Level, Threshold, MimeTypes) ->
 -doc """
 Compress a response body with the coding that the request `Accept-Encoding`
 selects, and add `vary: accept-encoding` when the selection depends on it.
-
 The response is returned unchanged when compression is disabled, the status
 has no content or holds a range (1xx, 204, 206, 304), the body is empty,
 smaller than the threshold or of a type outside the compressible list, the

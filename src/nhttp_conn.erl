@@ -110,6 +110,11 @@ drain(Pid) ->
     Pid ! shutdown,
     ok.
 
+-doc "The spawn options of the processes that run handler code.".
+-spec spawn_opts(nhttp:opts()) -> [nhttp:conn_spawn_opt()].
+spawn_opts(Opts) ->
+    maps:get(conn_spawn_opts, Opts, ?DEFAULT_CONN_SPAWN_OPTS).
+
 -doc """
 Start a connection under `nhttp_conn_sup` without waiting for `init/1`.
 A failed handler `init/1` ends the process with `{shutdown, _}`.
@@ -118,11 +123,6 @@ A failed handler `init/1` ends the process with `{shutdown, _}`.
 start_link_supervised(Name, Socket, Opts, Ctx) ->
     Args = [{Name, Socket, Opts, Ctx, self()}],
     {ok, proc_lib:spawn_opt(?MODULE, init, Args, [link | spawn_opts(Opts)])}.
-
--doc "The spawn options of the processes that run handler code.".
--spec spawn_opts(nhttp:opts()) -> [nhttp:conn_spawn_opt()].
-spawn_opts(Opts) ->
-    maps:get(conn_spawn_opts, Opts, ?DEFAULT_CONN_SPAWN_OPTS).
 
 %%%-----------------------------------------------------------------------------
 %% PROC_LIB CALLBACKS
