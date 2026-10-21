@@ -96,9 +96,15 @@ client sends.
 }).
 ```
 
+`versions => [http1_1, http2]` without `tls` serves both on one port. Each
+connection gets HTTP/2 when its first 14 bytes are `PRI * HTTP/2.0`, the
+start of the connection preface (RFC 9113 §3.4), and HTTP/1.1 from the
+first byte that differs. A connection that sends no deciding bytes
+before the `request` timeout, or the `idle` timeout when it is shorter,
+is closed without a response.
+
 Use cleartext HTTP/2 only behind a TLS terminator or inside a trusted
-network. A cleartext listener serves one protocol: the first of
-`http1_1` and `http2` in `versions`. `http3` always needs `tls`.
+network. `http3` always needs `tls`.
 
 ## Mixed h1/h2/h3 listeners
 
@@ -322,7 +328,8 @@ Connection timeouts (milliseconds, or `infinity`).
   Default 60000.
 - `request`: absolute deadline from the first byte of a request head to
   a complete head (HTTP/1.1). Caps slowloris drip regardless of `idle`.
-  Default 30000.
+  On a cleartext listener with `http1_1` and `http2`, also the deadline
+  from the accept to the bytes that choose the protocol. Default 30000.
 - `body`: per-chunk idle while receiving a request body; re-arms per
   chunk. Default 60000.
 - `body_deadline`: absolute deadline from head-complete to a fully

@@ -52,7 +52,7 @@ responses, WebSocket, SSE, CORS, and chunked uploads.
 
 ### HTTP/2 in cleartext (h2c)
 
-Without `tls`, `versions => [http2]` serves HTTP/2 with prior knowledge (RFC 9113 §3.3), for example to `curl --http2-prior-knowledge`. Use it only behind a TLS terminator or inside a trusted network.
+Without `tls`, `versions => [http2]` serves HTTP/2 with prior knowledge (RFC 9113 §3.3), for example to `curl --http2-prior-knowledge`. `versions => [http1_1, http2]` without `tls` serves both on one port and picks the protocol of each connection from its first bytes. Use cleartext HTTP/2 only behind a TLS terminator or inside a trusted network.
 
 ```erlang
 {ok, Pid} = nhttp:start_link(my_server, #{

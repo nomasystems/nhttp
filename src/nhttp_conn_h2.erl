@@ -15,7 +15,8 @@
 %% API EXPORTS
 %%%-----------------------------------------------------------------------------
 -export([
-    loop/3
+    loop/3,
+    loop/4
 ]).
 
 %%%-----------------------------------------------------------------------------
@@ -81,6 +82,14 @@ protocol classification picks `http2`.
 -spec loop(pid(), [sys:debug_option()], #state{}) -> no_return().
 loop(Parent, Debug, State) ->
     h2_loop(Parent, Debug, State).
+
+-doc """
+Entry point with the first bytes of the connection, which `nhttp_conn`
+read to classify a cleartext connection. The socket is passive.
+""".
+-spec loop(pid(), [sys:debug_option()], #state{}, binary()) -> no_return().
+loop(Parent, Debug, State, Data) ->
+    handle_h2_data(Parent, Debug, State, Data).
 
 %%%-----------------------------------------------------------------------------
 %% PROC_LIB / SYS CALLBACKS
