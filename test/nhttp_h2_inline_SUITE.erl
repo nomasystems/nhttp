@@ -69,6 +69,7 @@ handle_request(#{path := <<"/accept">>}, State) ->
 handle_request(#{path := <<"/echo">>}, State) ->
     {accept_body, [], State};
 handle_request(#{path := <<"/gc_body">>}, #{test := TestPid} = State) ->
+    TestPid ! {handled_in, self()},
     TestPid ! {fullsweep_after, request_worker, fullsweep_after()},
     {accept_body, [], State};
 handle_request(#{path := <<"/gc_stream">>}, #{test := TestPid} = State) ->
@@ -201,9 +202,14 @@ worker_option_runs_outside_connection_process(Config) ->
 
 conn_spawn_opts_apply_to_workers(Config) ->
     Sock = ?config(sock, Config),
+    [ConnPid] = nhttp_test_helpers:wait_for_conns(?config(server, Config), 1, ?RECV_TIMEOUT),
     ok = nhttp_test_helpers:h2_send_post(Sock, 1, <<"/gc_body">>, <<"hello">>),
     Frames1 = nhttp_test_helpers:h2_recv_stream(Sock, 1, ?RECV_TIMEOUT),
     ?assertEqual(<<"FIN:hello">>, nhttp_test_helpers:h2_response_body(Frames1, 1)),
+    receive
+        {handled_in, Pid} -> ?assertNotEqual(ConnPid, Pid)
+    after ?RECV_TIMEOUT -> ct:fail(handler_not_called)
+    end,
     ok = nhttp_test_helpers:h2_send_request(Sock, 3, <<"/gc_stream">>),
     Frames3 = nhttp_test_helpers:h2_recv_stream(Sock, 3, ?RECV_TIMEOUT),
     ?assertEqual(<<"a">>, nhttp_test_helpers:h2_response_body(Frames3, 3)),
