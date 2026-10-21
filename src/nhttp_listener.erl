@@ -726,8 +726,7 @@ validate_versions(Opts) ->
 
 -spec validate_versions_tls([nhttp:version()], nhttp:opts()) -> ok | nhttp_error:t().
 validate_versions_tls(Versions, Opts) ->
-    NeedsTls = lists:member(http2, Versions) orelse lists:member(http3, Versions),
-    case {NeedsTls, maps:find(tls, Opts)} of
+    case {lists:member(http3, Versions), maps:find(tls, Opts)} of
         {false, error} ->
             ok;
         {true, error} ->

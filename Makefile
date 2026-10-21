@@ -1,5 +1,5 @@
 .PHONY: all compile clean check test cover doc binopt certs compliance \
-        h1-compliance h2-compliance h3-compliance ws-compliance \
+        h1-compliance h2-compliance h2c-compliance h3-compliance ws-compliance \
         h1spec-image h2spec-image h3spec-image autobahn-image help
 
 # Tools
@@ -125,6 +125,15 @@ h2-compliance: certs h2spec-image
 			-v $(CURDIR)/$(COMPLIANCE_REPORTS):/reports $(H2SPEC_IMAGE) \
 			-t -k -h $(COMPLIANCE_TARGET) -p $$PORT -o 5 -j /reports/h2spec.xml'
 
+h2c-compliance: h2spec-image
+	@echo "=== HTTP/2 cleartext (h2c, prior knowledge) Compliance Tests with h2spec (Docker) ==="
+	@$(REBAR3) as test compile
+	@mkdir -p $(COMPLIANCE_REPORTS)
+	@$(COMPLIANCE_RUN) nhttp_compliance:start_h2c \
+		'docker run --rm $(DOCKER_NET_ARGS) $(DOCKER_USER) \
+			-v $(CURDIR)/$(COMPLIANCE_REPORTS):/reports $(H2SPEC_IMAGE) \
+			-k -h $(COMPLIANCE_TARGET) -p $$PORT -o 5 -j /reports/h2spec-h2c.xml'
+
 h2spec-image:
 	@command -v docker >/dev/null 2>&1 || { \
 		echo "Error: docker not found in PATH. Install Docker to run compliance tests."; \
@@ -176,7 +185,7 @@ autobahn-image:
 		docker build -t $(AUTOBAHN_IMAGE) -f $(AUTOBAHN_DOCKERFILE) priv; \
 	}
 
-compliance: h1-compliance h2-compliance h3-compliance ws-compliance
+compliance: h1-compliance h2-compliance h2c-compliance h3-compliance ws-compliance
 
 #==============================================================================
 # Help
@@ -205,11 +214,12 @@ help:
 	@echo "    make compliance      - Run all RFC compliance tests (h1spec + h2spec + h3spec + Autobahn)"
 	@echo "    make h1-compliance   - Run HTTP/1.1 tests (Docker: $(H1SPEC_IMAGE))"
 	@echo "    make h2-compliance   - Run HTTP/2 RFC 9113 tests (Docker: $(H2SPEC_IMAGE))"
+	@echo "    make h2c-compliance  - Run HTTP/2 RFC 9113 tests in cleartext (Docker: $(H2SPEC_IMAGE))"
 	@echo "    make h3-compliance   - Run HTTP/3 tests (Docker: $(H3SPEC_IMAGE))"
 	@echo "    make ws-compliance   - Run WebSocket RFC 6455 tests (Docker: $(AUTOBAHN_IMAGE))"
 	@echo ""
 	@echo "  Each target exits with the status of its runner. Reports land in"
-	@echo "  $(COMPLIANCE_REPORTS)/: h2spec.xml (JUnit) and autobahn/index.html."
+	@echo "  $(COMPLIANCE_REPORTS)/: h2spec.xml and h2spec-h2c.xml (JUnit), and autobahn/index.html."
 	@echo "  make -k compliance runs every suite before it reports a failure."
 	@echo ""
 	@echo "  Requirement: Docker daemon running. On macOS/Windows, Docker Desktop."

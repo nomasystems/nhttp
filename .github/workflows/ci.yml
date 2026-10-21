@@ -85,4 +85,4 @@ jobs:
       - uses: test-summary/action@v2
         if: always()
         with:
-          paths: 'compliance-reports/h2spec.xml'
+          paths: 'compliance-reports/h2spec*.xml'

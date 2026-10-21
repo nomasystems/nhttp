@@ -107,7 +107,7 @@
     alpn_h2_not_allowed/1,
     alpn_no_alpn_fallback/1,
     alpn_http1_0/1,
-    alpn_h2_first_fallback/1,
+    cleartext_h2_first_serves_h2c/1,
     h1_http1_0_no_keepalive/1,
     h1_http1_0_explicit_keepalive/1,
     h1_compression_empty_body/1,
@@ -433,7 +433,7 @@ groups() ->
             alpn_h2_not_allowed,
             alpn_no_alpn_fallback,
             alpn_http1_0,
-            alpn_h2_first_fallback
+            cleartext_h2_first_serves_h2c
         ]},
         {h1_http1_0, [sequence], [
             h1_http1_0_no_keepalive,
@@ -3322,17 +3322,19 @@ conn_parent_exit(_Config) ->
 %%% ADDITIONAL PROTOCOL DETECTION TESTS
 %%%-----------------------------------------------------------------------------
 
-alpn_h2_first_fallback(_Config) ->
-    case
-        nhttp:start_link(#{
-            port => 0,
-            handler => ?MODULE,
-            versions => [http2, http1_1]
-        })
-    of
-        {error, _} -> ok;
-        {ok, Pid} -> ct:fail({unexpected_start, Pid})
-    end.
+cleartext_h2_first_serves_h2c(_Config) ->
+    {ok, Pid} = nhttp:start_link(#{
+        port => 0,
+        handler => ?MODULE,
+        versions => [http2, http1_1]
+    }),
+    {ok, Port} = nhttp:get_port(Pid),
+    {ok, Sock} = nhttp_test_helpers:h2c_connect(Port),
+    ok = nhttp_test_helpers:h2_send_request(Sock, 1, <<"/">>),
+    Frames = nhttp_test_helpers:h2_recv_stream(Sock, 1, 5000),
+    ?assertEqual(<<"200">>, nhttp_test_helpers:h2_response_status(Frames)),
+    ok = gen_tcp:close(Sock),
+    ok = nhttp:stop(Pid).
 
 %%%-----------------------------------------------------------------------------
 %%% HIBERNATION TESTS
