@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `conn_spawn_opts => [nhttp:conn_spawn_opt()]`: spawn options for the connection processes of HTTP/1.1, HTTP/2 and HTTP/3 and for the stream workers, for example `{fullsweep_after, 0}` or `{min_heap_size, Words}`. The listener rejects `link`, `monitor` and a value that `erlang:spawn_opt/4` does not accept. Default `[]`
+- Response compression adds `vary: accept-encoding` to every response whose coding depends on `Accept-Encoding`. A `vary` field that the handler set is kept
+
+### Fixed
+
+- Response compression does not compress a body that the handler already encoded with `content-encoding`. Before, a `br` body sent to a client that accepts gzip went out with two codings in the wrong order
+- Response compression does not change a response whose `cache-control` holds `no-transform`, or a 1xx, 204, 206 or 304 response
 
 ## [1.3.0] - 2026-10-19
 
