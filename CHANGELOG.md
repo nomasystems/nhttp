@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - HTTP/2 in cleartext with prior knowledge (h2c, RFC 9113 §3.3): `versions => [http2]` without `tls` starts. Only `http3` needs `tls`
 - HTTP/1.1 and h2c on one cleartext port: `versions => [http1_1, http2]` without `tls` picks the protocol of each connection from its first bytes, HTTP/2 when they are the connection preface. A connection that sends no deciding bytes before the `request` timeout is closed
 
+### Changed
+
+- `nhttp_limits:from_opts/1` returns every limit. A limit that `Opts` does not set has the value from `default_limits/0`
+- An HTTP/1.1 connection builds its parser options and limits once, parses each request head once, and checks the header limits in one pass. A keep-alive `GET` costs about 2% less CPU
+- With traces off, a request on any protocol builds no span attributes. With metrics also off, it does not read the clock
+
 ### Fixed
 
 - Response compression does not compress a body that the handler already encoded with `content-encoding`. Before, a `br` body sent to a client that accepts gzip went out with two codings in the wrong order

@@ -22,8 +22,7 @@
 
 -type conn_attrs() :: #{
     transport := tcp | ssl | udp,
-    version := nhttp_lib:version(),
-    scheme := binary()
+    version := nhttp_lib:version()
 }.
 
 %%%-----------------------------------------------------------------------------
@@ -66,17 +65,21 @@ connection_stop(ConnSpan, RequestsCount, Reason) ->
     nhttp_otel:span_ctx(),
     nhttp_lib:stream_id(),
     nhttp_lib:request(),
-    conn_attrs()
+    nhttp_lib:scheme()
 ) -> {nhttp_otel:span_ctx(), integer()}.
-request_start(
-    OtelConfig, ConnSpan, StreamId, #{method := Method, path := Path}, #{scheme := Scheme}
-) ->
-    nhttp_otel:request_span_start(OtelConfig, ConnSpan, #{
-        method => nhttp_lib:encode_method(Method),
-        path => Path,
-        scheme => Scheme,
-        stream_id => StreamId
-    }).
+request_start(OtelConfig, ConnSpan, StreamId, Request, Scheme) ->
+    case nhttp_otel:traces_enabled(OtelConfig) of
+        false ->
+            {undefined, nhttp_otel:request_start_time(OtelConfig)};
+        true ->
+            #{method := Method, path := Path} = Request,
+            nhttp_otel:request_span_start(OtelConfig, ConnSpan, #{
+                method => nhttp_lib:encode_method(Method),
+                path => Path,
+                scheme => nhttp_lib:encode_scheme(Scheme),
+                stream_id => StreamId
+            })
+    end.
 
 -spec request_stop(
     nhttp_otel:config(),

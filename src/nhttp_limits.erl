@@ -41,6 +41,8 @@ Configuration options:
     | too_many_headers
     | uri_too_long.
 
+-type header_failure() :: header_name_too_long | header_value_too_long.
+
 -type t() :: #{
     max_header_name_length => pos_integer(),
     max_header_value_length => pos_integer(),
@@ -91,23 +93,26 @@ error_to_status(too_many_headers) -> 431;
 error_to_status(uri_too_long) -> 414.
 
 -doc """
-Extract the request-limit subset from a connection's `nhttp:opts()` map.
-The result is a `t()` ready to pass to `validate_request/2` and
-`check_body_size/2`. Unknown keys are dropped. Missing keys fall back to
-`default_limits/0` at lookup time.
+Extract the request limits from a connection's `nhttp:opts()` map.
+The result holds every key of `default_limits/0`, with the value of `Opts`
+where it sets one. Unknown keys are dropped. The result is ready to pass to
+`validate_request/2` and `check_body_size/2`.
 """.
 -spec from_opts(nhttp:opts()) -> t().
 from_opts(Opts) ->
-    maps:with(
-        [
-            max_header_name_length,
-            max_header_value_length,
-            max_headers,
-            max_header_size,
-            max_uri_length,
-            max_body_size
-        ],
-        Opts
+    maps:merge(
+        default_limits(),
+        maps:with(
+            [
+                max_header_name_length,
+                max_header_value_length,
+                max_headers,
+                max_header_size,
+                max_uri_length,
+                max_body_size
+            ],
+            Opts
+        )
     ).
 
 -doc """
@@ -137,77 +142,75 @@ max_body_size(Limits) ->
 -doc """
 Validate a request against configured limits.
 Returns ok if all limits pass, or `{error, Reason}` for the first failure.
+A limit missing from `Limits` takes its value from `default_limits/0`.
 """.
 -spec validate_request(nhttp_lib:request(), t()) -> ok | {error, limit_error()}.
-validate_request(#{path := Path, headers := Headers}, Limits) ->
-    MergedLimits = maps:merge(default_limits(), Limits),
-    maybe
-        ok ?= validate_uri_length(Path, MergedLimits),
-        ok ?= validate_header_count(Headers, MergedLimits),
-        ok ?= validate_header_names(Headers, MergedLimits),
-        ok ?= validate_header_values(Headers, MergedLimits),
-        ok ?= validate_total_header_size(Headers, MergedLimits)
-    end.
+validate_request(
+    #{path := Path, headers := Headers},
+    #{
+        max_uri_length := MaxUri,
+        max_headers := MaxCount,
+        max_header_name_length := MaxName,
+        max_header_value_length := MaxValue,
+        max_header_size := MaxSize
+    }
+) ->
+    case byte_size(Path) =< MaxUri of
+        true -> validate_headers(Headers, MaxCount, MaxName, MaxValue, MaxSize, 0, 0, ok);
+        false -> {error, uri_too_long}
+    end;
+validate_request(Request, Limits) ->
+    validate_request(Request, maps:merge(default_limits(), Limits)).
 
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS
 %%%-----------------------------------------------------------------------------
--spec validate_header_count([{binary(), binary()}], t()) ->
-    ok | {error, too_many_headers}.
-validate_header_count(Headers, #{max_headers := MaxCount}) ->
-    case length(Headers) =< MaxCount of
-        true -> ok;
-        false -> {error, too_many_headers}
-    end.
+-spec header_failure(ok | header_failure(), boolean(), boolean()) -> ok | header_failure().
+header_failure(header_name_too_long, _NameTooLong, _ValueTooLong) -> header_name_too_long;
+header_failure(_Failure, true, _ValueTooLong) -> header_name_too_long;
+header_failure(ok, false, true) -> header_value_too_long;
+header_failure(Failure, false, _ValueTooLong) -> Failure.
 
--spec validate_header_names([{binary(), binary()}], t()) ->
-    ok | {error, header_name_too_long}.
-validate_header_names(Headers, #{max_header_name_length := MaxLen}) ->
-    validate_header_names_loop(Headers, MaxLen).
-
--spec validate_header_names_loop([{binary(), binary()}], pos_integer()) ->
-    ok | {error, header_name_too_long}.
-validate_header_names_loop([], _MaxLen) ->
+-doc """
+One walk over the headers. The failures keep the order of the checks:
+the count, then any name, then any value, then the total size. The count
+fails as soon as the walk passes it. A name or value failure waits for the
+end of the walk, because a later header can still exceed the count.
+""".
+-spec validate_headers(
+    [{binary(), binary()}],
+    pos_integer(),
+    pos_integer(),
+    pos_integer(),
+    pos_integer(),
+    non_neg_integer(),
+    non_neg_integer(),
+    ok | header_failure()
+) -> ok | {error, too_many_headers | header_failure() | header_too_large}.
+validate_headers([], _MaxCount, _MaxName, _MaxValue, MaxSize, _Count, Size, ok) when
+    Size > MaxSize
+->
+    {error, header_too_large};
+validate_headers([], _MaxCount, _MaxName, _MaxValue, _MaxSize, _Count, _Size, ok) ->
     ok;
-validate_header_names_loop([{Name, _Value} | Rest], MaxLen) ->
-    case byte_size(Name) =< MaxLen of
-        true -> validate_header_names_loop(Rest, MaxLen);
-        false -> {error, header_name_too_long}
-    end.
-
--spec validate_header_values([{binary(), binary()}], t()) ->
-    ok | {error, header_value_too_long}.
-validate_header_values(Headers, #{max_header_value_length := MaxLen}) ->
-    validate_header_values_loop(Headers, MaxLen).
-
--spec validate_header_values_loop([{binary(), binary()}], pos_integer()) ->
-    ok | {error, header_value_too_long}.
-validate_header_values_loop([], _MaxLen) ->
-    ok;
-validate_header_values_loop([{_Name, Value} | Rest], MaxLen) ->
-    case byte_size(Value) =< MaxLen of
-        true -> validate_header_values_loop(Rest, MaxLen);
-        false -> {error, header_value_too_long}
-    end.
-
--spec validate_total_header_size([{binary(), binary()}], t()) ->
-    ok | {error, header_too_large}.
-validate_total_header_size(Headers, #{max_header_size := MaxSize}) ->
-    TotalSize = lists:foldl(
-        fun({Name, Value}, Acc) ->
-            Acc + byte_size(Name) + byte_size(Value) + 4
-        end,
-        0,
-        Headers
-    ),
-    case TotalSize =< MaxSize of
-        true -> ok;
-        false -> {error, header_too_large}
-    end.
-
--spec validate_uri_length(binary(), t()) -> ok | {error, uri_too_long}.
-validate_uri_length(Path, #{max_uri_length := MaxLen}) ->
-    case byte_size(Path) =< MaxLen of
-        true -> ok;
-        false -> {error, uri_too_long}
-    end.
+validate_headers([], _MaxCount, _MaxName, _MaxValue, _MaxSize, _Count, _Size, Failure) ->
+    {error, Failure};
+validate_headers([_ | _], MaxCount, _MaxName, _MaxValue, _MaxSize, Count, _Size, _Failure) when
+    Count >= MaxCount
+->
+    {error, too_many_headers};
+validate_headers(
+    [{Name, Value} | Rest], MaxCount, MaxName, MaxValue, MaxSize, Count, Size, Failure
+) ->
+    NameSize = byte_size(Name),
+    ValueSize = byte_size(Value),
+    validate_headers(
+        Rest,
+        MaxCount,
+        MaxName,
+        MaxValue,
+        MaxSize,
+        Count + 1,
+        Size + NameSize + ValueSize + 4,
+        header_failure(Failure, NameSize > MaxName, ValueSize > MaxValue)
+    ).

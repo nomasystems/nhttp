@@ -35,7 +35,12 @@
     metrics_record_duration_with_body_size/1,
     format_ipv6/1,
     integration_h1_request/1,
-    integration_h1_ssl_request/1
+    integration_h1_ssl_request/1,
+    request_emit_off/1,
+    request_emit_traces_off_metrics_off/1,
+    request_emit_traces_only/1,
+    request_emit_metrics_only/1,
+    request_emit_traces_and_metrics/1
 ]).
 
 -behaviour(nhttp_handler).
@@ -52,7 +57,8 @@ all() ->
         {group, metrics},
         {group, helpers},
         {group, integration},
-        {group, integration_ssl}
+        {group, integration_ssl},
+        {group, request_emit}
     ].
 
 groups() ->
@@ -85,6 +91,13 @@ groups() ->
         ]},
         {integration_ssl, [sequence], [
             integration_h1_ssl_request
+        ]},
+        {request_emit, [sequence], [
+            request_emit_off,
+            request_emit_traces_off_metrics_off,
+            request_emit_traces_only,
+            request_emit_metrics_only,
+            request_emit_traces_and_metrics
         ]}
     ].
 
@@ -489,3 +502,71 @@ integration_h1_ssl_request(Config) ->
 
     nhttp:stop(Pid),
     ok.
+
+%%%-----------------------------------------------------------------------------
+%%% REQUEST EMIT TESTS
+%%%-----------------------------------------------------------------------------
+
+request_emit_off(_Config) ->
+    assert_request_emit(#{}, 0, 0).
+
+request_emit_traces_off_metrics_off(_Config) ->
+    assert_request_emit(#{otel => #{traces => false, metrics => false}}, 0, 0).
+
+request_emit_traces_only(_Config) ->
+    assert_request_emit(#{otel => #{traces => true}}, 1, 0).
+
+request_emit_metrics_only(_Config) ->
+    assert_request_emit(#{otel => #{metrics => true}}, 0, 1).
+
+request_emit_traces_and_metrics(_Config) ->
+    assert_request_emit(#{otel => true}, 1, 1).
+
+assert_request_emit(OtelOpts, ExpectedSpans, ExpectedDurations) ->
+    {ok, Pid} = nhttp:start_link(OtelOpts#{port => 0, handler => ?MODULE, versions => [http1_1]}),
+    {ok, Port} = nhttp:get_port(Pid),
+    Calls = trace_request_emit(Port),
+    nhttp:stop(Pid),
+    Spans = [Name || {otel_tracer, start_span, [_, _, Name, _]} <- Calls],
+    Durations = [
+        D
+     || {otel_histogram, record, [_, _, 'nhttp.http.request.duration', D, _]} <- Calls
+    ],
+    ?assertEqual(lists:duplicate(ExpectedSpans, <<"GET /">>), Spans),
+    ?assertEqual(ExpectedDurations, length(Durations)),
+    MaxDuration = erlang:convert_time_unit(10, second, native),
+    ?assertEqual(
+        [], [D || D <- Durations, not (is_integer(D) andalso D >= 0 andalso D < MaxDuration)]
+    ).
+
+trace_request_emit(Port) ->
+    {module, otel_tracer} = code:ensure_loaded(otel_tracer),
+    {module, otel_histogram} = code:ensure_loaded(otel_histogram),
+    1 = erlang:trace_pattern({otel_tracer, start_span, 4}, true, [global]),
+    1 = erlang:trace_pattern({otel_histogram, record, 5}, true, [global]),
+    _ = erlang:trace(new_processes, true, [call]),
+    {ok, Socket} = gen_tcp:connect("localhost", Port, [binary, {active, false}]),
+    ok = gen_tcp:send(Socket, <<"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n">>),
+    Response = recv_until_closed(Socket, <<>>),
+    _ = erlang:trace(new_processes, false, [call]),
+    1 = erlang:trace_pattern({otel_tracer, start_span, 4}, false, [global]),
+    1 = erlang:trace_pattern({otel_histogram, record, 5}, false, [global]),
+    Ref = erlang:trace_delivered(all),
+    receive
+        {trace_delivered, all, Ref} -> ok
+    after 5000 -> ct:fail(trace_not_delivered)
+    end,
+    ?assertMatch(<<"HTTP/1.1 200", _/binary>>, Response),
+    collect_trace_calls([]).
+
+collect_trace_calls(Acc) ->
+    receive
+        {trace, _Pid, call, MFA} -> collect_trace_calls([MFA | Acc])
+    after 0 -> lists:reverse(Acc)
+    end.
+
+recv_until_closed(Socket, Acc) ->
+    case gen_tcp:recv(Socket, 0, 5000) of
+        {ok, Data} -> recv_until_closed(Socket, <<Acc/binary, Data/binary>>);
+        {error, closed} -> Acc
+    end.

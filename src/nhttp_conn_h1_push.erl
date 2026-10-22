@@ -127,10 +127,7 @@ continue_after_h1_push(
 ) ->
     case Buffer of
         <<>> ->
-            case nhttp_conn:activate(State) of
-                ok -> nhttp_conn_h1:h1_loop(Parent, Debug, State);
-                {stop, Reason} -> nhttp_conn:stop(Reason, State)
-            end;
+            nhttp_conn_h1:await_h1_request(Parent, Debug, State);
         _ ->
             nhttp_conn_h1:process_h1_pipeline(Parent, Debug, State, 0)
     end.
