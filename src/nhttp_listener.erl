@@ -64,6 +64,7 @@ ChildSpec = nhttp_listener:child_spec(my_http_listener, #{
 -define(H2_DEFAULT_MAX_FRAME_SIZE, 16384).
 -define(H2_MAX_FRAME_SIZE_UPPER_LIMIT, 16777215).
 -define(H2_MAX_WINDOW_SIZE, 2147483647).
+-define(QUIC_OPTS_KEYS, [cc, ip, ipv6_v6only, receivers, transport]).
 -define(SUP_RESTART_PERIOD_SECONDS, 5).
 
 %%%-----------------------------------------------------------------------------
@@ -306,6 +307,10 @@ invalid_conn_spawn_opts_error(Reason) ->
 -spec invalid_proxy_protocol_error(term()) -> nhttp_error:t().
 invalid_proxy_protocol_error(Reason) ->
     {error, {server, #{type => invalid_proxy_protocol, reason => Reason}}}.
+
+-spec invalid_quic_opts_error(term()) -> nhttp_error:t().
+invalid_quic_opts_error(Reason) ->
+    {error, {server, #{type => invalid_quic_opts, reason => Reason}}}.
 
 -spec invalid_versions_error(term()) -> nhttp_error:t().
 invalid_versions_error(Reason) ->
@@ -634,6 +639,7 @@ validate_opts(Opts) ->
         ok ?= validate_acceptor_count(maps:get(acceptor_count, Opts, undefined)),
         ok ?= validate_alt_svc(maps:get(alt_svc, Opts, #{})),
         ok ?= validate_conn_spawn_opts(maps:get(conn_spawn_opts, Opts, [])),
+        ok ?= validate_quic_opts(maps:get(quic, Opts, #{})),
         ok
     end.
 
@@ -664,6 +670,15 @@ validate_proxy_version(V) when V =:= v1; V =:= v2; V =:= both ->
     ok;
 validate_proxy_version(V) ->
     invalid_proxy_protocol_error({unknown_version, V}).
+
+-spec validate_quic_opts(term()) -> ok | nhttp_error:t().
+validate_quic_opts(Quic) when is_map(Quic) ->
+    case maps:keys(maps:without(?QUIC_OPTS_KEYS, Quic)) of
+        [] -> ok;
+        [Key | _] -> invalid_quic_opts_error({unsupported_key, Key})
+    end;
+validate_quic_opts(_) ->
+    invalid_quic_opts_error(not_a_map).
 
 -spec validate_required_opts(nhttp:opts()) -> ok | nhttp_error:t().
 validate_required_opts(Opts) ->

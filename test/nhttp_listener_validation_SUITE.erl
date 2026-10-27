@@ -38,7 +38,8 @@
     listener_invalid_tls/1,
     listener_invalid_versions/1,
     listener_listen_failed/1,
-    listener_named_start/1
+    listener_named_start/1,
+    listener_quic_opts_invalid/1
 ]).
 
 %%%-----------------------------------------------------------------------------
@@ -60,7 +61,8 @@ all() ->
         listener_invalid_tls,
         listener_invalid_versions,
         listener_listen_failed,
-        listener_named_start
+        listener_named_start,
+        listener_quic_opts_invalid
     ].
 
 init_per_suite(Config) ->
@@ -351,6 +353,39 @@ listener_named_start(_Config) ->
     nhttp:stop(PidL),
     nhttp:stop(PidG),
     nhttp:stop(PidV),
+    ok.
+
+listener_quic_opts_invalid(_Config) ->
+    Base = #{port => 0, handler => ?MODULE, versions => [http1_1]},
+    Invalid = [
+        not_a_map,
+        #{conn_handler => ?MODULE},
+        #{conn_handler_opts => #{}},
+        #{tls => #{}},
+        #{idle_timeout => 1000},
+        #{replay_protection => ?MODULE},
+        #{bogus => 1}
+    ],
+    Valid = [
+        #{},
+        #{receivers => 2},
+        #{transport => #{gso => true, pacing => true}},
+        #{cc => #{algo => newreno}},
+        #{ip => {0, 0, 0, 0, 0, 0, 0, 0}, ipv6_v6only => false}
+    ],
+    lists:foreach(
+        fun(Quic) ->
+            assert_error_contains("invalid_quic_opts", nhttp:start_link(Base#{quic => Quic}))
+        end,
+        Invalid
+    ),
+    lists:foreach(
+        fun(Quic) ->
+            {ok, Pid} = nhttp:start_link(Base#{quic => Quic}),
+            nhttp:stop(Pid)
+        end,
+        Valid
+    ),
     ok.
 
 assert_error_contains(Substr, Result) ->

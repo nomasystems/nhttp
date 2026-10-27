@@ -13,9 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Response compression adds `vary: accept-encoding` to every response whose coding depends on `Accept-Encoding`. A `vary` field that the handler set is kept
 - HTTP/2 in cleartext with prior knowledge (h2c, RFC 9113 §3.3): `versions => [http2]` without `tls` starts. Only `http3` needs `tls`
 - HTTP/1.1 and h2c on one cleartext port: `versions => [http1_1, http2]` without `tls` picks the protocol of each connection from its first bytes, HTTP/2 when they are the connection preface. A connection that sends no deciding bytes before the `request` timeout is closed
+- `quic => nhttp:quic_opts()`: the `receivers`, `ip`, `ipv6_v6only`, `transport` and `cc` settings of the nquic listener that serves HTTP/3. `ip => {0,0,0,0,0,0,0,0}` with `ipv6_v6only => false` serves HTTP/3 to IPv6 and IPv4 clients on one port. The listener rejects other keys
 
 ### Changed
 
+- The HTTP/3 listener opens one UDP socket and one receiver per online scheduler (`receivers`), not one. With one receiver the socket dropped datagrams under load, and static files over HTTP/3 served less than half the requests per second
+- A request with the method `QUERY` reaches the handler with `method => query`. Before, the method was `<<"QUERY">>`
 - `nhttp_limits:from_opts/1` returns every limit. A limit that `Opts` does not set has the value from `default_limits/0`
 - An HTTP/1.1 connection builds its parser options and limits once, parses each request head once, and checks the header limits in one pass. A keep-alive `GET` costs about 2% less CPU
 - With traces off, a request on any protocol builds no span attributes. With metrics also off, it does not read the clock
