@@ -241,10 +241,13 @@ completes, so a replayed non-idempotent method cannot reach the handler
 with a Too Early (425) / defer policy.
 """.
 -spec quic_listen_opts([binary()], nhttp:tls(), nhttp:opts(), nhttp_conn_h3:handler_opts()) ->
-    map().
+    nquic:listen_opts().
 quic_listen_opts(Alpn, Tls, Opts, HandlerOpts) ->
     Timeouts = maps:get(timeouts, Opts, #{}),
-    #{
+    Quic = maps:merge(
+        #{receivers => erlang:system_info(schedulers_online)}, maps:get(quic, Opts, #{})
+    ),
+    maps:merge(Quic, #{
         tls => #{
             certfile => maps:get(certfile, Tls),
             keyfile => maps:get(keyfile, Tls),
@@ -253,7 +256,7 @@ quic_listen_opts(Alpn, Tls, Opts, HandlerOpts) ->
         idle_timeout => maps:get(idle, Timeouts, ?DEFAULT_QUIC_IDLE_TIMEOUT),
         conn_handler => nhttp_conn_h3,
         conn_handler_opts => HandlerOpts
-    }.
+    }).
 
 -spec quic_listener_children(nhttp_registry:tab(), nhttp_registry:tab() | undefined) ->
     [supervisor:child_spec()].

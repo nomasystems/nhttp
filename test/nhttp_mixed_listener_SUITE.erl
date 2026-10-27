@@ -32,6 +32,10 @@
     mixed_quic_crash_isolates_tcp/1,
     mixed_each_transport_crash_within_period/1,
     mixed_transport_crash_loop_kills_listener/1,
+    mixed_quic_dual_stack/1,
+    mixed_quic_receivers/1,
+    quic_listen_opts_merge_quic/1,
+    quic_listen_opts_default_receivers/1,
     quic_listen_opts_reject_zero_rtt/1
 ]).
 
@@ -51,6 +55,10 @@ all() ->
         mixed_quic_crash_isolates_tcp,
         mixed_each_transport_crash_within_period,
         mixed_transport_crash_loop_kills_listener,
+        mixed_quic_dual_stack,
+        mixed_quic_receivers,
+        quic_listen_opts_merge_quic,
+        quic_listen_opts_default_receivers,
         quic_listen_opts_reject_zero_rtt
     ].
 
@@ -263,6 +271,50 @@ mixed_transport_crash_loop_kills_listener(Config) ->
     erlang:erase(listener_pid),
     ok.
 
+mixed_quic_dual_stack(Config) ->
+    Pid = start_mixed(Config, #{quic => #{ip => {0, 0, 0, 0, 0, 0, 0, 0}, ipv6_v6only => false}}),
+    {ok, Port} = nhttp:get_port(Pid, quic),
+    ?assertEqual({error, eaddrinuse}, udp6_bind({0, 0, 0, 0, 0, 0, 0, 1}, Port)),
+    {QConn, H3} = nhttp_h3_test_client:connect(Port),
+    {ok, 200, _Headers, Body, _H3_1} =
+        nhttp_h3_test_client:request(QConn, H3, <<"GET">>, <<"/hello">>, [], <<>>),
+    ?assertEqual(<<"Hello!">>, Body),
+    nhttp_h3_test_client:close(QConn),
+    ok.
+
+mixed_quic_receivers(Config) ->
+    Pid = start_mixed(Config, #{quic => #{receivers => 4}}),
+    ?assertEqual(4, length(quic_receivers(Pid))),
+    {ok, Port} = nhttp:get_port(Pid, quic),
+    {QConn, H3} = nhttp_h3_test_client:connect(Port),
+    {ok, 200, _Headers, Body, _H3_1} =
+        nhttp_h3_test_client:request(QConn, H3, <<"GET">>, <<"/hello">>, [], <<>>),
+    ?assertEqual(<<"Hello!">>, Body),
+    nhttp_h3_test_client:close(QConn),
+    ok.
+
+quic_listen_opts_merge_quic(_Config) ->
+    Opts = nhttp_transport_sup:quic_listen_opts(
+        [<<"h3">>],
+        #{certfile => "cert.pem", keyfile => "key.pem"},
+        #{quic => #{receivers => 4, transport => #{gso => true, pacing => true}}},
+        #{}
+    ),
+    ?assertEqual(4, maps:get(receivers, Opts)),
+    ?assertEqual(#{gso => true, pacing => true}, maps:get(transport, Opts)),
+    ?assertEqual(nhttp_conn_h3, maps:get(conn_handler, Opts)),
+    ok.
+
+quic_listen_opts_default_receivers(_Config) ->
+    Opts = nhttp_transport_sup:quic_listen_opts(
+        [<<"h3">>],
+        #{certfile => "cert.pem", keyfile => "key.pem"},
+        #{quic => #{transport => #{pacing => true}}},
+        #{}
+    ),
+    ?assertEqual(erlang:system_info(schedulers_online), maps:get(receivers, Opts)),
+    ok.
+
 quic_listen_opts_reject_zero_rtt(_Config) ->
     Opts = nhttp_transport_sup:quic_listen_opts(
         [<<"h3">>],
@@ -313,6 +365,32 @@ alpn_negotiated(Port, Advertised) ->
     ssl:close(Sock),
     Result.
 
+-spec quic_receivers(pid()) -> [pid()].
+quic_receivers(ListenerPid) ->
+    {links, Links} = process_info(transport_sup(ListenerPid, quic), links),
+    NquicSups = [
+        P
+     || P <- Links,
+        is_pid(P),
+        proc_lib:translate_initial_call(P) =:= {supervisor, nquic_listener_sup, 1}
+    ],
+    [
+        P
+     || Sup <- NquicSups,
+        P <- sup_descendants(Sup),
+        proc_lib:translate_initial_call(P) =:= {nquic_receiver, init, 1}
+    ].
+
+-spec sup_descendants(pid()) -> [pid()].
+sup_descendants(Sup) ->
+    lists:append([
+        case Type of
+            supervisor -> [Child | sup_descendants(Child)];
+            worker -> [Child]
+        end
+     || {_, Child, Type, _} <- supervisor:which_children(Sup), is_pid(Child)
+    ]).
+
 -spec tls_connect(inet:port_number()) -> {ok, ssl:sslsocket()} | {error, term()}.
 tls_connect(Port) ->
     ssl:connect(
@@ -334,6 +412,14 @@ tls_h1_get(Port, Path) ->
     ok = ssl:send(Sock, Req),
     {ok, Resp} = ssl:recv(Sock, 0, 5000),
     {Sock, Resp}.
+
+-spec udp6_bind(inet:ip6_address(), inet:port_number()) -> ok | {error, term()}.
+udp6_bind(IP, Port) ->
+    {ok, Sock} = socket:open(inet6, dgram, udp),
+    ok = socket:setopt(Sock, ipv6, v6only, true),
+    Result = socket:bind(Sock, #{family => inet6, addr => IP, port => Port}),
+    ok = socket:close(Sock),
+    Result.
 
 -spec wait_for_new_transport_sup(pid(), tcp | quic, pid()) -> ok | {error, timeout}.
 wait_for_new_transport_sup(ListenerPid, Kind, OldSup) ->

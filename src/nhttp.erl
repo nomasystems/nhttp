@@ -218,6 +218,7 @@ RFC 9001 §9.2).
     peer/0,
     proxy_protocol_opts/0,
     quic_error/0,
+    quic_opts/0,
 
     request/0,
     response/0,
@@ -266,7 +267,8 @@ RFC 9001 §9.2).
     versions => [http1_1 | http2 | http3],
     timeouts => timeouts(),
     tls => tls(),
-    proxy_protocol => boolean() | proxy_protocol_opts()
+    proxy_protocol => boolean() | proxy_protocol_opts(),
+    quic => quic_opts()
 }.
 
 -doc """
@@ -365,6 +367,31 @@ Connection timeouts (milliseconds, or `infinity`).
 -type proxy_protocol_opts() :: #{
     version => v1 | v2 | both,
     timeout => timeout()
+}.
+
+-doc """
+Settings of the nquic listener that serves `http3`. nhttp passes them to
+`nquic:listen/2`, which checks the values.
+
+- `receivers`: the number of UDP sockets on the QUIC port, bound with
+  `SO_REUSEPORT`. Each socket has one receiver process, and the kernel
+  spreads the peers over the sockets. Default: the number of online
+  schedulers.
+- `ip`: the local address of the QUIC sockets. Default `{0,0,0,0}`. An
+  IPv6 address opens IPv6 sockets. `{0,0,0,0,0,0,0,0}` with
+  `ipv6_v6only => false` also accepts IPv4 peers. A host where IPv6 is
+  off cannot bind an IPv6 address.
+- `ipv6_v6only`: the `IPV6_V6ONLY` socket option for an IPv6 `ip`.
+- `transport`: `gso`, `pacing` and the other send settings of
+  `t:nquic:transport_opts/0`.
+- `cc`: the congestion controller, `t:nquic:cc_opts/0`.
+""".
+-type quic_opts() :: #{
+    receivers => pos_integer(),
+    ip => inet:ip_address(),
+    ipv6_v6only => boolean(),
+    transport => nquic:transport_opts(),
+    cc => nquic:cc_opts()
 }.
 
 -type stop_opts() :: #{
