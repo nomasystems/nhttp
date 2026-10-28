@@ -63,7 +63,6 @@
     stop/2,
     stop_parent/2,
     terminate/2,
-    transport_to_scheme/1,
     version_to_family/1
 ]).
 
