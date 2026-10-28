@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-28
+
 ### Added
 
 - `conn_spawn_opts => [nhttp:conn_spawn_opt()]`: spawn options for the connection processes of HTTP/1.1, HTTP/2 and HTTP/3 and for the stream workers, for example `{fullsweep_after, 0}` or `{min_heap_size, Words}`. The listener rejects `link`, `monitor` and a value that `erlang:spawn_opt/4` does not accept. Default `[]`
@@ -22,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `nhttp_limits:from_opts/1` returns every limit. A limit that `Opts` does not set has the value from `default_limits/0`
 - An HTTP/1.1 connection builds its parser options and limits once, parses each request head once, and checks the header limits in one pass. A keep-alive `GET` costs about 2% less CPU
 - With traces off, a request on any protocol builds no span attributes. With metrics also off, it does not read the clock
+- Requires `nhttp_lib` 2.1.1. Automatic response compression matches the `content-type` media type about 10 times faster per response
 
 ### Fixed
 

@@ -289,10 +289,7 @@ process_h1_pipeline(
                     send_h1_error(Flushed, header_too_large),
                     nhttp_conn:stop({protocol_error, header_too_large}, Flushed);
                 false ->
-                    case nhttp_conn:activate(Flushed) of
-                        ok -> h1_loop(Parent, Debug, arm_head_deadline(Flushed));
-                        {stop, Reason} -> nhttp_conn:stop(Reason, Flushed)
-                    end
+                    await_h1_request(Parent, Debug, arm_head_deadline(Flushed))
             end;
         {error, Reason} ->
             Flushed = flush_h1_out(State),
@@ -519,8 +516,8 @@ await_h1_body_data(
     end.
 
 -doc """
-Wait for the next request head once the buffer is empty: send what is
-queued, arm the socket and block in `h1_loop/3`.
+Wait for more bytes of the next request head: send what is queued, arm
+the socket and block in `h1_loop/3`.
 """.
 -spec await_h1_request(pid(), [sys:debug_option()], #state{}) -> no_return().
 await_h1_request(Parent, Debug, State0) ->

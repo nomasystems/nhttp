@@ -545,9 +545,9 @@ trace_request_emit(Port) ->
     1 = erlang:trace_pattern({otel_tracer, start_span, 4}, true, [global]),
     1 = erlang:trace_pattern({otel_histogram, record, 5}, true, [global]),
     _ = erlang:trace(new_processes, true, [call]),
-    {ok, Socket} = gen_tcp:connect("localhost", Port, [binary, {active, false}]),
+    Socket = nhttp_test_helpers:tcp_connect(Port),
     ok = gen_tcp:send(Socket, <<"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n">>),
-    Response = recv_until_closed(Socket, <<>>),
+    Response = nhttp_test_helpers:drain_tcp(Socket),
     _ = erlang:trace(new_processes, false, [call]),
     1 = erlang:trace_pattern({otel_tracer, start_span, 4}, false, [global]),
     1 = erlang:trace_pattern({otel_histogram, record, 5}, false, [global]),
@@ -563,10 +563,4 @@ collect_trace_calls(Acc) ->
     receive
         {trace, _Pid, call, MFA} -> collect_trace_calls([MFA | Acc])
     after 0 -> lists:reverse(Acc)
-    end.
-
-recv_until_closed(Socket, Acc) ->
-    case gen_tcp:recv(Socket, 0, 5000) of
-        {ok, Data} -> recv_until_closed(Socket, <<Acc/binary, Data/binary>>);
-        {error, closed} -> Acc
     end.
