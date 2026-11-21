@@ -495,7 +495,9 @@ classify_preface(Bytes) ->
 
 -spec detect_protocol(#state{}) ->
     {ok, http1 | http2} | sniff | {error, {unsupported_alpn, binary()}}.
-detect_protocol(#state{socket = Socket, transport = Transport, ctx = #{versions := Versions}}) ->
+detect_protocol(#state{socket = Socket, transport = Transport, ctx = #{versions := Versions}}) when
+    Socket =/= undefined
+->
     AllowedFamilies = [version_to_family(V) || V <- Versions],
     case sniffs(Transport, AllowedFamilies) of
         true -> sniff;

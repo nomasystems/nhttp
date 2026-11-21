@@ -78,6 +78,22 @@ threading `BodyState` between calls. Returning `{accept_body, _, _}`
 again continues consuming. Any other tag (`reply`, `stream`, `upgrade`,
 `abort`) terminates the body phase and proceeds to the response.
 
+The `{abort, Reason}` event is the last body event. `Reason` depends on
+the protocol:
+
+- HTTP/2: `{peer_reset, ErrorCode}` when the peer sends RST_STREAM, and
+  `body_too_large` when the body exceeds `max_body_size`. `ErrorCode` is
+  the RFC 9113 name as an atom, for example `cancel`, or the integer of
+  a code with no name. The event also arrives when the reset or the
+  limit comes before `handle_request/2` returns `{accept_body, _, _}`.
+  The stream is closed, so the connection drops the result of the
+  callback.
+- HTTP/3: `{peer_reset, ErrorCode}` when the peer resets the stream.
+  `ErrorCode` is the RFC 9114 name as an atom, for example
+  `h3_request_cancelled`.
+- HTTP/1.1: `peer_closed`, `shutdown`, `{socket_error, Reason}`,
+  `body_timeout`, `request_timeout`, or the error of the body parser.
+
 The connection applies end-to-end backpressure: TCP receive on HTTP/1.1,
 WINDOW_UPDATE on HTTP/2, and QUIC stream flow control on HTTP/3 are all
 gated on handler acknowledgement of the previous chunk. The configured
