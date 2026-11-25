@@ -586,6 +586,19 @@ spawn_h2_request_worker(
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - HTTP/2 STREAMING REQUEST BODY (PHASE 6 WAVE 2)
 %%%-----------------------------------------------------------------------------
+-doc """
+Send the abort body event to the worker of a request stream. A worker in
+`handle_request/2` reads it as its first body event if the handler
+returns `{accept_body, _, _}`. A worker that ends with another result
+drops it.
+""".
+-spec abort_body_worker(#h2_stream{}, nhttp_handler:abort_reason()) -> ok.
+abort_body_worker(#h2_stream{worker = undefined}, _Reason) ->
+    ok;
+abort_body_worker(#h2_stream{worker = WPid, worker_ref = Ref}, Reason) ->
+    WPid ! {body_chunk, Ref, {abort, Reason}},
+    ok.
+
 -spec abort_stream_worker(#state{}, nhttp_lib:stream_id()) -> #state{}.
 abort_stream_worker(
     #state{protocol_state = #h2_state{h2_streams = Streams}} = State, StreamId
@@ -1079,15 +1092,7 @@ handle_h2_response_delay(
 -spec handle_h2_streaming_body_too_large(#state{}, nhttp_lib:stream_id(), #h2_stream{}) ->
     #state{}.
 handle_h2_streaming_body_too_large(State, StreamId, Stream) ->
-    case Stream#h2_stream.streaming_body of
-        true ->
-            WPid = Stream#h2_stream.worker,
-            Ref = Stream#h2_stream.worker_ref,
-            WPid ! {body_chunk, Ref, {abort, body_too_large}},
-            ok;
-        false ->
-            ok
-    end,
+    ok = abort_body_worker(Stream, body_too_large),
     handle_h2_limit_error(State, StreamId, body_too_large).
 
 -spec head_credit_due(h2_conn_credit() | h2_stream_credit()) -> integer() | undefined.
@@ -1598,7 +1603,7 @@ handle_h2_event(
         #h2_stream{type = websocket} ->
             nhttp_conn_ws_h2:handle_stream_reset(State, StreamId, ErrorCode);
         #h2_stream{type = T} = Stream when T =:= request; T =:= stream ->
-            handle_h2_worker_stream_reset(State, StreamId, Stream);
+            handle_h2_worker_stream_reset(State, StreamId, Stream, ErrorCode);
         _ ->
             State#state{protocol_state = H2#h2_state{h2_streams = maps:remove(StreamId, Streams)}}
     end;
@@ -1729,30 +1734,19 @@ handle_h2_worker_send_trailers(
         end
     ).
 
--spec handle_h2_worker_stream_reset(#state{}, nhttp_lib:stream_id(), #h2_stream{}) -> #state{}.
+-spec handle_h2_worker_stream_reset(
+    #state{}, nhttp_lib:stream_id(), #h2_stream{}, nhttp_h2:error_code()
+) -> #state{}.
 handle_h2_worker_stream_reset(
     #state{protocol_state = #h2_state{h2_streams = Streams, h2_workers = Workers} = H2} = State,
     StreamId,
-    Stream
+    Stream,
+    ErrorCode
 ) ->
-    #h2_stream{
-        worker = WPid,
-        worker_ref = Ref,
-        worker_mref = MRef,
-        pending_ack = PendingRef
-    } = Stream,
+    #h2_stream{worker = WPid, worker_mref = MRef} = Stream,
     emit_h2_stream_complete(State, StreamId, Stream, peer_reset),
     ok = cancel_held_response(Stream),
-    case PendingRef of
-        undefined when WPid =/= undefined ->
-            WPid ! {chunk_ack, Ref, {error, closed}},
-            ok;
-        _ when WPid =/= undefined ->
-            WPid ! {chunk_ack, PendingRef, {error, closed}},
-            ok;
-        _ ->
-            ok
-    end,
+    ok = notify_reset_worker(Stream, ErrorCode),
     case MRef of
         undefined ->
             ok;
@@ -1781,6 +1775,25 @@ maybe_emit_h2_stream_start(State, #h2_stream{req_span = ReqSpan} = Stream) when
     Stream#h2_stream{response_started = true};
 maybe_emit_h2_stream_start(_State, Stream) ->
     Stream#h2_stream{response_started = true}.
+
+-doc """
+Tell the worker of a stream that the peer reset it. A request worker
+gets the abort body event. A producer gets `{error, closed}` on the
+chunk it waits for, or on its next chunk.
+""".
+-spec notify_reset_worker(#h2_stream{}, nhttp_h2:error_code()) -> ok.
+notify_reset_worker(#h2_stream{worker = undefined}, _ErrorCode) ->
+    ok;
+notify_reset_worker(#h2_stream{type = request} = Stream, ErrorCode) ->
+    abort_body_worker(Stream, {peer_reset, ErrorCode});
+notify_reset_worker(
+    #h2_stream{worker = WPid, worker_ref = Ref, pending_ack = undefined}, _ErrorCode
+) ->
+    WPid ! {chunk_ack, Ref, {error, closed}},
+    ok;
+notify_reset_worker(#h2_stream{worker = WPid, pending_ack = PendingRef}, _ErrorCode) ->
+    WPid ! {chunk_ack, PendingRef, {error, closed}},
+    ok.
 
 -doc """
 Offer `Data` on `StreamId` to the codec send queue and write the frames

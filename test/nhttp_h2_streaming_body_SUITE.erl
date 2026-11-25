@@ -34,8 +34,17 @@
     bad_handler_return/1,
     bad_stream_spec/1,
     ws_upgrade_on_h2_rejected/1,
-    ws_upgrade_on_h2_session_rejected/1
+    ws_upgrade_on_h2_session_rejected/1,
+    abort_on_peer_reset_in_body_phase/1,
+    abort_on_peer_reset_before_accept_body/1,
+    abort_on_body_too_large_before_accept_body/1,
+    reply_from_abort_sends_no_frame/1,
+    stream_from_abort_gets_closed/1
 ]).
+
+-define(PROBE, nhttp_h2_streaming_body_probe).
+-define(PROBE_TIMEOUT, 2000).
+-define(H2_CANCEL, 8).
 
 -behaviour(nhttp_handler).
 -export([init/1, handle_request/2, handle_request_body/3]).
@@ -60,6 +69,21 @@ handle_request(#{path := <<"/bad-return">>}, _State) ->
     not_a_handler_return;
 handle_request(#{path := <<"/bad-stream-spec">>}, State) ->
     {stream, not_a_stream_spec, State};
+handle_request(#{path := <<"/probe">>}, State) ->
+    probe(request),
+    {accept_body, probe, State};
+handle_request(#{path := <<"/probe-blocked">>}, State) ->
+    probe(request),
+    receive
+        release -> ok
+    end,
+    {accept_body, probe, State};
+handle_request(#{path := <<"/probe-reply">>}, State) ->
+    probe(request),
+    {accept_body, probe_reply, State};
+handle_request(#{path := <<"/probe-stream">>}, State) ->
+    probe(request),
+    {accept_body, probe_stream, State};
 handle_request(#{path := <<"/ws-upgrade">>}, State) ->
     {upgrade, websocket, State};
 handle_request(#{path := <<"/ws-upgrade-session">>}, State) ->
@@ -67,6 +91,29 @@ handle_request(#{path := <<"/ws-upgrade-session">>}, State) ->
 handle_request(_Req, State) ->
     {reply, nhttp_resp:not_found(), State}.
 
+handle_request_body({abort, _} = Event, probe_reply, State) ->
+    probe(Event),
+    {reply, nhttp_resp:ok(<<"late">>), State};
+handle_request_body({abort, _} = Event, probe_stream, State) ->
+    probe(Event),
+    Producer = fun(SendChunk) ->
+        probe({send_chunk, SendChunk(<<"late">>)}),
+        ok
+    end,
+    {stream, nhttp_stream:producer(200, [], Producer), State};
+handle_request_body({data, _} = Event, Probe, State) when
+    Probe =:= probe; Probe =:= probe_reply; Probe =:= probe_stream
+->
+    probe(Event),
+    {accept_body, Probe, State};
+handle_request_body({fin, _} = Event, Probe, State) when
+    Probe =:= probe; Probe =:= probe_reply; Probe =:= probe_stream
+->
+    probe(Event),
+    {reply, nhttp_resp:ok(<<"fin">>), State};
+handle_request_body({abort, Reason} = Event, probe, State) ->
+    probe(Event),
+    {abort, Reason, State};
 handle_request_body({data, _Chunk}, reply_on_data, State) ->
     {reply, nhttp_resp:ok(<<"early">>), State};
 handle_request_body({fin, _}, reply_on_data, State) ->
@@ -86,6 +133,10 @@ handle_request_body({fin, _Trailers}, Acc, State) ->
     {reply, nhttp_resp:ok(Body), State};
 handle_request_body({abort, Reason}, _Acc, State) ->
     {abort, Reason, State}.
+
+probe(Event) ->
+    ?PROBE ! {probe, self(), Event},
+    ok.
 
 encode_trailers(Trailers) ->
     iolist_to_binary(
@@ -111,7 +162,12 @@ all() ->
         bad_handler_return,
         bad_stream_spec,
         ws_upgrade_on_h2_rejected,
-        ws_upgrade_on_h2_session_rejected
+        ws_upgrade_on_h2_session_rejected,
+        abort_on_peer_reset_in_body_phase,
+        abort_on_peer_reset_before_accept_body,
+        abort_on_body_too_large_before_accept_body,
+        reply_from_abort_sends_no_frame,
+        stream_from_abort_gets_closed
     ].
 
 init_per_suite(Config) ->
@@ -312,6 +368,105 @@ ws_upgrade_on_h2_session_rejected(_Config) ->
         nhttp:stop(Pid)
     end.
 
+abort_on_peer_reset_in_body_phase(_Config) ->
+    {Pid, Port} = nhttp_test_helpers:h2_start_server(?MODULE, #{}),
+    true = register(?PROBE, self()),
+    try
+        {ok, Sock} = nhttp_test_helpers:h2_connect(Port),
+        Worker = open_body_phase(Sock, 1, <<"/probe">>),
+        MRef = erlang:monitor(process, Worker),
+        ok = nhttp_test_helpers:h2_send_rst_stream(Sock, 1, ?H2_CANCEL),
+        ?assertEqual({abort, {peer_reset, cancel}}, probe_event(Worker)),
+        ok = await_down(MRef, Worker),
+        ok = no_probe_event(Worker),
+        ok = assert_echo(Sock, 3),
+        ssl:close(Sock)
+    after
+        unregister(?PROBE),
+        nhttp:stop(Pid)
+    end.
+
+abort_on_peer_reset_before_accept_body(_Config) ->
+    {Pid, Port} = nhttp_test_helpers:h2_start_server(?MODULE, #{}),
+    true = register(?PROBE, self()),
+    try
+        {ok, Sock} = nhttp_test_helpers:h2_connect(Port),
+        ok = nhttp_test_helpers:h2_send_headers(Sock, 1, <<"/probe-blocked">>, 16, false),
+        Worker = probe_worker(),
+        MRef = erlang:monitor(process, Worker),
+        ok = nhttp_test_helpers:h2_send_rst_stream(Sock, 1, ?H2_CANCEL),
+        ok = assert_echo(Sock, 3),
+        Worker ! release,
+        ?assertEqual({abort, {peer_reset, cancel}}, probe_event(Worker)),
+        ok = await_down(MRef, Worker),
+        ok = no_probe_event(Worker),
+        ssl:close(Sock)
+    after
+        unregister(?PROBE),
+        nhttp:stop(Pid)
+    end.
+
+abort_on_body_too_large_before_accept_body(_Config) ->
+    {Pid, Port} = nhttp_test_helpers:h2_start_server(?MODULE, #{max_body_size => 8}),
+    true = register(?PROBE, self()),
+    try
+        {ok, Sock} = nhttp_test_helpers:h2_connect(Port),
+        Body = <<"way-too-many-bytes-for-the-cap">>,
+        ok = nhttp_test_helpers:h2_send_headers(
+            Sock, 1, <<"/probe-blocked">>, byte_size(Body), false
+        ),
+        Worker = probe_worker(),
+        MRef = erlang:monitor(process, Worker),
+        ok = nhttp_test_helpers:h2_send_data(Sock, 1, Body, false),
+        Frames = nhttp_test_helpers:h2_recv_stream(Sock, 1, 3000),
+        ?assertEqual(<<"413">>, nhttp_test_helpers:h2_response_status(Frames)),
+        Worker ! release,
+        ?assertEqual({abort, body_too_large}, probe_event(Worker)),
+        ok = await_down(MRef, Worker),
+        ok = no_probe_event(Worker),
+        ssl:close(Sock)
+    after
+        unregister(?PROBE),
+        nhttp:stop(Pid)
+    end.
+
+reply_from_abort_sends_no_frame(_Config) ->
+    {Pid, Port} = nhttp_test_helpers:h2_start_server(?MODULE, #{}),
+    true = register(?PROBE, self()),
+    try
+        {ok, Sock} = nhttp_test_helpers:h2_connect(Port),
+        Worker = open_body_phase(Sock, 1, <<"/probe-reply">>),
+        MRef = erlang:monitor(process, Worker),
+        ok = nhttp_test_helpers:h2_send_rst_stream(Sock, 1, ?H2_CANCEL),
+        ?assertEqual({abort, {peer_reset, cancel}}, probe_event(Worker)),
+        ok = await_down(MRef, Worker),
+        Frames = echo_frames(Sock, 3),
+        ?assertEqual([], response_frames(Frames, 1)),
+        ssl:close(Sock)
+    after
+        unregister(?PROBE),
+        nhttp:stop(Pid)
+    end.
+
+stream_from_abort_gets_closed(_Config) ->
+    {Pid, Port} = nhttp_test_helpers:h2_start_server(?MODULE, #{}),
+    true = register(?PROBE, self()),
+    try
+        {ok, Sock} = nhttp_test_helpers:h2_connect(Port),
+        Worker = open_body_phase(Sock, 1, <<"/probe-stream">>),
+        MRef = erlang:monitor(process, Worker),
+        ok = nhttp_test_helpers:h2_send_rst_stream(Sock, 1, ?H2_CANCEL),
+        ?assertEqual({abort, {peer_reset, cancel}}, probe_event(Worker)),
+        ?assertEqual({send_chunk, {error, closed}}, probe_event(Worker)),
+        ok = await_down(MRef, Worker),
+        Frames = echo_frames(Sock, 3),
+        ?assertEqual([], response_frames(Frames, 1)),
+        ssl:close(Sock)
+    after
+        unregister(?PROBE),
+        nhttp:stop(Pid)
+    end.
+
 has_rst_stream(Frames, StreamId) ->
     lists:any(
         fun
@@ -333,6 +488,60 @@ find_test_conf_dir() ->
 %%%-----------------------------------------------------------------------------
 %%% H2 CLIENT HELPERS
 %%%-----------------------------------------------------------------------------
+
+assert_echo(Sock, StreamId) ->
+    _Frames = echo_frames(Sock, StreamId),
+    ok.
+
+await_down(MRef, Worker) ->
+    receive
+        {'DOWN', MRef, process, Worker, _Reason} -> ok
+    after ?PROBE_TIMEOUT ->
+        {error, {worker_alive, erlang:process_info(Worker, [current_stacktrace, messages])}}
+    end.
+
+echo_frames(Sock, StreamId) ->
+    Body = <<"after-the-reset">>,
+    ok = nhttp_test_helpers:h2_send_post(Sock, StreamId, <<"/echo">>, Body),
+    Frames = nhttp_test_helpers:h2_recv_stream(Sock, StreamId, 3000),
+    ?assertEqual(Body, nhttp_test_helpers:h2_response_body(Frames, StreamId)),
+    Frames.
+
+response_frames(Frames, StreamId) ->
+    [
+        F
+     || F <- Frames,
+        lists:member(element(1, F), [headers, data, rst_stream]),
+        element(2, F) =:= StreamId
+    ].
+
+no_probe_event(Worker) ->
+    receive
+        {probe, Worker, Event} -> {error, {extra_event, Event}}
+    after 0 ->
+        ok
+    end.
+
+open_body_phase(Sock, StreamId, Path) ->
+    ok = nhttp_test_helpers:h2_send_headers(Sock, StreamId, Path, 16, false),
+    Worker = probe_worker(),
+    ok = nhttp_test_helpers:h2_send_data(Sock, StreamId, <<"partial">>, false),
+    ?assertEqual({data, <<"partial">>}, probe_event(Worker)),
+    Worker.
+
+probe_event(Worker) ->
+    receive
+        {probe, Worker, Event} -> Event
+    after ?PROBE_TIMEOUT ->
+        {error, {no_event, erlang:process_info(Worker, [current_stacktrace, messages])}}
+    end.
+
+probe_worker() ->
+    receive
+        {probe, Worker, request} -> Worker
+    after ?PROBE_TIMEOUT ->
+        error(no_request_event)
+    end.
 
 send_data_frames(Sock, StreamId, [Last]) ->
     nhttp_test_helpers:h2_send_data(Sock, StreamId, Last, true);
