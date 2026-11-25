@@ -7,8 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.4.1] - 2026-11-21
-
 ### Fixed
 
 - HTTP/2: a handler in the body phase gets `{abort, {peer_reset, ErrorCode}}` when the peer resets the stream, and its worker ends. Before, the handler got no event and the worker stayed until the connection closed, so a client that opened and reset streams in a loop left one process per stream
