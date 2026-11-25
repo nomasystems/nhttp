@@ -14,6 +14,7 @@
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
+-include("../src/nhttp_conn.hrl").
 
 -export([
     all/0,
@@ -39,12 +40,36 @@
     abort_on_peer_reset_before_accept_body/1,
     abort_on_body_too_large_before_accept_body/1,
     reply_from_abort_sends_no_frame/1,
-    stream_from_abort_gets_closed/1
+    stream_from_abort_gets_closed/1,
+    duplex_ping_pong/1,
+    duplex_ping_pong_from_body_phase/1,
+    duplex_on_complete_request/1,
+    duplex_data_before_stream_result/1,
+    duplex_fin_trailers/1,
+    duplex_no_read_no_credit/1,
+    duplex_send_blocks_reads_kept/1,
+    duplex_reset_in_recv/1,
+    duplex_reset_in_send/1,
+    duplex_reset_after_request_end/1,
+    duplex_body_too_large/1,
+    duplex_response_end_resets_open_request/1,
+    duplex_producer_crash_resets_stream/1,
+    duplex_on_response_policy_credits_reads/1,
+    simplex_request_body_is_credited/1,
+    simplex_response_end_resets_open_request/1
 ]).
 
 -define(PROBE, nhttp_h2_streaming_body_probe).
 -define(PROBE_TIMEOUT, 2000).
 -define(H2_CANCEL, 8).
+-define(H2_NO_ERROR, 0).
+-define(H2_INTERNAL_ERROR, 2).
+-define(H2_SETTINGS_INITIAL_WINDOW_SIZE, 4).
+-define(H2_FRAME_PING, 6).
+-define(H2_DEFAULT_WINDOW, 65535).
+-define(H2_DEFAULT_FRAME, 16384).
+-define(FRAME_TIMEOUT, 2000).
+-define(SMALL_WINDOW, 10).
 
 -behaviour(nhttp_handler).
 -export([init/1, handle_request/2, handle_request_body/3]).
@@ -84,6 +109,18 @@ handle_request(#{path := <<"/probe-reply">>}, State) ->
 handle_request(#{path := <<"/probe-stream">>}, State) ->
     probe(request),
     {accept_body, probe_stream, State};
+handle_request(#{path := <<"/duplex">>}, State) ->
+    {stream, duplex_spec(), State};
+handle_request(#{path := <<"/duplex-blocked">>}, State) ->
+    probe(request),
+    receive
+        release -> ok
+    end,
+    {stream, duplex_spec(), State};
+handle_request(#{path := <<"/duplex-body">>}, State) ->
+    {accept_body, duplex_body, State};
+handle_request(#{path := <<"/simplex">>}, State) ->
+    {stream, simplex_spec(), State};
 handle_request(#{path := <<"/ws-upgrade">>}, State) ->
     {upgrade, websocket, State};
 handle_request(#{path := <<"/ws-upgrade-session">>}, State) ->
@@ -91,6 +128,9 @@ handle_request(#{path := <<"/ws-upgrade-session">>}, State) ->
 handle_request(_Req, State) ->
     {reply, nhttp_resp:not_found(), State}.
 
+handle_request_body({data, _} = Event, duplex_body, State) ->
+    probe(Event),
+    {stream, duplex_spec(), State};
 handle_request_body({abort, _} = Event, probe_reply, State) ->
     probe(Event),
     {reply, nhttp_resp:ok(<<"late">>), State};
@@ -138,6 +178,34 @@ probe(Event) ->
     ?PROBE ! {probe, self(), Event},
     ok.
 
+duplex_spec() ->
+    Producer = fun(SendChunk, RecvBody) ->
+        probe(producer),
+        run_script(SendChunk, RecvBody)
+    end,
+    nhttp_stream:producer(200, [], Producer).
+
+simplex_spec() ->
+    Producer = fun(SendChunk) ->
+        probe(producer),
+        run_script(SendChunk, undefined)
+    end,
+    nhttp_stream:producer(200, [], Producer).
+
+run_script(SendChunk, RecvBody) ->
+    receive
+        {script, {recv, Timeout}} ->
+            probe({recv, RecvBody(Timeout)}),
+            run_script(SendChunk, RecvBody);
+        {script, {send, Data}} ->
+            probe({send, SendChunk(Data)}),
+            run_script(SendChunk, RecvBody);
+        {script, {return, Value}} ->
+            Value;
+        {script, crash} ->
+            exit(scripted_crash)
+    end.
+
 encode_trailers(Trailers) ->
     iolist_to_binary(
         lists:join(
@@ -167,7 +235,23 @@ all() ->
         abort_on_peer_reset_before_accept_body,
         abort_on_body_too_large_before_accept_body,
         reply_from_abort_sends_no_frame,
-        stream_from_abort_gets_closed
+        stream_from_abort_gets_closed,
+        duplex_ping_pong,
+        duplex_ping_pong_from_body_phase,
+        duplex_on_complete_request,
+        duplex_data_before_stream_result,
+        duplex_fin_trailers,
+        duplex_no_read_no_credit,
+        duplex_send_blocks_reads_kept,
+        duplex_reset_in_recv,
+        duplex_reset_in_send,
+        duplex_reset_after_request_end,
+        duplex_body_too_large,
+        duplex_response_end_resets_open_request,
+        duplex_producer_crash_resets_stream,
+        duplex_on_response_policy_credits_reads,
+        simplex_request_body_is_credited,
+        simplex_response_end_resets_open_request
     ].
 
 init_per_suite(Config) ->
@@ -467,6 +551,279 @@ stream_from_abort_gets_closed(_Config) ->
         nhttp:stop(Pid)
     end.
 
+duplex_ping_pong(_Config) ->
+    with_probe_server(#{}, fun(Server, Sock) ->
+        Worker = open_duplex(Sock, 1, <<"/duplex">>),
+        ?assertEqual({recv, timeout}, script(Worker, {recv, 0})),
+        ok = ping_pong(Sock, 1, Worker, 4),
+        ok = end_request_then_response(Sock, 1, Worker),
+        ?assertEqual([], [F || {rst_stream, 1, _} = F <- ping_frames(Sock)]),
+        ok = await_conn_idle(Server)
+    end).
+
+duplex_ping_pong_from_body_phase(_Config) ->
+    with_probe_server(#{}, fun(Server, Sock) ->
+        ok = open_stream(Sock, 1, <<"/duplex-body">>),
+        ok = nhttp_test_helpers:h2_send_data(Sock, 1, <<"first">>, false),
+        Worker = probe_pid({data, <<"first">>}),
+        ?assertEqual(producer, probe_event(Worker)),
+        {headers, 1, _, nofin} = await_frame(Sock, is_headers(1)),
+        ok = ping_pong(Sock, 1, Worker, 4),
+        ok = end_request_then_response(Sock, 1, Worker),
+        ok = await_conn_idle(Server)
+    end).
+
+duplex_on_complete_request(_Config) ->
+    with_probe_server(#{}, fun(Server, Sock) ->
+        ok = nhttp_test_helpers:h2_send_headers(Sock, 1, <<"/duplex">>, 0, true),
+        Worker = probe_pid(producer),
+        MRef = erlang:monitor(process, Worker),
+        ?assertEqual({recv, {fin, []}}, script(Worker, {recv, ?PROBE_TIMEOUT})),
+        ?assertEqual({send, ok}, script(Worker, {send, <<"only">>})),
+        ?assertEqual({data, 1, <<"only">>, nofin}, await_frame(Sock, is_data(1))),
+        ok = script_async(Worker, {return, ok}),
+        ?assertEqual({data, 1, <<>>, fin}, await_frame(Sock, is_data(1))),
+        ok = await_down(MRef, Worker),
+        ?assertEqual([], [F || {rst_stream, 1, _} = F <- ping_frames(Sock)]),
+        ok = await_conn_idle(Server)
+    end).
+
+duplex_data_before_stream_result(_Config) ->
+    with_probe_server(#{}, fun(Server, Sock) ->
+        ok = open_stream(Sock, 1, <<"/duplex-blocked">>),
+        Worker = probe_worker(),
+        MRef = erlang:monitor(process, Worker),
+        Chunks = [<<"one">>, <<"two">>, <<"three">>],
+        ok = send_open_data(Sock, 1, Chunks),
+        Trailers = [{<<"x-trailer">>, <<"abc">>}],
+        ok = send_trailers(Sock, 1, Trailers),
+        ?assertEqual(0, credit(ping_frames(Sock), 1)),
+        Worker ! release,
+        ?assertEqual(producer, probe_event(Worker)),
+        ?assertEqual(
+            [{recv, {data, C}} || C <- Chunks],
+            [script(Worker, {recv, ?PROBE_TIMEOUT}) || _ <- Chunks]
+        ),
+        ?assertEqual({recv, {fin, Trailers}}, script(Worker, {recv, ?PROBE_TIMEOUT})),
+        ok = script_async(Worker, {return, ok}),
+        ok = await_down(MRef, Worker),
+        ok = await_conn_idle(Server)
+    end).
+
+duplex_fin_trailers(_Config) ->
+    with_probe_server(#{}, fun(Server, Sock) ->
+        Worker = open_duplex(Sock, 1, <<"/duplex">>),
+        MRef = erlang:monitor(process, Worker),
+        ok = nhttp_test_helpers:h2_send_data(Sock, 1, <<"body">>, false),
+        ?assertEqual({recv, {data, <<"body">>}}, script(Worker, {recv, ?PROBE_TIMEOUT})),
+        Trailers = [{<<"x-trailer">>, <<"abc">>}],
+        ok = send_trailers(Sock, 1, Trailers),
+        ?assertEqual({recv, {fin, Trailers}}, script(Worker, {recv, ?PROBE_TIMEOUT})),
+        ?assertEqual({recv, {fin, Trailers}}, script(Worker, {recv, 0})),
+        ok = script_async(Worker, {return, ok}),
+        ok = await_down(MRef, Worker),
+        ok = await_conn_idle(Server)
+    end).
+
+duplex_no_read_no_credit(_Config) ->
+    with_probe_server(#{}, fun(_Server, Sock) ->
+        Worker = open_duplex(Sock, 1, <<"/duplex">>),
+        MRef = erlang:monitor(process, Worker),
+        [First | _] = Chunks = window_chunks(),
+        ok = send_open_data(Sock, 1, Chunks),
+        Quiet = ping_frames(Sock),
+        ?assertEqual({0, 0}, {credit(Quiet, 0), credit(Quiet, 1)}),
+        ?assertEqual({recv, {data, First}}, script(Worker, {recv, ?PROBE_TIMEOUT})),
+        Credit = [await_frame(Sock, fun is_window_update/1) || _ <- [connection, stream]],
+        ?assertEqual(
+            [{window_update, 0, byte_size(First)}, {window_update, 1, byte_size(First)}],
+            lists:sort(Credit)
+        ),
+        After = ping_frames(Sock),
+        ?assertEqual({0, 0}, {credit(After, 0), credit(After, 1)}),
+        ok = script_async(Worker, {return, ok}),
+        ok = await_down(MRef, Worker)
+    end).
+
+duplex_send_blocks_reads_kept(_Config) ->
+    with_probe_server(#{}, fun(_Server, Sock) ->
+        ok = nhttp_test_helpers:h2_send_settings(
+            Sock, [{?H2_SETTINGS_INITIAL_WINDOW_SIZE, ?SMALL_WINDOW}]
+        ),
+        Worker = open_duplex(Sock, 1, <<"/duplex">>),
+        MRef = erlang:monitor(process, Worker),
+        ok = script_async(Worker, {send, binary:copy(<<"r">>, 2 * ?SMALL_WINDOW)}),
+        Half = binary:copy(<<"r">>, ?SMALL_WINDOW),
+        ?assertEqual({data, 1, Half, nofin}, await_frame(Sock, is_data(1))),
+        Chunks = [<<"one">>, <<"two">>, <<"three">>],
+        ok = send_open_data(Sock, 1, Chunks),
+        _ = ping_frames(Sock),
+        ok = no_probe_event(Worker),
+        ok = nhttp_test_helpers:h2_send_window_update(Sock, 1, ?SMALL_WINDOW),
+        ?assertEqual({send, ok}, probe_event(Worker)),
+        ?assertEqual({data, 1, Half, nofin}, await_frame(Sock, is_data(1))),
+        ?assertEqual(
+            [{recv, {data, C}} || C <- Chunks],
+            [script(Worker, {recv, ?PROBE_TIMEOUT}) || _ <- Chunks]
+        ),
+        ok = script_async(Worker, {return, ok}),
+        ok = await_down(MRef, Worker)
+    end).
+
+duplex_reset_in_recv(_Config) ->
+    with_probe_server(#{}, fun(Server, Sock) ->
+        Worker = open_duplex(Sock, 1, <<"/duplex">>),
+        MRef = erlang:monitor(process, Worker),
+        ok = script_async(Worker, {recv, infinity}),
+        ok = nhttp_test_helpers:h2_send_rst_stream(Sock, 1, ?H2_CANCEL),
+        ?assertEqual({recv, {abort, {peer_reset, cancel}}}, probe_event(Worker)),
+        ?assertEqual({recv, {abort, {peer_reset, cancel}}}, script(Worker, {recv, 0})),
+        ?assertEqual({send, {error, closed}}, script(Worker, {send, <<"late">>})),
+        ok = script_async(Worker, {return, ok}),
+        ok = await_down(MRef, Worker),
+        ok = assert_echo(Sock, 3),
+        ok = await_conn_idle(Server)
+    end).
+
+duplex_reset_in_send(_Config) ->
+    with_probe_server(#{}, fun(Server, Sock) ->
+        ok = nhttp_test_helpers:h2_send_settings(
+            Sock, [{?H2_SETTINGS_INITIAL_WINDOW_SIZE, ?SMALL_WINDOW}]
+        ),
+        Worker = open_duplex(Sock, 1, <<"/duplex">>),
+        MRef = erlang:monitor(process, Worker),
+        ok = script_async(Worker, {send, binary:copy(<<"r">>, 2 * ?SMALL_WINDOW)}),
+        {data, 1, _, nofin} = await_frame(Sock, is_data(1)),
+        ok = nhttp_test_helpers:h2_send_rst_stream(Sock, 1, ?H2_CANCEL),
+        ?assertEqual({send, {error, closed}}, probe_event(Worker)),
+        ?assertEqual({recv, {abort, {peer_reset, cancel}}}, script(Worker, {recv, 0})),
+        ok = script_async(Worker, {return, ok}),
+        ok = await_down(MRef, Worker),
+        ok = await_conn_idle(Server)
+    end).
+
+duplex_reset_after_request_end(_Config) ->
+    with_probe_server(#{}, fun(Server, Sock) ->
+        Worker = open_duplex(Sock, 1, <<"/duplex">>),
+        MRef = erlang:monitor(process, Worker),
+        ok = nhttp_test_helpers:h2_send_data(Sock, 1, <<"all">>, true),
+        ?assertEqual({recv, {data, <<"all">>}}, script(Worker, {recv, ?PROBE_TIMEOUT})),
+        ?assertEqual({recv, {fin, []}}, script(Worker, {recv, ?PROBE_TIMEOUT})),
+        ok = nhttp_test_helpers:h2_send_rst_stream(Sock, 1, ?H2_CANCEL),
+        _ = ping_frames(Sock),
+        ?assertEqual({send, {error, closed}}, script(Worker, {send, <<"late">>})),
+        ?assertEqual({recv, {fin, []}}, script(Worker, {recv, 0})),
+        ok = script_async(Worker, {return, ok}),
+        ok = await_down(MRef, Worker),
+        ok = assert_echo(Sock, 3),
+        ok = await_conn_idle(Server)
+    end).
+
+duplex_body_too_large(_Config) ->
+    with_probe_server(#{max_body_size => 8}, fun(Server, Sock) ->
+        Worker = open_duplex(Sock, 1, <<"/duplex">>),
+        MRef = erlang:monitor(process, Worker),
+        ok = nhttp_test_helpers:h2_send_data(Sock, 1, <<"12345">>, false),
+        ?assertEqual({recv, {data, <<"12345">>}}, script(Worker, {recv, ?PROBE_TIMEOUT})),
+        ok = nhttp_test_helpers:h2_send_data(Sock, 1, <<"6789012345">>, false),
+        ?assertEqual(
+            {rst_stream, 1, ?H2_INTERNAL_ERROR}, await_frame(Sock, is_stream_end(1))
+        ),
+        ?assertEqual({recv, {abort, body_too_large}}, script(Worker, {recv, ?PROBE_TIMEOUT})),
+        ?assertEqual({send, {error, closed}}, script(Worker, {send, <<"late">>})),
+        ok = script_async(Worker, {return, ok}),
+        ok = await_down(MRef, Worker),
+        ok = await_conn_idle(Server)
+    end).
+
+duplex_response_end_resets_open_request(_Config) ->
+    with_probe_server(#{}, fun(Server, Sock) ->
+        Worker = open_duplex(Sock, 1, <<"/duplex">>),
+        MRef = erlang:monitor(process, Worker),
+        ok = nhttp_test_helpers:h2_send_data(Sock, 1, <<"unread">>, false),
+        _ = ping_frames(Sock),
+        ok = script_async(Worker, {return, ok}),
+        ok = await_down(MRef, Worker),
+        ok = nhttp_test_helpers:h2_send_data(Sock, 1, <<"late">>, false),
+        ok = nhttp_test_helpers:h2_send_rst_stream(Sock, 1, ?H2_CANCEL),
+        Frames = ping_frames(Sock),
+        ?assertEqual(
+            [{data, 1, <<>>, fin}, {rst_stream, 1, ?H2_NO_ERROR}], response_frames(Frames, 1)
+        ),
+        ?assertEqual(byte_size(<<"unread">>) + byte_size(<<"late">>), credit(Frames, 0)),
+        ok = assert_echo(Sock, 3),
+        ok = await_conn_idle(Server)
+    end).
+
+duplex_producer_crash_resets_stream(_Config) ->
+    with_probe_server(#{}, fun(Server, Sock) ->
+        Worker = open_duplex(Sock, 1, <<"/duplex">>),
+        MRef = erlang:monitor(process, Worker),
+        ok = nhttp_test_helpers:h2_send_data(Sock, 1, <<"unread">>, false),
+        _ = ping_frames(Sock),
+        ok = script_async(Worker, crash),
+        ok = await_down(MRef, Worker),
+        Frames = ping_frames(Sock),
+        ?assertEqual([{rst_stream, 1, ?H2_INTERNAL_ERROR}], response_frames(Frames, 1)),
+        ?assertEqual(byte_size(<<"unread">>), credit(Frames, 0)),
+        ok = await_conn_idle(Server)
+    end).
+
+duplex_on_response_policy_credits_reads(_Config) ->
+    Opts = #{h2_connection_window_policy => on_response, h2_stream_window_policy => on_response},
+    with_probe_server(Opts, fun(Server, Sock) ->
+        ok = open_stream(Sock, 1, <<"/duplex-body">>),
+        First = <<"first">>,
+        ok = nhttp_test_helpers:h2_send_data(Sock, 1, First, false),
+        Worker = probe_pid({data, First}),
+        MRef = erlang:monitor(process, Worker),
+        ?assertEqual(producer, probe_event(Worker)),
+        Held = frames_before(Sock, is_headers(1)),
+        ?assertEqual({byte_size(First), byte_size(First)}, {credit(Held, 0), credit(Held, 1)}),
+        Second = <<"second">>,
+        ok = nhttp_test_helpers:h2_send_data(Sock, 1, Second, false),
+        Quiet = ping_frames(Sock),
+        ?assertEqual({0, 0}, {credit(Quiet, 0), credit(Quiet, 1)}),
+        ?assertEqual({recv, {data, Second}}, script(Worker, {recv, ?PROBE_TIMEOUT})),
+        Read = ping_frames(Sock),
+        ?assertEqual({byte_size(Second), byte_size(Second)}, {credit(Read, 0), credit(Read, 1)}),
+        ok = script_async(Worker, {return, ok}),
+        ok = await_down(MRef, Worker),
+        ok = await_conn_idle(Server)
+    end).
+
+simplex_request_body_is_credited(_Config) ->
+    with_probe_server(#{}, fun(Server, Sock) ->
+        ok = open_stream(Sock, 1, <<"/simplex">>),
+        Worker = probe_pid(producer),
+        MRef = erlang:monitor(process, Worker),
+        {headers, 1, _, nofin} = await_frame(Sock, is_headers(1)),
+        ok = send_open_data(Sock, 1, window_chunks()),
+        Frames = ping_frames(Sock),
+        ?assertEqual(
+            {?H2_DEFAULT_WINDOW, ?H2_DEFAULT_WINDOW}, {credit(Frames, 0), credit(Frames, 1)}
+        ),
+        ok = nhttp_test_helpers:h2_send_data(Sock, 1, <<>>, true),
+        ?assertEqual({send, ok}, script(Worker, {send, <<"out">>})),
+        ok = script_async(Worker, {return, ok}),
+        ?assertEqual({data, 1, <<>>, fin}, await_frame(Sock, is_stream_end(1))),
+        ok = await_down(MRef, Worker),
+        ?assertEqual([], [F || {rst_stream, 1, _} = F <- ping_frames(Sock)]),
+        ok = await_conn_idle(Server)
+    end).
+
+simplex_response_end_resets_open_request(_Config) ->
+    with_probe_server(#{}, fun(Server, Sock) ->
+        ok = open_stream(Sock, 1, <<"/simplex">>),
+        Worker = probe_pid(producer),
+        MRef = erlang:monitor(process, Worker),
+        ok = script_async(Worker, {return, ok}),
+        ?assertEqual({data, 1, <<>>, fin}, await_frame(Sock, is_stream_end(1))),
+        ?assertEqual({rst_stream, 1, ?H2_NO_ERROR}, await_frame(Sock, is_rst_stream(1))),
+        ok = await_down(MRef, Worker),
+        ok = await_conn_idle(Server)
+    end).
+
 has_rst_stream(Frames, StreamId) ->
     lists:any(
         fun
@@ -565,3 +922,167 @@ has_rst_no_error(Frames, StreamId) ->
         end,
         Frames
     ).
+
+%%%-----------------------------------------------------------------------------
+%%% DUPLEX HELPERS
+%%%-----------------------------------------------------------------------------
+
+with_probe_server(Opts, Fun) ->
+    {Pid, Port} = nhttp_test_helpers:h2_start_server(?MODULE, Opts),
+    true = register(?PROBE, self()),
+    try
+        {ok, Sock} = nhttp_test_helpers:h2_connect(Port),
+        Fun(Pid, Sock),
+        ssl:close(Sock)
+    after
+        unregister(?PROBE),
+        nhttp:stop(Pid)
+    end.
+
+open_stream(Sock, StreamId, Path) ->
+    {ok, Enc} = nhttp_hpack:new(),
+    Headers = [
+        {<<":method">>, <<"POST">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"localhost">>},
+        {<<":path">>, Path}
+    ],
+    {ok, IOList, _Enc1} = nhttp_hpack:encode(Headers, Enc),
+    Block = iolist_to_binary(IOList),
+    ssl:send(Sock, <<(byte_size(Block)):24, 1, 16#04, 0:1, StreamId:31, Block/binary>>).
+
+open_duplex(Sock, StreamId, Path) ->
+    ok = open_stream(Sock, StreamId, Path),
+    Worker = probe_pid(producer),
+    {headers, StreamId, _, nofin} = await_frame(Sock, is_headers(StreamId)),
+    Worker.
+
+ping_pong(_Sock, _StreamId, _Worker, 0) ->
+    ok;
+ping_pong(Sock, StreamId, Worker, Round) ->
+    Ping = <<"ping-", (integer_to_binary(Round))/binary>>,
+    Pong = <<"pong-", (integer_to_binary(Round))/binary>>,
+    ok = nhttp_test_helpers:h2_send_data(Sock, StreamId, Ping, false),
+    ?assertEqual({recv, {data, Ping}}, script(Worker, {recv, ?PROBE_TIMEOUT})),
+    ?assertEqual({send, ok}, script(Worker, {send, Pong})),
+    ?assertEqual({data, StreamId, Pong, nofin}, await_frame(Sock, is_data(StreamId))),
+    ping_pong(Sock, StreamId, Worker, Round - 1).
+
+end_request_then_response(Sock, StreamId, Worker) ->
+    MRef = erlang:monitor(process, Worker),
+    ok = nhttp_test_helpers:h2_send_data(Sock, StreamId, <<>>, true),
+    ?assertEqual({recv, {data, <<>>}}, script(Worker, {recv, ?PROBE_TIMEOUT})),
+    ?assertEqual({recv, {fin, []}}, script(Worker, {recv, ?PROBE_TIMEOUT})),
+    ?assertEqual({recv, {fin, []}}, script(Worker, {recv, 0})),
+    ok = script_async(Worker, {return, {trailers, [{<<"x-status">>, <<"0">>}]}}),
+    {headers, StreamId, _, fin} = await_frame(Sock, is_headers(StreamId)),
+    await_down(MRef, Worker).
+
+script(Worker, Step) ->
+    ok = script_async(Worker, Step),
+    probe_event(Worker).
+
+script_async(Worker, Step) ->
+    Worker ! {script, Step},
+    ok.
+
+probe_pid(Event) ->
+    receive
+        {probe, Worker, Event} -> Worker
+    after ?PROBE_TIMEOUT ->
+        error({no_probe_event, Event})
+    end.
+
+send_open_data(_Sock, _StreamId, []) ->
+    ok;
+send_open_data(Sock, StreamId, [Chunk | Rest]) ->
+    ok = nhttp_test_helpers:h2_send_data(Sock, StreamId, Chunk, false),
+    send_open_data(Sock, StreamId, Rest).
+
+window_chunks() ->
+    Full = binary:copy(<<"w">>, ?H2_DEFAULT_FRAME),
+    Last = binary:copy(<<"w">>, ?H2_DEFAULT_WINDOW - 3 * ?H2_DEFAULT_FRAME),
+    [Full, Full, Full, Last].
+
+credit(Frames, StreamId) ->
+    lists:sum([Inc || {window_update, Id, Inc} <- Frames, Id =:= StreamId]).
+
+recv_frame(Sock) ->
+    {ok, <<Len:24, _/binary>> = Head} = ssl:recv(Sock, 9, ?FRAME_TIMEOUT),
+    Payload = recv_payload(Sock, Len),
+    {[Frame], <<>>} = nhttp_test_helpers:decode_h2_frames(<<Head/binary, Payload/binary>>),
+    Frame.
+
+recv_payload(_Sock, 0) ->
+    <<>>;
+recv_payload(Sock, Len) ->
+    {ok, Payload} = ssl:recv(Sock, Len, ?FRAME_TIMEOUT),
+    Payload.
+
+await_frame(Sock, Pred) ->
+    Frame = recv_frame(Sock),
+    case Pred(Frame) of
+        true -> Frame;
+        false -> await_frame(Sock, Pred)
+    end.
+
+%% The server answers a PING ahead of the frames that the events of the same
+%% socket read produce. The second PING leaves after the first answer, so the
+%% server reads it in a later read and its answer follows those frames.
+ping_frames(Sock) ->
+    ping_round(Sock) ++ ping_round(Sock).
+
+frames_before(Sock, Pred) ->
+    frames_before(Sock, Pred, []).
+
+frames_before(Sock, Pred, Acc) ->
+    Frame = recv_frame(Sock),
+    case Pred(Frame) of
+        true -> lists:reverse(Acc);
+        false -> frames_before(Sock, Pred, [Frame | Acc])
+    end.
+
+ping_round(Sock) ->
+    Opaque = <<(erlang:unique_integer([positive])):64>>,
+    ok = nhttp_test_helpers:h2_send_raw(Sock, <<8:24, ?H2_FRAME_PING, 0, 0:32, Opaque/binary>>),
+    frames_until_ping(Sock, Opaque, []).
+
+frames_until_ping(Sock, Opaque, Acc) ->
+    case recv_frame(Sock) of
+        {other, 0, ?H2_FRAME_PING, Opaque} -> lists:reverse(Acc);
+        Frame -> frames_until_ping(Sock, Opaque, [Frame | Acc])
+    end.
+
+is_data(StreamId) ->
+    fun
+        ({data, Id, _, _}) -> Id =:= StreamId;
+        (_) -> false
+    end.
+
+is_headers(StreamId) ->
+    fun
+        ({headers, Id, _, _}) -> Id =:= StreamId;
+        (_) -> false
+    end.
+
+is_rst_stream(StreamId) ->
+    fun
+        ({rst_stream, Id, _}) -> Id =:= StreamId;
+        (_) -> false
+    end.
+
+is_stream_end(StreamId) ->
+    fun(Frame) -> nhttp_test_helpers:h2_stream_done([Frame], StreamId) end.
+
+is_window_update({window_update, _, _}) -> true;
+is_window_update(_) -> false.
+
+await_conn_idle(Server) ->
+    [Conn] = nhttp_test_helpers:conn_pids(Server),
+    nhttp_test_helpers:wait_until(fun() -> conn_idle(Conn) end, ?PROBE_TIMEOUT).
+
+conn_idle(Conn) ->
+    #state{protocol_state = #h2_state{h2_streams = Streams, h2_workers = Workers}} =
+        sys:get_state(Conn),
+    {monitors, Monitors} = erlang:process_info(Conn, monitors),
+    {Streams, Workers, Monitors} =:= {#{}, #{}, []}.

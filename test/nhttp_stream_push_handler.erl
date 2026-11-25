@@ -100,6 +100,9 @@ handle_request(#{path := <<"/push/slow">>}, State) ->
 handle_request(#{path := <<"/push/no-content">>}, State) ->
     Producer = fun(SendChunk) -> SendChunk(<<"noop">>) end,
     {stream, nhttp_stream:producer(204, [], Producer), State};
+handle_request(#{path := <<"/push/duplex">>}, State) ->
+    Producer = fun(SendChunk, _RecvBody) -> SendChunk(<<"noop">>) end,
+    {stream, nhttp_stream:producer(200, [], Producer), State};
 handle_request(#{path := <<"/push/not-modified">>}, State) ->
     Producer = fun(SendChunk) -> SendChunk(<<"noop">>) end,
     {stream, nhttp_stream:producer(304, [], Producer), State};

@@ -21,6 +21,7 @@
     h1_head_request/1,
     h1_no_content_rejected/1,
     h1_http1_0_rejected/1,
+    h1_duplex_producer_rejected/1,
     h1_client_closes_midstream/1,
     h1_client_closes_during_sleep/1,
     h1_producer_crash/1,
@@ -55,6 +56,7 @@
     h3_head_request/1,
     h3_no_content_rejected/1,
     h3_not_modified_rejected/1,
+    h3_duplex_producer_rejected/1,
     h3_concurrent_streams/1,
     h3_with_trailers/1,
     h3_client_resets_stream/1,
@@ -81,6 +83,7 @@ groups() ->
             h1_head_request,
             h1_no_content_rejected,
             h1_http1_0_rejected,
+            h1_duplex_producer_rejected,
             h1_client_closes_midstream,
             h1_client_closes_during_sleep,
             h1_producer_crash,
@@ -115,6 +118,7 @@ groups() ->
             h3_head_request,
             h3_no_content_rejected,
             h3_not_modified_rejected,
+            h3_duplex_producer_rejected,
             h3_concurrent_streams,
             h3_with_trailers,
             h3_client_resets_stream,
@@ -222,6 +226,18 @@ h1_no_content_rejected(_Config) ->
     try
         {ok, Sock} = gen_tcp:connect("127.0.0.1", Port, [binary, {active, false}]),
         ok = gen_tcp:send(Sock, <<"GET /push/no-content HTTP/1.1\r\nHost: x\r\n\r\n">>),
+        Resp = recv_all(Sock, <<>>, 5000),
+        ?assertMatch(<<"HTTP/1.1 500", _/binary>>, Resp),
+        gen_tcp:close(Sock)
+    after
+        nhttp:stop(Pid)
+    end.
+
+h1_duplex_producer_rejected(_Config) ->
+    {Pid, Port} = start_h1_server(#{}),
+    try
+        {ok, Sock} = gen_tcp:connect("127.0.0.1", Port, [binary, {active, false}]),
+        ok = gen_tcp:send(Sock, <<"GET /push/duplex HTTP/1.1\r\nHost: x\r\n\r\n">>),
         Resp = recv_all(Sock, <<>>, 5000),
         ?assertMatch(<<"HTTP/1.1 500", _/binary>>, Resp),
         gen_tcp:close(Sock)
@@ -889,6 +905,16 @@ h3_no_content_rejected(Config) ->
     try
         {QConn, H3} = h3_connect(Port),
         {ok, 500, _Hs, _B, _} = h3_do_request(QConn, H3, <<"GET">>, <<"/push/no-content">>),
+        nhttp_h3_test_client:close(QConn)
+    after
+        nhttp:stop(Pid)
+    end.
+
+h3_duplex_producer_rejected(Config) ->
+    {Pid, Port} = start_h3_server(Config),
+    try
+        {QConn, H3} = h3_connect(Port),
+        {ok, 500, _Hs, _B, _} = h3_do_request(QConn, H3, <<"GET">>, <<"/push/duplex">>),
         nhttp_h3_test_client:close(QConn)
     after
         nhttp:stop(Pid)

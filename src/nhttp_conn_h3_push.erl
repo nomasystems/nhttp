@@ -30,14 +30,14 @@
     nhttp_lib:request(),
     nhttp_lib:status(),
     nhttp_lib:headers(),
-    nhttp_stream:producer(),
+    nhttp_stream:producer() | nhttp_stream:duplex_producer(),
     term(),
     {nhttp_otel:span_ctx(), integer()}
 ) -> #state{}.
 dispatch_h3_stream_push(
     State, StreamId, Request, Status, Headers, Producer, NewHState, ReqSpan
 ) ->
-    case validate_h3_stream_push(Request, Status) of
+    case validate_h3_stream_push(Request, Status, Producer) of
         ok_head ->
             RespHeaders = [{<<":status">>, integer_to_binary(Status)} | Headers],
             State1 = nhttp_conn_h3:send_h3_headers(State, StreamId, RespHeaders, fin),
@@ -386,13 +386,23 @@ start_h3_stream_push(
         requests_count = State#state.requests_count + 1
     }.
 
--spec validate_h3_stream_push(nhttp_lib:request(), nhttp_lib:status()) ->
+-doc """
+The HTTP/3 connection gives no request body to a producer, so the result
+of a duplex producer is rejected.
+""".
+-spec validate_h3_stream_push(
+    nhttp_lib:request(),
+    nhttp_lib:status(),
+    nhttp_stream:producer() | nhttp_stream:duplex_producer()
+) ->
     ok | ok_head | {reject, term()}.
-validate_h3_stream_push(_Request, Status) when
+validate_h3_stream_push(_Request, _Status, Producer) when is_function(Producer, 2) ->
+    {reject, duplex_producer_not_supported};
+validate_h3_stream_push(_Request, Status, _Producer) when
     Status =:= ?HTTP_NO_CONTENT; Status =:= ?HTTP_NOT_MODIFIED
 ->
     {reject, {no_body_status, Status}};
-validate_h3_stream_push(#{method := head}, _Status) ->
+validate_h3_stream_push(#{method := head}, _Status, _Producer) ->
     ok_head;
-validate_h3_stream_push(_Request, _Status) ->
+validate_h3_stream_push(_Request, _Status, _Producer) ->
     ok.

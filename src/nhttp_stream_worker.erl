@@ -25,6 +25,7 @@
 %% LOCAL MACROS
 %%%-----------------------------------------------------------------------------
 -define(TERMINAL_KEY, '$nhttp_stream_terminal').
+-define(BODY_TERMINAL_KEY, '$nhttp_stream_body_terminal').
 -define(REAP_GRACE, 5000).
 
 %%%-----------------------------------------------------------------------------
@@ -66,7 +67,12 @@ are dropped, while stuck survivors are `kill`ed. See
 `nhttp_conn:terminate/2`, `nhttp_conn_h3:terminate/2`, and the h1 push
 teardown.
 """.
--spec start(pid(), reference(), nhttp_stream:producer(), [nhttp:conn_spawn_opt()]) -> pid().
+-spec start(
+    pid(),
+    reference(),
+    nhttp_stream:producer() | nhttp_stream:duplex_producer(),
+    [nhttp:conn_spawn_opt()]
+) -> pid().
 start(ConnPid, Ref, Producer, SpawnOpts) ->
     spawn_worker(run, [ConnPid, Ref, Producer], SpawnOpts).
 
@@ -119,11 +125,10 @@ reaper(Pids) ->
     MRefs = maps:from_list([{erlang:monitor(process, P), P} || P <- Pids]),
     reaper_wait(MRefs).
 
--spec run(pid(), reference(), nhttp_stream:producer()) -> ok.
+-spec run(pid(), reference(), nhttp_stream:producer() | nhttp_stream:duplex_producer()) -> ok.
 run(ConnPid, Ref, Producer) ->
     MRef = erlang:monitor(process, ConnPid),
-    SendChunk = fun(Data) -> send_chunk(ConnPid, Ref, MRef, Data) end,
-    finalize_producer(ConnPid, Ref, MRef, Producer(SendChunk)).
+    run_producer(ConnPid, Ref, MRef, Producer).
 
 -spec run_request(
     pid(), nhttp_lib:stream_id(), reference(), module(), nhttp_lib:request(), term()
@@ -140,6 +145,17 @@ run_request(ConnPid, StreamId, Ref, Handler, Request, HState) ->
 ack_body_chunk(ConnPid, Ref) ->
     ConnPid ! {body_chunk_ack, self(), Ref},
     ok.
+
+-doc """
+End the request body of a duplex producer with `{abort, closed}`: the
+stream or the connection ended and no body event says why. The send side
+is closed too.
+""".
+-spec close_body() -> {abort, closed}.
+close_body() ->
+    put(?TERMINAL_KEY, closed),
+    put(?BODY_TERMINAL_KEY, {abort, closed}),
+    {abort, closed}.
 
 -spec dispatch_result(
     pid(),
@@ -215,6 +231,21 @@ finish(ConnPid, Ref, MRef) ->
             end
     end.
 
+-doc """
+Record the last body event that `handle_request_body/3` took, so that the
+read fun of a duplex producer returns it and does not wait for an event
+that the connection already sent.
+""".
+-spec keep_body_terminal(nhttp_handler:body_event()) -> ok.
+keep_body_terminal({data, _Chunk}) ->
+    ok;
+keep_body_terminal({fin, _Trailers} = Terminal) ->
+    put(?BODY_TERMINAL_KEY, Terminal),
+    ok;
+keep_body_terminal({abort, _Reason} = Terminal) ->
+    put(?BODY_TERMINAL_KEY, Terminal),
+    ok.
+
 -spec post_result(pid(), nhttp_lib:stream_id(), reference(), term()) -> ok.
 post_result(ConnPid, StreamId, Ref, Result) ->
     ConnPid ! {request_result, StreamId, Ref, Result},
@@ -229,6 +260,55 @@ reaper_wait(MRefs) ->
             reaper_wait(maps:remove(MRef, MRefs))
     after ?REAP_GRACE ->
         ok = lists:foreach(fun(Pid) -> exit(Pid, kill) end, maps:values(MRefs))
+    end.
+
+-doc """
+The read fun of a duplex producer. It takes the next body event of the
+stream from the mailbox and acknowledges a `data` event, which is when
+the connection credits the receive windows. The last event is kept and
+returned again by every later call. An error `chunk_ack` that no
+`SendChunk` waits for means that the connection closed the stream. The
+connection sends the last body event before that `chunk_ack`, so a closed
+send side with no body event in the mailbox ends the body.
+""".
+-spec recv_body(pid(), reference(), reference(), timeout()) ->
+    nhttp_handler:body_event() | timeout.
+recv_body(ConnPid, Ref, MRef, Timeout) ->
+    case get(?BODY_TERMINAL_KEY) of
+        undefined -> recv_body_event(ConnPid, Ref, MRef, recv_body_wait(Timeout));
+        Terminal -> Terminal
+    end.
+
+-spec recv_body_event(pid(), reference(), reference(), timeout()) ->
+    nhttp_handler:body_event() | timeout.
+recv_body_event(ConnPid, Ref, MRef, Wait) ->
+    receive
+        {body_chunk, Ref, {data, _Chunk} = Event} ->
+            ack_body_chunk(ConnPid, Ref),
+            Event;
+        {body_chunk, Ref, Terminal} ->
+            put(?BODY_TERMINAL_KEY, Terminal),
+            Terminal;
+        {chunk_ack, Ref, {error, _Reason}} ->
+            close_body();
+        {'DOWN', MRef, process, ConnPid, _Reason} ->
+            close_body()
+    after Wait ->
+        recv_body_idle()
+    end.
+
+-spec recv_body_idle() -> {abort, closed} | timeout.
+recv_body_idle() ->
+    case get(?TERMINAL_KEY) of
+        closed -> close_body();
+        _ -> timeout
+    end.
+
+-spec recv_body_wait(timeout()) -> timeout().
+recv_body_wait(Timeout) ->
+    case get(?TERMINAL_KEY) of
+        closed -> 0;
+        _ -> Timeout
     end.
 
 -spec run_body(
@@ -266,18 +346,29 @@ run_body(ConnPid, StreamId, Ref, MRef, Handler, {accept_body, BodyState, HState}
                     post_result(ConnPid, StreamId, Ref, Exc),
                     ok;
                 Final ->
+                    ok = keep_body_terminal(Event),
                     dispatch_result(ConnPid, StreamId, Ref, MRef, Handler, Final, HState)
             end;
         {'DOWN', MRef, process, ConnPid, _Reason} ->
             ok
     end.
 
+-spec run_producer(
+    pid(), reference(), reference(), nhttp_stream:producer() | nhttp_stream:duplex_producer()
+) -> ok.
+run_producer(ConnPid, Ref, MRef, Producer) when is_function(Producer, 1) ->
+    SendChunk = fun(Data) -> send_chunk(ConnPid, Ref, MRef, Data) end,
+    finalize_producer(ConnPid, Ref, MRef, Producer(SendChunk));
+run_producer(ConnPid, Ref, MRef, Producer) when is_function(Producer, 2) ->
+    SendChunk = fun(Data) -> send_chunk(ConnPid, Ref, MRef, Data) end,
+    RecvBody = fun(Timeout) -> recv_body(ConnPid, Ref, MRef, Timeout) end,
+    finalize_producer(ConnPid, Ref, MRef, Producer(SendChunk, RecvBody)).
+
 -spec run_stream_spec(
     pid(), reference(), reference(), nhttp_stream:spec()
 ) -> ok.
 run_stream_spec(ConnPid, Ref, MRef, {producer, _Status, _Headers, Producer}) ->
-    SendChunk = fun(Data) -> send_chunk(ConnPid, Ref, MRef, Data) end,
-    finalize_producer(ConnPid, Ref, MRef, Producer(SendChunk)).
+    run_producer(ConnPid, Ref, MRef, Producer).
 
 -spec send_chunk(pid(), reference(), reference(), iodata()) ->
     ok | {error, closed | timeout}.

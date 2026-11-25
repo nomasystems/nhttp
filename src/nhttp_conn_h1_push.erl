@@ -32,7 +32,7 @@
     nhttp_lib:request(),
     nhttp_lib:status(),
     nhttp_lib:headers(),
-    nhttp_stream:producer(),
+    nhttp_stream:producer() | nhttp_stream:duplex_producer(),
     term(),
     {nhttp_otel:span_ctx(), integer()}
 ) -> #state{} | {stream_push, #state{}, h1_push_ctx()}.
@@ -45,7 +45,7 @@ dispatch_h1_stream_push(
     NewHState,
     ReqSpan
 ) ->
-    case validate_h1_stream_push(Request, Status) of
+    case validate_h1_stream_push(Request, Status, Producer) of
         ok_head ->
             KeepAlive =
                 case nhttp_conn_h1:send_h1_response_head(State, Status, Headers) of
@@ -242,15 +242,25 @@ start_h1_stream_push(#state{opts = Opts} = State, Status, Producer, NewHState, R
     },
     {stream_push, NewState, Ctx}.
 
--spec validate_h1_stream_push(nhttp_lib:request(), nhttp_lib:status()) ->
+-doc """
+A duplex producer reads the request while it sends the response. An
+HTTP/1.1 client sends the whole request first, so the result is rejected.
+""".
+-spec validate_h1_stream_push(
+    nhttp_lib:request(),
+    nhttp_lib:status(),
+    nhttp_stream:producer() | nhttp_stream:duplex_producer()
+) ->
     ok | ok_head | {reject, term()}.
-validate_h1_stream_push(#{version := http1_0}, _Status) ->
+validate_h1_stream_push(_Request, _Status, Producer) when is_function(Producer, 2) ->
+    {reject, duplex_producer_not_supported};
+validate_h1_stream_push(#{version := http1_0}, _Status, _Producer) ->
     {reject, http_1_0_not_supported};
-validate_h1_stream_push(_Request, Status) when
+validate_h1_stream_push(_Request, Status, _Producer) when
     Status =:= ?HTTP_NO_CONTENT; Status =:= ?HTTP_NOT_MODIFIED
 ->
     {reject, {no_body_status, Status}};
-validate_h1_stream_push(#{method := head}, _Status) ->
+validate_h1_stream_push(#{method := head}, _Status, _Producer) ->
     ok_head;
-validate_h1_stream_push(_Request, _Status) ->
+validate_h1_stream_push(_Request, _Status, _Producer) ->
     ok.
