@@ -1121,11 +1121,7 @@ handle_h2_request_data(
                     }
             end;
         {error, body_too_large} ->
-            Unread = Stream#h2_stream{
-                body_window_pending =
-                    queue:in(byte_size(Data), Stream#h2_stream.body_window_pending)
-            },
-            handle_h2_streaming_body_too_large(State, StreamId, Unread)
+            handle_h2_streaming_body_too_large(State, StreamId, Stream, Data)
     end.
 
 -spec handle_h2_request_result(#state{}, nhttp_lib:stream_id(), reference(), term()) ->
@@ -1181,12 +1177,16 @@ handle_h2_response_delay(
             State
     end.
 
--spec handle_h2_streaming_body_too_large(#state{}, nhttp_lib:stream_id(), #h2_stream{}) ->
-    #state{}.
-handle_h2_streaming_body_too_large(State, StreamId, #h2_stream{type = request} = Stream) ->
+-spec handle_h2_streaming_body_too_large(
+    #state{}, nhttp_lib:stream_id(), #h2_stream{}, binary()
+) -> #state{}.
+handle_h2_streaming_body_too_large(State, StreamId, #h2_stream{type = request} = Stream, _Data) ->
     ok = abort_body_worker(Stream, body_too_large),
     handle_h2_limit_error(State, StreamId, body_too_large);
-handle_h2_streaming_body_too_large(State, StreamId, #h2_stream{type = stream} = Stream) ->
+handle_h2_streaming_body_too_large(State, StreamId, #h2_stream{type = stream} = Stream0, Data) ->
+    Stream = Stream0#h2_stream{
+        body_window_pending = queue:in(byte_size(Data), Stream0#h2_stream.body_window_pending)
+    },
     ok = close_producer_worker(Stream, body_too_large),
     State1 = send_h2_rst_stream(put_h2_stream(State, StreamId, Stream), StreamId),
     complete_h2_stream(State1, StreamId, body_too_large).
@@ -1406,6 +1406,15 @@ release_stream_response_credit(
 release_stream_response_credit(State, _StreamId, _Octets) ->
     {State, []}.
 
+-spec release_stream_threshold_credit(#state{}, nhttp_lib:stream_id(), non_neg_integer()) ->
+    {#state{}, iodata()}.
+release_stream_threshold_credit(
+    #state{protocol_state = #h2_state{stream_credit = {threshold, _}}} = State, StreamId, Octets
+) when Octets > 0 ->
+    window_update_frame(State, StreamId, Octets);
+release_stream_threshold_credit(State, _StreamId, _Octets) ->
+    {State, []}.
+
 -doc """
 Credit the peer for `Size` consumed octets on both receive windows
 through the resolved policies. The `eager` pair is the default and sends
@@ -1450,27 +1459,18 @@ start_h2_stream_push_response(
     end.
 
 -doc """
-Release the credit that an `on_response` policy held for the request of
-a stream that starts a producer response. The frames go ahead of the
-response HEADERS. From here the policy credits each chunk when the
-producer takes it, because a held credit stops a duplex stream.
+Release the credit that the policies held for the request of a stream
+that starts a producer response. `on_response` holds credit on both
+windows and `{threshold, _}` holds it on the stream window. The frames go
+ahead of the response HEADERS. From here the policies credit each chunk
+when the producer takes it, because a held credit stops a duplex stream.
 """.
 -spec start_producer_credit(#state{}, nhttp_lib:stream_id(), #h2_stream{}) ->
     {#state{}, #h2_stream{}, iodata()}.
-start_producer_credit(
-    #state{protocol_state = #h2_state{conn_credit = {on_response, _, _}}} = State,
-    StreamId,
-    Stream
-) ->
+start_producer_credit(State, StreamId, #h2_stream{uncredited = Held} = Stream) ->
     {State1, Credit} = release_response_credit(State, StreamId, Stream),
-    {State1, Stream#h2_stream{conn_uncredited = 0}, Credit};
-start_producer_credit(
-    #state{protocol_state = #h2_state{stream_credit = on_response}} = State, StreamId, Stream
-) ->
-    {State1, Credit} = release_response_credit(State, StreamId, Stream),
-    {State1, Stream#h2_stream{uncredited = 0}, Credit};
-start_producer_credit(State, _StreamId, Stream) ->
-    {State, Stream, []}.
+    {State2, Threshold} = release_stream_threshold_credit(State1, StreamId, Held),
+    {State2, Stream#h2_stream{uncredited = 0, conn_uncredited = 0}, join_credit(Credit, Threshold)}.
 
 -spec stream(#state{}, nhttp_lib:stream_id()) -> #h2_stream{}.
 stream(#state{protocol_state = #h2_state{h2_streams = Streams}}, StreamId) ->
