@@ -68,6 +68,12 @@ For streaming responses, return `{stream, Spec, State}` where `Spec` is
 built with `nhttp_stream:producer/3` (push-based fun in a dedicated
 worker). See `nhttp_stream` for examples.
 
+On HTTP/2 a producer of arity 2 reads the request body of its stream
+while it sends the response. Its `RecvBody` fun returns the
+`t:body_event/0` values that `handle_request_body/3` gets, and
+`{abort, closed}` when the stream or the connection ends with no other
+event. See "Request body on HTTP/2" in `nhttp_stream`.
+
 ## Streaming request bodies
 
 To consume a request body chunk-by-chunk instead of buffering, return

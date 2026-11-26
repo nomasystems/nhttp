@@ -319,6 +319,10 @@ credit for the body of a request ahead of the response headers of its
 holds that credit until the responded octets reach the batch, then
 sends one WINDOW_UPDATE of exactly the batch. `never` sends no credit.
 Default `eager`.
+
+A `{stream, _, _}` result releases the credit that `on_response` holds
+ahead of its response headers. From there `on_response` sends the credit
+for each chunk when the producer takes it or the connection drops it.
 """.
 -type h2_window_policy() ::
     eager | {threshold, pos_integer()} | {delay, non_neg_integer()} | on_response | never.

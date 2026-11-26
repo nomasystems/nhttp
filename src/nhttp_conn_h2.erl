@@ -400,8 +400,9 @@ apply_request_result(
         0 -> complete_h2_reply(State1, StreamId, Stream, Response);
         _ -> hold_h2_reply(State1, StreamId, Stream, Response, Delay)
     end;
-apply_request_result(State, StreamId, {stream, {producer, Status, Headers, _Producer}, NewHState}) ->
-    start_h2_stream_push_response(State, StreamId, Status, Headers, NewHState);
+apply_request_result(State, StreamId, {stream, {producer, Status, Headers, Producer}, NewHState}) ->
+    Duplex = is_function(Producer, 2),
+    start_h2_stream_push_response(State, StreamId, Status, Headers, Duplex, NewHState);
 apply_request_result(State, StreamId, {accept_body, _BodyState, NewHState}) ->
     enter_h2_accept_body(State, StreamId, NewHState);
 apply_request_result(State, StreamId, {upgrade, websocket, _NewHState}) ->
@@ -618,6 +619,10 @@ abort_stream_worker(
             State
     end.
 
+-spec add_octets(non_neg_integer(), non_neg_integer()) -> non_neg_integer().
+add_octets(Size, Total) when is_integer(Size), is_integer(Total) ->
+    Size + Total.
+
 -spec apply_conn_credit(#state{}, nhttp_lib:stream_id(), pos_integer()) -> #state{}.
 apply_conn_credit(
     #state{protocol_state = #h2_state{conn_credit = eager}} = State, _StreamId, Size
@@ -659,12 +664,19 @@ apply_conn_credit(
     StreamId,
     Size
 ) ->
-    #h2_stream{conn_uncredited = Acc} = Stream = maps:get(StreamId, Streams),
-    State#state{
-        protocol_state = H2#h2_state{
-            h2_streams = Streams#{StreamId => Stream#h2_stream{conn_uncredited = Acc + Size}}
-        }
-    }.
+    case maps:get(StreamId, Streams) of
+        #h2_stream{type = stream} ->
+            {State1, Frames} = release_conn_response_credit(State, Size),
+            write_frames(State1, Frames, []);
+        #h2_stream{conn_uncredited = Acc} = Stream ->
+            State#state{
+                protocol_state = H2#h2_state{
+                    h2_streams = Streams#{
+                        StreamId => Stream#h2_stream{conn_uncredited = Acc + Size}
+                    }
+                }
+            }
+    end.
 
 -spec apply_stream_credit(#state{}, nhttp_lib:stream_id(), pos_integer()) -> #state{}.
 apply_stream_credit(
@@ -717,12 +729,16 @@ apply_stream_credit(
     StreamId,
     Size
 ) ->
-    #h2_stream{uncredited = Acc} = Stream = maps:get(StreamId, Streams),
-    State#state{
-        protocol_state = H2#h2_state{
-            h2_streams = Streams#{StreamId => Stream#h2_stream{uncredited = Acc + Size}}
-        }
-    }.
+    case maps:get(StreamId, Streams) of
+        #h2_stream{type = stream} ->
+            credit_stream(State, StreamId, Size);
+        #h2_stream{uncredited = Acc} = Stream ->
+            State#state{
+                protocol_state = H2#h2_state{
+                    h2_streams = Streams#{StreamId => Stream#h2_stream{uncredited = Acc + Size}}
+                }
+            }
+    end.
 
 -spec apply_stream_push_validation(
     #state{},
@@ -731,6 +747,7 @@ apply_stream_credit(
     nhttp_lib:request(),
     nhttp_lib:status(),
     nhttp_lib:headers(),
+    boolean(),
     term()
 ) -> #state{}.
 apply_stream_push_validation(
@@ -740,6 +757,7 @@ apply_stream_push_validation(
     Request,
     Status,
     Headers,
+    Duplex,
     NewHState
 ) ->
     case nhttp_conn_h2_push:validate_h2_stream_push(Request, Status) of
@@ -747,13 +765,16 @@ apply_stream_push_validation(
             RespHeaders = nhttp_conn:alt_svc_headers(
                 State, [{<<":status">>, integer_to_binary(Status)} | Headers]
             ),
-            Stream1 = Stream0#h2_stream{type = stream, status = Status},
-            State1 = put_h2_stream(
-                send_h2_headers(State, StreamId, RespHeaders, nofin), StreamId, Stream1
+            {State1, Stream1, Credit} = start_producer_credit(
+                State, StreamId, Stream0#h2_stream{type = stream, status = Status}
             ),
-            State1#state{
+            State2 = send_h2_headers(
+                write_frames(State1, Credit, []), StreamId, RespHeaders, nofin
+            ),
+            State3 = enter_h2_producer_body(State2, StreamId, Stream1, Duplex),
+            State3#state{
                 handler_state = NewHState,
-                requests_count = State1#state.requests_count + 1
+                requests_count = State3#state.requests_count + 1
             };
         ok_head ->
             RespHeaders = nhttp_conn:alt_svc_headers(
@@ -846,6 +867,30 @@ credit_connection_batches(
 credit_connection_batches(State, Frames) ->
     {State, Frames}.
 
+-doc """
+Credit the octets of request DATA that the server drops. An open request
+gets the credit on both windows. After END_STREAM the stream window has
+no use, so only the connection gets it.
+""".
+-spec credit_dropped_data(#state{}, nhttp_lib:stream_id(), non_neg_integer(), nhttp_h2:fin()) ->
+    #state{}.
+credit_dropped_data(State, _StreamId, 0, _Fin) ->
+    State;
+credit_dropped_data(State, StreamId, Size, nofin) ->
+    replenish_recv_window(State, StreamId, Size);
+credit_dropped_data(State, StreamId, Size, fin) ->
+    apply_conn_credit(State, StreamId, Size).
+
+-doc """
+A producer stream that the peer reset gives the connection window the
+credit for its unread request body.
+""".
+-spec credit_reset_stream(#state{}, nhttp_lib:stream_id(), #h2_stream{}) -> #state{}.
+credit_reset_stream(State, StreamId, #h2_stream{type = stream} = Stream) ->
+    credit_unread_body(State, StreamId, Stream);
+credit_reset_stream(State, _StreamId, #h2_stream{type = request}) ->
+    State.
+
 -spec credit_stream(#state{}, nhttp_lib:stream_id(), pos_integer()) -> #state{}.
 credit_stream(
     #state{protocol_state = #h2_state{h2_conn = H2Conn} = H2} = State, StreamId, Size
@@ -859,11 +904,27 @@ credit_stream(
             State
     end.
 
+-doc """
+Give the connection window the credit for the request body that a
+stream holds and that no handler took. The stream leaves, so its own
+window needs none. The stream entry must still be in `h2_streams`.
+""".
+-spec credit_unread_body(#state{}, nhttp_lib:stream_id(), #h2_stream{}) -> #state{}.
+credit_unread_body(State, StreamId, Stream) ->
+    case unread_body_octets(Stream) of
+        0 -> State;
+        Unread -> apply_conn_credit(State, StreamId, Unread)
+    end.
+
 -spec draw_response_delay(nhttp:h2_response_delay()) -> non_neg_integer().
 draw_response_delay(Ms) when is_integer(Ms) ->
     Ms;
 draw_response_delay({uniform, MinMs, MaxMs}) ->
     MinMs + rand:uniform(MaxMs - MinMs + 1) - 1.
+
+-spec end_stream_fin(#h2_stream{}) -> nhttp_h2:fin().
+end_stream_fin(#h2_stream{end_stream = true}) -> fin;
+end_stream_fin(#h2_stream{end_stream = false}) -> nofin.
 
 -doc """
 Bridge accept_body into the streaming body recv loop.
@@ -877,35 +938,39 @@ with the body-terminating event.
 """.
 -spec enter_h2_accept_body(#state{}, nhttp_lib:stream_id(), term()) -> #state{}.
 enter_h2_accept_body(
-    #state{protocol_state = #h2_state{h2_streams = Streams} = H2} = State, StreamId, NewHState
+    #state{protocol_state = #h2_state{h2_streams = Streams}} = State, StreamId, NewHState
 ) ->
     case maps:get(StreamId, Streams, undefined) of
-        #h2_stream{type = request, worker = WPid, worker_ref = Ref} = Stream when
-            WPid =/= undefined
-        ->
-            BufferedChunks = lists:reverse(Stream#h2_stream.body_acc),
-            EndStream = Stream#h2_stream.end_stream,
-            PendingTrailers = Stream#h2_stream.pending_trailers,
-            BufferedSizes = [byte_size(C) || C <- BufferedChunks],
-            Stream1 = Stream#h2_stream{
-                streaming_body = true,
-                body_acc = [],
-                pending_trailers = undefined,
-                body_window_pending =
-                    queue:join(
-                        Stream#h2_stream.body_window_pending, queue:from_list(BufferedSizes)
-                    )
-            },
-            State1 = State#state{
-                protocol_state = H2#h2_state{h2_streams = Streams#{StreamId => Stream1}},
-                handler_state = NewHState
-            },
-            forward_body_chunks(WPid, Ref, BufferedChunks),
-            forward_terminal_body_event(WPid, Ref, EndStream, PendingTrailers),
-            State1;
+        #h2_stream{type = request, worker = WPid} = Stream when WPid =/= undefined ->
+            forward_request_body(State#state{handler_state = NewHState}, StreamId, Stream);
         _ ->
             State#state{handler_state = NewHState}
     end.
+
+-doc """
+Set the request side of a stream that starts a producer response. A
+duplex producer reads the request body, so the stream forwards it as
+`enter_h2_accept_body/3` does. A stream that came from the body phase
+already forwards. A producer of arity 1 reads nothing: the octets that no
+handler took get their credit and the stream drops the rest of the body.
+""".
+-spec enter_h2_producer_body(#state{}, nhttp_lib:stream_id(), #h2_stream{}, boolean()) ->
+    #state{}.
+enter_h2_producer_body(State, StreamId, #h2_stream{streaming_body = true} = Stream, true) ->
+    put_h2_stream(State, StreamId, Stream);
+enter_h2_producer_body(State, StreamId, Stream, true) ->
+    forward_request_body(State, StreamId, Stream);
+enter_h2_producer_body(State, StreamId, Stream, false) ->
+    Unread = unread_body_octets(Stream),
+    Dropped = Stream#h2_stream{
+        streaming_body = false,
+        body_acc = [],
+        pending_trailers = undefined,
+        body_window_pending = queue:new()
+    },
+    credit_dropped_data(
+        put_h2_stream(State, StreamId, Dropped), StreamId, Unread, end_stream_fin(Dropped)
+    ).
 
 -spec forward_body_chunks(pid(), reference(), [binary()]) -> ok.
 forward_body_chunks(_WPid, _Ref, []) ->
@@ -913,6 +978,29 @@ forward_body_chunks(_WPid, _Ref, []) ->
 forward_body_chunks(WPid, Ref, [Chunk | Rest]) ->
     WPid ! {body_chunk, Ref, {data, Chunk}},
     forward_body_chunks(WPid, Ref, Rest).
+
+-doc """
+Send the request body that the connection holds for a stream to its
+worker, mark the stream as forwarding, and send the terminal body event
+when the peer already ended the request. The size of each chunk waits in
+`body_window_pending` for the acknowledgement of the worker.
+""".
+-spec forward_request_body(#state{}, nhttp_lib:stream_id(), #h2_stream{}) -> #state{}.
+forward_request_body(State, StreamId, #h2_stream{worker = WPid, worker_ref = Ref} = Stream) ->
+    BufferedChunks = lists:reverse(Stream#h2_stream.body_acc),
+    BufferedSizes = [byte_size(C) || C <- BufferedChunks],
+    Stream1 = Stream#h2_stream{
+        streaming_body = true,
+        body_acc = [],
+        pending_trailers = undefined,
+        body_window_pending =
+            queue:join(Stream#h2_stream.body_window_pending, queue:from_list(BufferedSizes))
+    },
+    forward_body_chunks(WPid, Ref, BufferedChunks),
+    forward_terminal_body_event(
+        WPid, Ref, Stream#h2_stream.end_stream, Stream#h2_stream.pending_trailers
+    ),
+    put_h2_stream(State, StreamId, Stream1).
 
 -spec forward_terminal_body_event(
     pid(), reference(), boolean(), nhttp_lib:headers() | undefined
@@ -1033,7 +1121,7 @@ handle_h2_request_data(
                     }
             end;
         {error, body_too_large} ->
-            handle_h2_streaming_body_too_large(State, StreamId, Stream)
+            handle_h2_streaming_body_too_large(State, StreamId, Stream, Data)
     end.
 
 -spec handle_h2_request_result(#state{}, nhttp_lib:stream_id(), reference(), term()) ->
@@ -1089,11 +1177,19 @@ handle_h2_response_delay(
             State
     end.
 
--spec handle_h2_streaming_body_too_large(#state{}, nhttp_lib:stream_id(), #h2_stream{}) ->
-    #state{}.
-handle_h2_streaming_body_too_large(State, StreamId, Stream) ->
+-spec handle_h2_streaming_body_too_large(
+    #state{}, nhttp_lib:stream_id(), #h2_stream{}, binary()
+) -> #state{}.
+handle_h2_streaming_body_too_large(State, StreamId, #h2_stream{type = request} = Stream, _Data) ->
     ok = abort_body_worker(Stream, body_too_large),
-    handle_h2_limit_error(State, StreamId, body_too_large).
+    handle_h2_limit_error(State, StreamId, body_too_large);
+handle_h2_streaming_body_too_large(State, StreamId, #h2_stream{type = stream} = Stream0, Data) ->
+    Stream = Stream0#h2_stream{
+        body_window_pending = queue:in(byte_size(Data), Stream0#h2_stream.body_window_pending)
+    },
+    ok = close_producer_worker(Stream, body_too_large),
+    State1 = send_h2_rst_stream(put_h2_stream(State, StreamId, Stream), StreamId),
+    complete_h2_stream(State1, StreamId, body_too_large).
 
 -spec head_credit_due(h2_conn_credit() | h2_stream_credit()) -> integer() | undefined.
 head_credit_due(eager) ->
@@ -1310,6 +1406,15 @@ release_stream_response_credit(
 release_stream_response_credit(State, _StreamId, _Octets) ->
     {State, []}.
 
+-spec release_stream_threshold_credit(#state{}, nhttp_lib:stream_id(), non_neg_integer()) ->
+    {#state{}, iodata()}.
+release_stream_threshold_credit(
+    #state{protocol_state = #h2_state{stream_credit = {threshold, _}}} = State, StreamId, Octets
+) when Octets > 0 ->
+    window_update_frame(State, StreamId, Octets);
+release_stream_threshold_credit(State, _StreamId, _Octets) ->
+    {State, []}.
+
 -doc """
 Credit the peer for `Size` consumed octets on both receive windows
 through the resolved policies. The `eager` pair is the default and sends
@@ -1332,6 +1437,7 @@ replenish_recv_window(State, StreamId, Size) ->
     nhttp_lib:stream_id(),
     nhttp_lib:status(),
     nhttp_lib:headers(),
+    boolean(),
     term()
 ) -> #state{}.
 start_h2_stream_push_response(
@@ -1339,17 +1445,32 @@ start_h2_stream_push_response(
     StreamId,
     Status,
     Headers,
+    Duplex,
     NewHState
 ) ->
     case maps:get(StreamId, Streams, undefined) of
         #h2_stream{type = request} = Stream0 ->
             Request = stream_request(Stream0),
             apply_stream_push_validation(
-                State, StreamId, Stream0, Request, Status, Headers, NewHState
+                State, StreamId, Stream0, Request, Status, Headers, Duplex, NewHState
             );
         _ ->
             State#state{handler_state = NewHState}
     end.
+
+-doc """
+Release the credit that the policies held for the request of a stream
+that starts a producer response. `on_response` holds credit on both
+windows and `{threshold, _}` holds it on the stream window. The frames go
+ahead of the response HEADERS. From here the policies credit each chunk
+when the producer takes it, because a held credit stops a duplex stream.
+""".
+-spec start_producer_credit(#state{}, nhttp_lib:stream_id(), #h2_stream{}) ->
+    {#state{}, #h2_stream{}, iodata()}.
+start_producer_credit(State, StreamId, #h2_stream{uncredited = Held} = Stream) ->
+    {State1, Credit} = release_response_credit(State, StreamId, Stream),
+    {State2, Threshold} = release_stream_threshold_credit(State1, StreamId, Held),
+    {State2, Stream#h2_stream{uncredited = 0, conn_uncredited = 0}, join_credit(Credit, Threshold)}.
 
 -spec stream(#state{}, nhttp_lib:stream_id()) -> #h2_stream{}.
 stream(#state{protocol_state = #h2_state{h2_streams = Streams}}, StreamId) ->
@@ -1370,6 +1491,10 @@ track_stream_end(State, _StreamId, _Stream, nofin) ->
     State;
 track_stream_end(State, StreamId, Stream, fin) ->
     put_h2_stream(State, StreamId, Stream#h2_stream{end_stream = true}).
+
+-spec unread_body_octets(#h2_stream{}) -> non_neg_integer().
+unread_body_octets(#h2_stream{body_acc = Acc, body_window_pending = Pending}) ->
+    queue:fold(fun add_octets/2, iolist_size(Acc), Pending).
 
 -doc """
 Build one WINDOW_UPDATE for `Target` without sending it. A stream the
@@ -1393,6 +1518,16 @@ window_update_frame(
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS - WORKER MESSAGE HANDLERS
 %%%-----------------------------------------------------------------------------
+-spec ack_producer_closed(#h2_stream{}) -> ok.
+ack_producer_closed(#h2_stream{worker = undefined}) ->
+    ok;
+ack_producer_closed(#h2_stream{worker = WPid, worker_ref = Ref, pending_ack = undefined}) ->
+    WPid ! {chunk_ack, Ref, {error, closed}},
+    ok;
+ack_producer_closed(#h2_stream{worker = WPid, pending_ack = PendingRef}) ->
+    WPid ! {chunk_ack, PendingRef, {error, closed}},
+    ok.
+
 -spec cleanup_h2_worker_entry(#state{}, pid()) -> #state{}.
 cleanup_h2_worker_entry(
     #state{protocol_state = #h2_state{h2_workers = Workers} = H2} = State, WPid
@@ -1400,24 +1535,34 @@ cleanup_h2_worker_entry(
     State#state{protocol_state = H2#h2_state{h2_workers = maps:remove(WPid, Workers)}}.
 
 -doc """
+Tell the worker of a producer that its stream is closed. A duplex
+producer whose request is open gets the abort body event first, so its
+read fun finds the reason ahead of the closed send side. `SendChunk`
+returns `{error, closed}` on the chunk it waits for, or on its next
+chunk.
+""".
+-spec close_producer_worker(#h2_stream{}, nhttp_handler:abort_reason()) -> ok.
+close_producer_worker(#h2_stream{streaming_body = true, end_stream = false} = Stream, Reason) ->
+    ok = abort_body_worker(Stream, Reason),
+    ack_producer_closed(Stream);
+close_producer_worker(Stream, _Reason) ->
+    ack_producer_closed(Stream).
+
+-doc """
 End a producer stream: emit the request-stop telemetry, drop the monitor
-of its worker and remove the stream and the worker entries.
+of its worker, credit the request body that nobody read and remove the
+stream and the worker entries.
 """.
 -spec complete_h2_stream(#state{}, nhttp_lib:stream_id(), atom()) -> #state{}.
 complete_h2_stream(
-    #state{protocol_state = #h2_state{h2_streams = Streams, h2_workers = Workers} = H2} = State,
-    StreamId,
-    Reason
+    #state{protocol_state = #h2_state{h2_streams = Streams}} = State, StreamId, Reason
 ) ->
     #h2_stream{worker = WPid} = Stream = maps:get(StreamId, Streams),
     emit_h2_stream_complete(State, StreamId, Stream, Reason),
     ok = demonitor_worker(Stream),
-    State#state{
-        protocol_state = H2#h2_state{
-            h2_streams = maps:remove(StreamId, Streams),
-            h2_workers = remove_worker(WPid, Workers)
-        }
-    }.
+    #state{protocol_state = #h2_state{h2_workers = Workers} = H2} =
+        State1 = remove_h2_stream(credit_unread_body(State, StreamId, Stream), StreamId),
+    State1#state{protocol_state = H2#h2_state{h2_workers = remove_worker(WPid, Workers)}}.
 
 -spec demonitor_worker(#h2_stream{}) -> ok.
 demonitor_worker(#h2_stream{worker_mref = undefined}) ->
@@ -1466,7 +1611,7 @@ producer sees `{error, closed}`.
 ) -> #state{}.
 finalize_h2_worker_send(State, StreamId, WPid, Ref, fin, sent) ->
     WPid ! {chunk_ack, Ref, ok},
-    complete_h2_stream(State, StreamId, normal);
+    finish_h2_producer_stream(State, StreamId);
 finalize_h2_worker_send(State, _StreamId, WPid, Ref, nofin, sent) ->
     WPid ! {chunk_ack, Ref, ok},
     State;
@@ -1489,6 +1634,22 @@ finalize_h2_worker_send(State, StreamId, WPid, Ref, _Fin, stream_gone) ->
     cleanup_h2_worker_entry(remove_h2_stream(State, StreamId), WPid).
 
 -doc """
+End a producer stream whose response left in full. A request that is
+still open gets RST_STREAM(NO_ERROR), which asks the peer to stop the
+rest of it (RFC 9113 Section 8.1).
+""".
+-spec finish_h2_producer_stream(#state{}, nhttp_lib:stream_id()) -> #state{}.
+finish_h2_producer_stream(
+    #state{protocol_state = #h2_state{h2_streams = Streams}} = State, StreamId
+) ->
+    case maps:get(StreamId, Streams) of
+        #h2_stream{end_stream = true} ->
+            complete_h2_stream(State, StreamId, normal);
+        #h2_stream{end_stream = false} ->
+            complete_h2_stream(reset_h2_stream(State, StreamId, no_error), StreamId, normal)
+    end.
+
+-doc """
 The producer of `StreamId` exited before its END_STREAM went out. An
 empty `fin` closes the stream. Behind pending octets the codec queues it
 and the entry stays, without a worker, until the `data_sent` event with
@@ -1503,11 +1664,12 @@ finish_orphan_h2_stream(
         worker = undefined,
         worker_ref = undefined,
         worker_mref = undefined,
-        pending_ack = undefined
+        pending_ack = undefined,
+        streaming_body = false
     },
     case offer_h2_data(put_h2_stream(State, StreamId, Orphan), StreamId, <<>>, fin, []) of
         {sent, State1} ->
-            complete_h2_stream(State1, StreamId, normal);
+            finish_h2_producer_stream(State1, StreamId);
         {queued, State1} ->
             State1;
         {send_buffer_full, State1} ->
@@ -1567,8 +1729,11 @@ handle_h2_event(
             handle_h2_request_data(State, StreamId, Stream, Data, Fin);
         #h2_stream{type = http} = Stream ->
             track_stream_end(State, StreamId, Stream, Fin);
-        #h2_stream{type = stream} ->
-            State
+        #h2_stream{type = stream, streaming_body = true} = Stream ->
+            handle_h2_request_data(State, StreamId, Stream, Data, Fin);
+        #h2_stream{type = stream} = Stream ->
+            Tracked = track_stream_end(State, StreamId, Stream, Fin),
+            credit_dropped_data(Tracked, StreamId, byte_size(Data), Fin)
     end;
 handle_h2_event(
     #state{protocol_state = #h2_state{h2_streams = Streams}} = State, {trailers, StreamId, Trailers}
@@ -1580,8 +1745,10 @@ handle_h2_event(
             handle_h2_request_trailers(State, StreamId, Stream, Trailers);
         #h2_stream{type = http} = Stream ->
             track_stream_end(State, StreamId, Stream, fin);
-        #h2_stream{type = stream} ->
-            State;
+        #h2_stream{type = stream, streaming_body = true} = Stream ->
+            handle_h2_request_trailers(State, StreamId, Stream, Trailers);
+        #h2_stream{type = stream} = Stream ->
+            track_stream_end(State, StreamId, Stream, fin);
         #h2_stream{type = websocket} ->
             State
     end;
@@ -1640,7 +1807,7 @@ handle_h2_reply_drained(State, StreamId, #h2_stream{end_stream = false}, fin) ->
 handle_h2_stream_drained(State, StreamId, Stream, nofin) ->
     pay_pending_ack(State, StreamId, Stream);
 handle_h2_stream_drained(State, StreamId, Stream, fin) ->
-    complete_h2_stream(pay_pending_ack(State, StreamId, Stream), StreamId, normal).
+    finish_h2_producer_stream(pay_pending_ack(State, StreamId, Stream), StreamId).
 
 -spec handle_h2_worker_down(#state{}, pid(), term()) -> #state{}.
 handle_h2_worker_down(
@@ -1664,7 +1831,8 @@ handle_h2_worker_down(
                         nhttp_conn:log_ctx(State), Reason
                     ),
                     emit_h2_stream_complete(State, StreamId, Stream, producer_crashed),
-                    remove_h2_stream(send_h2_rst_stream(Released, StreamId), StreamId);
+                    Credited = credit_unread_body(Released, StreamId, Stream),
+                    remove_h2_stream(send_h2_rst_stream(Credited, StreamId), StreamId);
                 #h2_stream{type = request} = Stream when Reason =:= normal ->
                     State1 = remove_h2_stream(send_h2_rst_stream(Released, StreamId), StreamId),
                     nhttp_conn:emit_request_stop(
@@ -1737,12 +1905,7 @@ handle_h2_worker_send_trailers(
 -spec handle_h2_worker_stream_reset(
     #state{}, nhttp_lib:stream_id(), #h2_stream{}, nhttp_h2:error_code()
 ) -> #state{}.
-handle_h2_worker_stream_reset(
-    #state{protocol_state = #h2_state{h2_streams = Streams, h2_workers = Workers} = H2} = State,
-    StreamId,
-    Stream,
-    ErrorCode
-) ->
+handle_h2_worker_stream_reset(State, StreamId, Stream, ErrorCode) ->
     #h2_stream{worker = WPid, worker_mref = MRef} = Stream,
     emit_h2_stream_complete(State, StreamId, Stream, peer_reset),
     ok = cancel_held_response(Stream),
@@ -1754,7 +1917,9 @@ handle_h2_worker_stream_reset(
             _ = erlang:demonitor(MRef, [flush]),
             ok
     end,
-    State#state{
+    #state{protocol_state = #h2_state{h2_streams = Streams, h2_workers = Workers} = H2} =
+        State1 = credit_reset_stream(State, StreamId, Stream),
+    State1#state{
         protocol_state = H2#h2_state{
             h2_streams = maps:remove(StreamId, Streams),
             h2_workers =
@@ -1778,22 +1943,16 @@ maybe_emit_h2_stream_start(_State, Stream) ->
 
 -doc """
 Tell the worker of a stream that the peer reset it. A request worker
-gets the abort body event. A producer gets `{error, closed}` on the
-chunk it waits for, or on its next chunk.
+gets the abort body event. A producer gets what
+`close_producer_worker/2` sends.
 """.
 -spec notify_reset_worker(#h2_stream{}, nhttp_h2:error_code()) -> ok.
 notify_reset_worker(#h2_stream{worker = undefined}, _ErrorCode) ->
     ok;
 notify_reset_worker(#h2_stream{type = request} = Stream, ErrorCode) ->
     abort_body_worker(Stream, {peer_reset, ErrorCode});
-notify_reset_worker(
-    #h2_stream{worker = WPid, worker_ref = Ref, pending_ack = undefined}, _ErrorCode
-) ->
-    WPid ! {chunk_ack, Ref, {error, closed}},
-    ok;
-notify_reset_worker(#h2_stream{worker = WPid, pending_ack = PendingRef}, _ErrorCode) ->
-    WPid ! {chunk_ack, PendingRef, {error, closed}},
-    ok.
+notify_reset_worker(#h2_stream{type = stream} = Stream, ErrorCode) ->
+    close_producer_worker(Stream, {peer_reset, ErrorCode}).
 
 -doc """
 Offer `Data` on `StreamId` to the codec send queue and write the frames
@@ -2019,7 +2178,7 @@ send_h2_trailers(
         {ok, NewH2Conn, Frame} ->
             WPid ! {chunk_ack, Ref, ok},
             State1 = State#state{protocol_state = H2#h2_state{h2_conn = NewH2Conn}},
-            complete_h2_stream(queue_h2_out(State1, Frame), StreamId, normal);
+            finish_h2_producer_stream(queue_h2_out(State1, Frame), StreamId);
         {error, {data_pending, _}} ->
             State1 = reset_h2_stream(State, StreamId, internal_error),
             WPid ! {chunk_ack, Ref, {error, closed}},

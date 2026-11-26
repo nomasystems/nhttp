@@ -7,8 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- HTTP/2: `nhttp_stream:producer/3` accepts a producer of arity 2, `fun(SendChunk, RecvBody)`, that reads the request body of its stream while it sends the response. `RecvBody(Timeout)` returns `{data, Binary}`, `{fin, Trailers}`, `{abort, Reason}` or `timeout`. The connection credits the receive windows for a chunk when the producer takes it. `Reason` is `{peer_reset, ErrorCode}`, `body_too_large` or `closed`. New types `nhttp_stream:duplex_producer/0`, `recv_body_fun/0` and `producer_result/0`
+
+### Changed
+
+- HTTP/2: a producer response that ends while the request is open resets the stream with RST_STREAM(NO_ERROR) after its last frame, as a `{reply, _, _}` response does. Before, the stream stayed half-closed until the client ended the request
+- `nhttp_stream:producer/3` accepts a fun of arity 1 or 2 only. A different term fails with `function_clause` in the handler
+- HTTP/1.1 and HTTP/3: a `{stream, _, _}` result with a producer of arity 2 gets a 500 response and a `stream_push_rejected` log line
+- `h2_stream_window_policy` and `h2_connection_window_policy` with `on_response`: a `{stream, _, _}` result releases the held credit ahead of its response headers, and each later chunk gets its credit when the producer takes it or the connection drops it
+
 ### Fixed
 
+- HTTP/2: request DATA that arrives on a stream with a producer of arity 1 gets its WINDOW_UPDATE credit, and so does the body that the connection held when the handler returned the `{stream, _, _}` result. Before, the connection dropped the DATA with no credit: the client stopped after one stream window, and the connection window lost those octets for all streams
+- HTTP/2: a producer stream that ends or that the peer resets gives the connection window the credit for the request chunks that no handler took
 - HTTP/2: a handler in the body phase gets `{abort, {peer_reset, ErrorCode}}` when the peer resets the stream, and its worker ends. Before, the handler got no event and the worker stayed until the connection closed, so a client that opened and reset streams in a loop left one process per stream
 - HTTP/2: the same event, or `{abort, body_too_large}`, reaches a handler that returns `{accept_body, _, _}` after the peer reset the stream or the body exceeded `max_body_size`
 
